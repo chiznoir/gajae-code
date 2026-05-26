@@ -12,7 +12,7 @@
  * - Dense code: Minimal whitespace makes context harder to read
  * - Deep nesting: Whitespace-sensitive edits at high indent levels
  *
- * Difficulty modes control both FILE SELECTION and PRGJCT DETAIL:
+ * Difficulty modes control both FILE SELECTION and PROMPT DETAIL:
  * - easy: Short files, unique lines, line number given
  * - medium: Medium files, function context given
  * - hard: Long files with similar blocks, no location hint

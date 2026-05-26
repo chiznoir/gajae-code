@@ -3,7 +3,7 @@ import { parse as babelParse } from "@babel/parser";
 // Static ESM `import` declarations are not valid inside vm.runInContext (script-mode parsing),
 // and dynamic `import(...)` would otherwise resolve specifiers against the worker module's URL
 // instead of the session cwd. We rewrite both forms so they route through the worker-injected
-// `__omp_import__` helper, which resolves the specifier against the active session cwd. A real
+// `__gjc_import__` helper, which resolves the specifier against the active session cwd. A real
 // parser keeps imports embedded in string literals, template literals, or comments intact.
 
 type BabelImportDeclaration = {
@@ -77,10 +77,10 @@ function parseProgram(code: string): { program: { body: ReadonlyArray<BabelProgr
 	}
 }
 
-function buildOmpImportCall(sourceLiteral: string, optionsLiteral: string | undefined): string {
-	// Route every static import through the worker-injected `__omp_import__` helper so the
+function buildGjcImportCall(sourceLiteral: string, optionsLiteral: string | undefined): string {
+	// Route every static import through the worker-injected `__gjc_import__` helper so the
 	// specifier resolves against the session cwd (and `with`-attribute imports keep working).
-	return optionsLiteral ? `__omp_import__(${sourceLiteral}, ${optionsLiteral})` : `__omp_import__(${sourceLiteral})`;
+	return optionsLiteral ? `__gjc_import__(${sourceLiteral}, ${optionsLiteral})` : `__gjc_import__(${sourceLiteral})`;
 }
 
 // Walks every node in `root`, depth-first, invoking `visit` on each one. Skips Babel's
@@ -112,7 +112,7 @@ function buildOptionsLiteral(node: BabelImportDeclaration): string | undefined {
 		const key = attr.key.type === "Identifier" ? attr.key.name : JSON.stringify(attr.key.value);
 		return `${key}: ${JSON.stringify(attr.value.value)}`;
 	});
-	// Native dynamic import takes options as `{ with: { ... } }`. `__omp_import__` forwards the
+	// Native dynamic import takes options as `{ with: { ... } }`. `__gjc_import__` forwards the
 	// options bag verbatim, so we wrap the attribute pairs accordingly.
 	return `{ with: { ${pairs.join(", ")} } }`;
 }
@@ -120,7 +120,7 @@ function buildOptionsLiteral(node: BabelImportDeclaration): string | undefined {
 function rewriteImportNode(node: BabelImportDeclaration): string {
 	const sourceLiteral = JSON.stringify(node.source.value);
 	const optionsLiteral = buildOptionsLiteral(node);
-	const importCall = buildOmpImportCall(sourceLiteral, optionsLiteral);
+	const importCall = buildGjcImportCall(sourceLiteral, optionsLiteral);
 
 	let defaultName: string | undefined;
 	let namespaceName: string | undefined;
@@ -161,14 +161,14 @@ export function rewriteImports(code: string): string {
 	type Edit = { start: number; end: number; text: string };
 	const edits: Edit[] = [];
 
-	// Top-level static `import` declarations become `await __omp_import__(...)` calls.
+	// Top-level static `import` declarations become `await __gjc_import__(...)` calls.
 	for (const node of ast.program.body) {
 		if (node.type !== "ImportDeclaration") continue;
 		const decl = node as unknown as BabelImportDeclaration;
 		edits.push({ start: decl.start, end: decl.end, text: rewriteImportNode(decl) });
 	}
 
-	// Dynamic `import(...)` expressions (anywhere) get their callee swapped for `__omp_import__`
+	// Dynamic `import(...)` expressions (anywhere) get their callee swapped for `__gjc_import__`
 	// so the specifier resolves against the session cwd instead of the worker module's URL.
 	walkNodes(ast, node => {
 		if (node.type !== "CallExpression") return;
@@ -176,7 +176,7 @@ export function rewriteImports(code: string): string {
 		const callee = call.callee;
 		if (!callee || callee.type !== "Import" || typeof callee.start !== "number" || typeof callee.end !== "number")
 			return;
-		edits.push({ start: callee.start, end: callee.end, text: "__omp_import__" });
+		edits.push({ start: callee.start, end: callee.end, text: "__gjc_import__" });
 	});
 
 	if (edits.length === 0) return code;
@@ -310,18 +310,18 @@ function returnFinalExpression(code: string): { source: string; returned: boolea
 		const suffix = code.slice(expression.end);
 		const semicolonMatch = statement.match(/;\s*$/);
 		const trimmedStatement = semicolonMatch ? statement.slice(0, semicolonMatch.index) : statement;
-		return { source: `${prefix}__omp_set_final_expr__((${trimmedStatement}));${suffix}`, returned: true };
+		return { source: `${prefix}__gjc_set_final_expr__((${trimmedStatement}));${suffix}`, returned: true };
 	}
 	if (last?.type === "ReturnStatement") {
 		// Top-level `return value;` is otherwise swallowed: it forces the cell into an async IIFE
-		// wrapper that discards the returned value. Rewrite into `__omp_set_final_expr__((expr))`
+		// wrapper that discards the returned value. Rewrite into `__gjc_set_final_expr__((expr))`
 		// so the runtime can surface the value to the caller just like a trailing expression.
 		const ret = last as unknown as { start: number; end: number; argument?: { start: number; end: number } | null };
 		if (!ret.argument) return { source: code, returned: false };
 		const prefix = code.slice(0, ret.start);
 		const suffix = code.slice(ret.end);
 		const expr = code.slice(ret.argument.start, ret.argument.end);
-		return { source: `${prefix}__omp_set_final_expr__((${expr}));${suffix}`, returned: true };
+		return { source: `${prefix}__gjc_set_final_expr__((${expr}));${suffix}`, returned: true };
 	}
 	return { source: code, returned: false };
 }

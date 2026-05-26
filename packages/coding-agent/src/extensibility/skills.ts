@@ -102,9 +102,6 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 	const {
 		cwd = getProjectDir(),
 		enabled = true,
-		enableCodexUser = true,
-		enableClaudeUser = true,
-		enableClaudeProject = true,
 		enablePiUser = true,
 		enablePiProject = true,
 		customDirectories = [],
@@ -118,18 +115,14 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 		return { skills: [], warnings: [] };
 	}
 
-	const anyBuiltInSkillSourceEnabled =
-		enableCodexUser || enableClaudeUser || enableClaudeProject || enablePiUser || enablePiProject;
-	// Helper to check if a source is enabled
+	// GJC only accepts native `.gjc` skills. Other providers may still exist for
+	// their own capabilities, but their skill surfaces are intentionally ignored.
 	function isSourceEnabled(source: SourceMeta): boolean {
 		const { provider, level } = source;
-		if (provider === "codex" && level === "user") return enableCodexUser;
-		if (provider === "claude" && level === "user") return enableClaudeUser;
-		if (provider === "claude" && level === "project") return enableClaudeProject;
-		if (provider === "native" && level === "user") return enablePiUser;
-		if (provider === "native" && level === "project") return enablePiProject;
-		// For other providers (agents, claude-plugins, etc.), treat them as built-in skill sources.
-		return anyBuiltInSkillSourceEnabled;
+		if (provider !== "native") return false;
+		if (level === "user") return enablePiUser;
+		if (level === "project") return enablePiProject;
+		return false;
 	}
 
 	// Use capability API to load all skills

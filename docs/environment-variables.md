@@ -153,6 +153,42 @@ Region fallback in provider code: `options.region` → `AWS_REGION` → `AWS_DEF
 
 Base URL resolution: option `azureBaseUrl` → env `AZURE_OPENAI_BASE_URL` → option/env resource name → `model.baseUrl`.
 
+### Model provider base URL overrides
+
+Built-in model provider base URLs resolve with this precedence:
+
+1. `models.yml` / model config provider `baseUrl`
+2. provider-specific base URL environment variable
+3. bundled provider default
+
+Supported aliases:
+
+| Provider | Variables |
+| --- | --- |
+| OpenAI | `OPENAI_BASE_URL` |
+| Anthropic | `ANTHROPIC_BASE_URL` |
+| Google Gemini | `GOOGLE_BASE_URL`, `GEMINI_BASE_URL` |
+| Google Antigravity | `GOOGLE_ANTIGRAVITY_BASE_URL`, then `GOOGLE_BASE_URL`, then `GEMINI_BASE_URL` |
+| Google Gemini CLI | `GOOGLE_GEMINI_CLI_BASE_URL`, then `GOOGLE_BASE_URL`, then `GEMINI_BASE_URL` |
+| Google Vertex | `GOOGLE_VERTEX_BASE_URL`, then `GOOGLE_BASE_URL`, then `GEMINI_BASE_URL` |
+| Any provider id | derived `<PROVIDER_ID>_BASE_URL`, uppercased with non-alphanumerics converted to `_` (for example `my-proxy` → `MY_PROXY_BASE_URL`) |
+
+OpenAI-compatible proxy note: the built-in `openai` provider keeps its bundled API transport (`openai-responses`). Setting `OPENAI_BASE_URL` changes the host but still calls `<baseUrl>/responses`. If your proxy only supports Chat Completions, configure a custom `models.yml` provider with `api: openai-completions` instead of using the built-in OpenAI provider override:
+
+```yaml
+providers:
+  openai-compatible:
+    baseUrl: https://proxy.example.com/v1
+    apiKey: OPENAI_API_KEY
+    api: openai-completions
+    models:
+      - id: gpt-4o
+        name: GPT-4o via proxy
+        api: openai-completions
+```
+
+For OpenRouter traffic, GJC explicitly sends `User-Agent: Gajae-Code/<package version>` plus OpenRouter attribution headers. For the built-in OpenAI Responses transport and generic OpenAI-compatible Chat Completions transport, GJC passes model/provider headers through the OpenAI JavaScript SDK and does not set a GJC user-agent unless the provider-specific code adds one.
+
 ### Google Vertex AI
 
 | Variable                         | Required?                      | Notes                                                                                                                     |
@@ -283,9 +319,9 @@ Extra conditional behavior:
 | `GJC_SLOW_MODEL`              | Ephemeral model-role override for `slow` (CLI `--slow` takes precedence)                           |
 | `GJC_PLAN_MODEL`              | Ephemeral model-role override for `plan` (CLI `--plan` takes precedence)                           |
 | `GJC_NO_TITLE`                | If set (any non-empty value), disables auto session title generation on first user message         |
-| `NULL_PRGJCT`                | If `true`, system prompt builder returns empty string                                              |
+| `NULL_PROMPT`                | If `true`, system prompt builder returns empty string                                              |
 | `GJC_BLOCKED_AGENT`           | Blocks a specific subagent type in task tool                                                       |
-| `GJC_SUBPROCESS_CMD`          | Overrides subagent spawn command (`gjc` / `omp.cmd` resolution bypass)                             |
+| `GJC_SUBPROCESS_CMD`          | Overrides subagent spawn command (`gjc` / `gjc.cmd` resolution bypass)                             |
 | `GJC_TASK_MAX_OUTPUT_BYTES`   | Max captured output bytes per subagent (default `500000`)                                          |
 | `GJC_TASK_MAX_OUTPUT_LINES`   | Max captured output lines per subagent (default `5000`)                                            |
 | `GJC_TIMING`                  | If set (any non-empty value), prints a hierarchical timing-span tree to **stderr** via `logger.printTimings()`. In interactive mode the tree prints once the agent is ready (before the TUI starts); in print mode it prints after the whole prompt batch completes. Print-mode prompts are wrapped in `print:prompt:initial` / `print:prompt:next` spans so each user message shows up as its own row. `GJC_TIMING=x` exits the process with code 0 right after printing in interactive mode (use to measure cold startup only). `GJC_TIMING=full` lists every module-load entry instead of just the top N. |

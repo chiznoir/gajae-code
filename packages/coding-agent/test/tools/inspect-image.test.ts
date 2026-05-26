@@ -112,7 +112,7 @@ describe("InspectImageTool", () => {
 	let testDir: string;
 
 	beforeEach(() => {
-		testDir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-inspect-image-"));
+		testDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-inspect-image-"));
 	});
 
 	afterEach(() => {

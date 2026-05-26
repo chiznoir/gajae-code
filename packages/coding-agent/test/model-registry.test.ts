@@ -109,6 +109,18 @@ describe("ModelRegistry", () => {
 		fs.writeFileSync(modelsJsonPath, JSON.stringify(config));
 	}
 
+	function setEnvForTest(key: string, value: string): () => void {
+		const previous = Bun.env[key];
+		Bun.env[key] = value;
+		return () => {
+			if (previous === undefined) {
+				delete Bun.env[key];
+			} else {
+				Bun.env[key] = previous;
+			}
+		};
+	}
+
 	function mockOpenAiCompatibleModels(url: string, modelIds: string[]) {
 		return hookFetch(input => {
 			const requestUrl = String(input);
@@ -140,6 +152,67 @@ describe("ModelRegistry", () => {
 			throw new Error(`Unexpected URL: ${url}`);
 		});
 	}
+
+	describe("provider base URL environment variables", () => {
+		test("uses OPENAI_BASE_URL for bundled OpenAI models when models config has no baseUrl override", () => {
+			const restore = setEnvForTest("OPENAI_BASE_URL", "https://openai-proxy.example.com/v1");
+			try {
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+				const openaiModels = getModelsForProvider(registry, "openai");
+
+				expect(openaiModels.length).toBeGreaterThan(0);
+				expect(openaiModels.every(model => model.baseUrl === "https://openai-proxy.example.com/v1")).toBe(true);
+				expect(registry.getProviderBaseUrl("openai")).toBe("https://openai-proxy.example.com/v1");
+			} finally {
+				restore();
+			}
+		});
+
+		test("keeps models config baseUrl ahead of provider base URL env vars", () => {
+			const restore = setEnvForTest("OPENAI_BASE_URL", "https://openai-env.example.com/v1");
+			try {
+				writeRawModelsJson({
+					openai: overrideConfig("https://openai-models-config.example.com/v1"),
+				});
+
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+				const openaiModels = getModelsForProvider(registry, "openai");
+
+				expect(openaiModels.length).toBeGreaterThan(0);
+				expect(openaiModels.every(model => model.baseUrl === "https://openai-models-config.example.com/v1")).toBe(
+					true,
+				);
+				expect(registry.getProviderBaseUrl("openai")).toBe("https://openai-models-config.example.com/v1");
+			} finally {
+				restore();
+			}
+		});
+
+		test("uses GEMINI_BASE_URL as a Google provider base URL alias", () => {
+			const restore = setEnvForTest("GEMINI_BASE_URL", "https://gemini-proxy.example.com/v1beta");
+			try {
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+				const googleModels = getModelsForProvider(registry, "google");
+
+				expect(googleModels.length).toBeGreaterThan(0);
+				expect(googleModels.every(model => model.baseUrl === "https://gemini-proxy.example.com/v1beta")).toBe(true);
+				expect(registry.getProviderBaseUrl("google")).toBe("https://gemini-proxy.example.com/v1beta");
+			} finally {
+				restore();
+			}
+		});
+
+		test("derives base URL env var names for custom provider ids", () => {
+			const restore = setEnvForTest("MY_PROXY_BASE_URL", "https://custom-provider.example.com/v1");
+			try {
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+
+				expect(registry.getProviderBaseUrl("my-proxy")).toBe("https://custom-provider.example.com/v1");
+			} finally {
+				restore();
+			}
+		});
+	});
 
 	describe("canonical equivalence", () => {
 		test("groups dotted provider variants under the bundled canonical id", () => {

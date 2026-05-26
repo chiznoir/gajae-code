@@ -209,7 +209,7 @@ pub(crate) fn init_well_known_vars(
 		)),
 	)?;
 
-	// CGJC_WORDBREAKS
+	// COMP_WORDBREAKS
 	let mut default_comp_wordbreaks = String::from(" \t\n\"\'><=;|&(:");
 	if shell.options().enable_hostname_completion {
 		default_comp_wordbreaks.push('@');
@@ -217,7 +217,7 @@ pub(crate) fn init_well_known_vars(
 
 	shell
 		.env_mut()
-		.set_global("CGJC_WORDBREAKS", ShellVariable::new(default_comp_wordbreaks))?;
+		.set_global("COMP_WORDBREAKS", ShellVariable::new(default_comp_wordbreaks))?;
 
 	// DIRSTACK
 	shell.env_mut().set_global(

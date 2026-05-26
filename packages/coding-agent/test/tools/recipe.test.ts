@@ -157,7 +157,7 @@ describe("recipe", () => {
 	});
 
 	it("detects package scripts and forwards execution through bash", async () => {
-		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-recipe-"));
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-recipe-"));
 		tempDirs.push(dir);
 		await Bun.write(path.join(dir, "package.json"), JSON.stringify({ scripts: { "say-ok": "echo ok" } }, null, 2));
 		await Bun.write(path.join(dir, "bun.lock"), "");
@@ -170,7 +170,7 @@ describe("recipe", () => {
 	});
 
 	it("keeps root package scripts bare and exposes workspace package scripts as package-name/script tasks", async () => {
-		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-recipe-workspace-"));
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-recipe-workspace-"));
 		tempDirs.push(dir);
 		await Bun.write(
 			path.join(dir, "package.json"),
@@ -197,7 +197,7 @@ describe("recipe", () => {
 	});
 
 	it("auto-includes recipe when bash is requested and a runner is detected", async () => {
-		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-recipe-auto-"));
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-recipe-auto-"));
 		tempDirs.push(dir);
 		await Bun.write(path.join(dir, "package.json"), JSON.stringify({ scripts: { test: "echo t" } }, null, 2));
 		await Bun.write(path.join(dir, "bun.lock"), "");
@@ -209,7 +209,7 @@ describe("recipe", () => {
 	});
 
 	it("is absent when disabled even if a package manifest is present", async () => {
-		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-recipe-disabled-"));
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-recipe-disabled-"));
 		tempDirs.push(dir);
 		await Bun.write(path.join(dir, "package.json"), JSON.stringify({ scripts: { test: "echo t" } }, null, 2));
 		const settings = Settings.isolated({ "recipe.enabled": false });

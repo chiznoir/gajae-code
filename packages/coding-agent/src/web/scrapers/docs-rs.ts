@@ -378,7 +378,7 @@ export const handleDocsRs: SpecialHandler = async (
 		const requestSignal = ptree.combineSignals(signal, timeout * 1000);
 		const response = await fetch(jsonUrl, {
 			signal: requestSignal,
-			headers: { "User-Agent": "omp-web-fetch/1.0", Accept: "application/gzip" },
+			headers: { "User-Agent": "gjc-web-fetch/1.0", Accept: "application/gzip" },
 			redirect: "follow",
 		});
 		if (!response.ok) return null;

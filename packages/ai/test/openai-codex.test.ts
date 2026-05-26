@@ -5,7 +5,7 @@ import { convertOpenAICodexResponsesTools } from "@gajae-code/ai/providers/opena
 import type { Tool } from "@gajae-code/ai/types";
 import { createCodexModel } from "./helpers";
 
-const DEFAULT_PRGJCT_PREFIX =
+const DEFAULT_PROMPT_PREFIX =
 	"You are an expert coding assistant. You help users with coding tasks by reading files, executing commands";
 
 describe("openai-codex tool schemas", () => {
@@ -38,7 +38,7 @@ describe("openai-codex request transformer", () => {
 					type: "message",
 					role: "developer",
 					id: "sys-1",
-					content: [{ type: "input_text", text: `${DEFAULT_PRGJCT_PREFIX}...` }],
+					content: [{ type: "input_text", text: `${DEFAULT_PROMPT_PREFIX}...` }],
 				},
 				{
 					type: "message",
@@ -64,7 +64,7 @@ describe("openai-codex request transformer", () => {
 		const first = input[0];
 		expect(first?.type).toBe("message");
 		expect(first?.role).toBe("developer");
-		expect(first?.content).toEqual([{ type: "input_text", text: `${DEFAULT_PRGJCT_PREFIX}...` }]);
+		expect(first?.content).toEqual([{ type: "input_text", text: `${DEFAULT_PROMPT_PREFIX}...` }]);
 
 		const orphaned = input.find(item => item.type === "message" && item.role === "assistant");
 		expect(orphaned?.content).toMatch(/Previous tool result/);

@@ -4,9 +4,9 @@
 #
 # Stages:
 #   natives-builder — Rust + Bun → pi_natives.linux-<arch>.node
-#   wheel-builder   — omp_rpc Python wheel
-#   pi-base         — python + bun + rustup launcher + natives + omp_rpc
-#                     + /usr/local/bin/omp shim
+#   wheel-builder   — gjc_rpc Python wheel
+#   pi-base         — python + bun + rustup launcher + natives + gjc_rpc
+#                     + /usr/local/bin/gjc shim
 #   pi-runtime      — pi-base + pi source + bun install      (DEFAULT, runnable)
 #
 # Build:
@@ -15,7 +15,7 @@
 #
 # Run:
 #     docker run --rm gajae-code/pi:dev --help
-#     docker run --rm -it -v "$PWD":/work gajae-code/pi:dev cli    # interactive omp
+#     docker run --rm -it -v "$PWD":/work gajae-code/pi:dev cli    # interactive gjc
 #
 # Consume as a base in another Dockerfile (see Dockerfile.robogjc):
 #     ARG PI_BASE=gajae-code/pi:dev
@@ -53,7 +53,7 @@ COPY --parents \
     Cargo.toml Cargo.lock rust-toolchain.toml \
     packages/*/package.json \
     packages/tsconfig.workspace.json \
-    python/robomp/web/package.json \
+    python/robogjc/web/package.json \
     crates/*/Cargo.toml \
     /pi/
 
@@ -89,11 +89,11 @@ RUN apt-get update \
 RUN pip install --upgrade pip build
 
 WORKDIR /src
-COPY python/omp-rpc /src
+COPY python/gjc-rpc /src
 RUN python -m build --wheel --outdir /out
 
 ############################
-# 3) pi-base — python + bun + rustup + natives + omp_rpc + omp shim
+# 3) pi-base — python + bun + rustup + natives + gjc_rpc + gjc shim
 #
 # Sharable runtime base. Derived images (pi-runtime below, Dockerfile.robogjc)
 # extend this and overlay their own source tree. Default PI_ROOT=/work/pi is
@@ -138,9 +138,9 @@ COPY --from=natives-builder /out/pi_natives.linux-*.node /opt/bun/bin/
 
 # gjc-rpc Python wheel.
 COPY --from=wheel-builder /out/*.whl /tmp/wheels/
-RUN pip install /tmp/wheels/omp_rpc-*.whl && rm -rf /tmp/wheels
+RUN pip install /tmp/wheels/gjc_rpc-*.whl && rm -rf /tmp/wheels
 
-# `omp` shim — runs the coding-agent CLI against $PI_ROOT via Bun. Derived
+# `gjc` shim — runs the coding-agent CLI against $PI_ROOT via Bun. Derived
 # images override PI_ROOT to point at wherever their pi source lives.
 RUN printf '%s\n' \
     '#!/usr/bin/env bash' \
@@ -151,13 +151,13 @@ RUN printf '%s\n' \
     '  exit 127' \
     'fi' \
     'exec bun "$PI_ROOT/packages/coding-agent/src/cli.ts" "$@"' \
-    > /usr/local/bin/omp \
-    && chmod +x /usr/local/bin/omp
+    > /usr/local/bin/gjc \
+    && chmod +x /usr/local/bin/gjc
 
 ############################
 # 4) pi-runtime — pi-base + pi source + bun install (DEFAULT)
 #
-# A self-contained, runnable omp image. `docker run gajae-code/pi:dev --help`
+# A self-contained, runnable gjc image. `docker run gajae-code/pi:dev --help`
 # Just Works without a host checkout.
 ############################
 FROM pi-base AS pi-runtime
@@ -172,7 +172,7 @@ COPY --parents \
     tsconfig.base.json tsconfig.json \
     packages/*/package.json \
     packages/tsconfig.workspace.json \
-    python/robomp/web/package.json \
+    python/robogjc/web/package.json \
     /pi/
 
 RUN bun install --frozen-lockfile --ignore-scripts
@@ -186,5 +186,5 @@ COPY . /pi/
 # package.json's `prepare` script normally handles this on a vanilla install.
 RUN bun --cwd=packages/coding-agent run generate-docs-index
 
-ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/omp"]
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/gjc"]
 CMD ["--help"]

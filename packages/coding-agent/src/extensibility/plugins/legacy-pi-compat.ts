@@ -59,8 +59,8 @@ const LEGACY_PI_IMPORT_SPECIFIER_REGEX = new RegExp(
 	`((?:from\\s+|import\\s*\\(\\s*)["'])(@(?:${PI_SCOPE_ALTERNATION})/(?:${PI_PACKAGE_ALTERNATION})(?:/[^"'()\\s]+)?)(["'])`,
 	"g",
 );
-const LEGACY_PI_FILE_PREFIX = "omp-legacy-pi-file:";
-const LEGACY_PI_FILE_NAMESPACE = "omp-legacy-pi-file";
+const LEGACY_PI_FILE_PREFIX = "gjc-legacy-pi-file:";
+const LEGACY_PI_FILE_NAMESPACE = "gjc-legacy-pi-file";
 const resolvedSpecifierFallbacks = new Map<string, string>();
 
 // Extensions that imported `@sinclair/typebox` directly used to resolve against a
@@ -243,7 +243,7 @@ async function mirrorLegacyPiFile(sourcePath: string, state: LegacyPiMirrorState
 }
 
 export async function loadLegacyPiModule(resolvedPath: string): Promise<unknown> {
-	const root = path.join(os.tmpdir(), "omp-legacy-pi-file", `entry-${Bun.hash(resolvedPath).toString(36)}`);
+	const root = path.join(os.tmpdir(), "gjc-legacy-pi-file", `entry-${Bun.hash(resolvedPath).toString(36)}`);
 	await fs.rm(root, { recursive: true, force: true });
 	const state: LegacyPiMirrorState = { root, seen: new Map() };
 	const mirroredEntry = await mirrorLegacyPiFile(resolvedPath, state);
@@ -298,7 +298,7 @@ export function installLegacyPiSpecifierShim(): void {
 	isLegacyPiSpecifierShimInstalled = true;
 
 	Bun.plugin({
-		name: "omp:legacy-pi-shim",
+		name: "gjc:legacy-pi-shim",
 		setup(build) {
 			build.onResolve({ filter: LEGACY_PI_SPECIFIER_FILTER, namespace: "file" }, resolveLegacyPiSpecifier);
 			build.onResolve(
@@ -312,7 +312,7 @@ export function installLegacyPiSpecifierShim(): void {
 				resolveTypeBoxSpecifier,
 			);
 
-			build.onResolve({ filter: /^omp-legacy-pi-file:/, namespace: "file" }, args => ({
+			build.onResolve({ filter: /^gjc-legacy-pi-file:/, namespace: "file" }, args => ({
 				path: args.path.slice(LEGACY_PI_FILE_PREFIX.length),
 				namespace: LEGACY_PI_FILE_NAMESPACE,
 			}));

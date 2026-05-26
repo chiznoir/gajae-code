@@ -44,7 +44,7 @@ interface PromptTaskModel {
 	cwd?: string;
 }
 
-const PRGJCT_TASK_LIMIT = 20;
+const PROMPT_TASK_LIMIT = 20;
 
 interface PromptRunnerModel {
 	id: string;
@@ -207,7 +207,7 @@ export function buildPromptModel(runners: DetectedRunner[]): RecipePromptModel {
 			id: runner.id,
 			label: runner.label,
 			commandPrefix: runner.commandPrefix,
-			tasks: runner.tasks.slice(0, PRGJCT_TASK_LIMIT).map(task => ({
+			tasks: runner.tasks.slice(0, PROMPT_TASK_LIMIT).map(task => ({
 				name: task.name,
 				paramSig: task.parameters.length > 0 ? task.parameters.join(" ") : undefined,
 				command: buildCommand(task.commandPrefix ?? runner.commandPrefix, task.commandName ?? task.name, ""),

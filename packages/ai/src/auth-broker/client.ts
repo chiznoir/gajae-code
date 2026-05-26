@@ -1,8 +1,8 @@
 /**
- * HTTP client for the omp auth-broker server.
+ * HTTP client for the gjc auth-broker server.
  *
  * Used by {@link RemoteAuthCredentialStore} (snapshot pulls) and by
- * `omp auth-broker status` (liveness checks). All endpoints except
+ * `gjc auth-broker status` (liveness checks). All endpoints except
  * `/v1/healthz` require a bearer token.
  */
 import { readSseEvents } from "@gajae-code/utils";

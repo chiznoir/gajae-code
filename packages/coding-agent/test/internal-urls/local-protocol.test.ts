@@ -84,7 +84,7 @@ describe("LocalProtocolHandler", () => {
 
 	it("uses session id fallback root when artifacts dir is unavailable", async () => {
 		const root = resolveLocalRoot({ getSessionId: () => "session-fallback", getArtifactsDir: () => null });
-		expect(root).toContain(path.join("omp-local", "session-fallback"));
+		expect(root).toContain(path.join("gjc-local", "session-fallback"));
 		expect(resolveLocalUrlToPath("local://memo.txt", { getSessionId: () => "session-fallback" })).toBe(
 			path.join(root, "memo.txt"),
 		);

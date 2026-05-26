@@ -30,7 +30,7 @@ export {
 import type { OutputMeta } from "../tools/output-meta";
 import { formatOutputNotice } from "../tools/output-meta";
 
-export const SKILL_PRGJCT_MESSAGE_TYPE = "skill-prompt";
+export const SKILL_PROMPT_MESSAGE_TYPE = "skill-prompt";
 
 export interface SkillPromptDetails {
 	name: string;

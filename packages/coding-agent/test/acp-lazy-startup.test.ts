@@ -187,7 +187,7 @@ describe("ACP lazy startup", () => {
 	});
 
 	it("applies CLI runtime API keys after ACP lazy session creation resolves extension models", async () => {
-		using tempDir = TempDir.createSync("@omp-acp-lazy-api-key-");
+		using tempDir = TempDir.createSync("@gjc-acp-lazy-api-key-");
 		const cwd = tempDir.path();
 
 		await Bun.write(

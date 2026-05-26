@@ -178,7 +178,7 @@ describe("SessionManager temp cwd session dirs", () => {
 	}
 
 	beforeEach(() => {
-		testAgentDir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-session-dir-test-"));
+		testAgentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-session-dir-test-"));
 		setAgentDir(testAgentDir);
 	});
 
@@ -197,9 +197,9 @@ describe("SessionManager temp cwd session dirs", () => {
 
 		const projectsRoot = path.join(os.homedir(), "Projects");
 		fs.mkdirSync(projectsRoot, { recursive: true });
-		const realProjectDir = fs.mkdtempSync(path.join(projectsRoot, "omp-session-home-"));
+		const realProjectDir = fs.mkdtempSync(path.join(projectsRoot, "gjc-session-home-"));
 		const nestedDir = path.join(realProjectDir, "nested");
-		const aliasRoot = fs.mkdtempSync(path.join(os.tmpdir(), "omp-session-home-alias-"));
+		const aliasRoot = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-session-home-alias-"));
 		const homeAlias = path.join(aliasRoot, "home-link");
 
 		try {
@@ -281,7 +281,7 @@ describe("SessionManager legacy session migration persistence", () => {
 	}
 
 	beforeEach(() => {
-		tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-session-manager-legacy-"));
+		tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-session-manager-legacy-"));
 	});
 
 	afterEach(() => {

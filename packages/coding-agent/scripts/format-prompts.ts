@@ -16,13 +16,13 @@ import { prompt } from "@gajae-code/utils";
  */
 import { Glob } from "bun";
 
-const PRGJCTS_DIR = `${import.meta.dir}/../src/prompts/`;
-const COMMIT_PRGJCTS_DIR = `${import.meta.dir}/../src/commit/prompts/`;
-const AGENTIC_PRGJCTS_DIR = `${import.meta.dir}/../src/commit/agentic/prompts/`;
+const PROMPTS_DIR = `${import.meta.dir}/../src/prompts/`;
+const COMMIT_PROMPTS_DIR = `${import.meta.dir}/../src/commit/prompts/`;
+const AGENTIC_PROMPTS_DIR = `${import.meta.dir}/../src/commit/agentic/prompts/`;
 
-const PRGJCT_DIRS = [PRGJCTS_DIR, COMMIT_PRGJCTS_DIR, AGENTIC_PRGJCTS_DIR];
+const PROMPT_DIRS = [PROMPTS_DIR, COMMIT_PROMPTS_DIR, AGENTIC_PROMPTS_DIR];
 
-const PRGJCT_FORMAT_OPTIONS = {
+const PROMPT_FORMAT_OPTIONS = {
 	renderPhase: "pre-render",
 	replaceAsciiSymbols: true,
 	normalizeRfc2119: true,
@@ -34,7 +34,7 @@ async function main() {
 	let changed = 0;
 	const check = process.argv.includes("--check");
 
-	for (const dir of PRGJCT_DIRS) {
+	for (const dir of PROMPT_DIRS) {
 		for await (const path of glob.scan(dir)) {
 			files.push(`${dir}${path}`);
 		}
@@ -42,7 +42,7 @@ async function main() {
 
 	for (const fullPath of files) {
 		const original = await Bun.file(fullPath).text();
-		const formatted = prompt.format(original, PRGJCT_FORMAT_OPTIONS);
+		const formatted = prompt.format(original, PROMPT_FORMAT_OPTIONS);
 
 		if (original !== `${formatted}\n`) {
 			if (check) {

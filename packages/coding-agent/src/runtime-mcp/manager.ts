@@ -548,7 +548,7 @@ export class MCPManager {
 				}
 				break;
 			}
-			case MCPNotificationMethods.PRGJCTS_LIST_CHANGED:
+			case MCPNotificationMethods.PROMPTS_LIST_CHANGED:
 				this.#triggerNotificationRefresh(serverName, "prompts");
 				break;
 			default:

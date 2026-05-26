@@ -75,7 +75,7 @@ export class STTController {
 			}
 		}
 		const id = Snowflake.next();
-		this.#tempFile = path.join(os.tmpdir(), `omp-stt-${id}.wav`);
+		this.#tempFile = path.join(os.tmpdir(), `gjc-stt-${id}.wav`);
 
 		try {
 			this.#recordingHandle = await startRecording(this.#tempFile);

@@ -36,7 +36,7 @@ describe("CLI help load order", () => {
 		if (Bun.semver.order(Bun.version, "1.3.14") < 0) {
 			return;
 		}
-		const root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-help-load-order-"));
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-help-load-order-"));
 		cleanupRoot = root;
 		const home = path.join(root, "home");
 		const xdg = path.join(root, "xdg");

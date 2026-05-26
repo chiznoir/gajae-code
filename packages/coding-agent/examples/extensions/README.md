@@ -9,7 +9,7 @@ Example extensions for gajae-code.
 pi --extension examples/extensions/permission-gate.ts
 
 # Or copy to extensions directory for auto-discovery
-cp permission-gate.ts ~/.omp/agent/extensions/
+cp permission-gate.ts ~/.gjc/agent/extensions/
 ```
 
 ## Examples

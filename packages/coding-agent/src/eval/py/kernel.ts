@@ -26,7 +26,7 @@ const TRACE_IPC = $flag("PI_PYTHON_IPC_TRACE");
 
 // Cache the runner script on disk so the subprocess loads it normally. Cached
 // per script hash so installs don't race across versions.
-const RUNNER_CACHE_DIR = path.join(os.tmpdir(), "omp-python-runner");
+const RUNNER_CACHE_DIR = path.join(os.tmpdir(), "gjc-python-runner");
 let RUNNER_SCRIPT_PATH: string | null = null;
 
 async function ensureRunnerScript(): Promise<string> {
@@ -659,10 +659,10 @@ function buildInitScript(cwd: string, env?: Record<string, string | undefined>):
 	const envPayload = Object.fromEntries(envEntries);
 	return [
 		"import os, sys",
-		`__omp_cwd = ${JSON.stringify(cwd)}`,
-		"os.chdir(__omp_cwd)",
-		`__omp_env = ${JSON.stringify(envPayload)}`,
-		"for __omp_key, __omp_val in __omp_env.items():\n    os.environ[__omp_key] = __omp_val",
-		"if __omp_cwd not in sys.path:\n    sys.path.insert(0, __omp_cwd)",
+		`__gjc_cwd = ${JSON.stringify(cwd)}`,
+		"os.chdir(__gjc_cwd)",
+		`__gjc_env = ${JSON.stringify(envPayload)}`,
+		"for __gjc_key, __gjc_val in __gjc_env.items():\n    os.environ[__gjc_key] = __gjc_val",
+		"if __gjc_cwd not in sys.path:\n    sys.path.insert(0, __gjc_cwd)",
 	].join("\n");
 }

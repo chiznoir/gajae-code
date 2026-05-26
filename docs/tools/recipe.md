@@ -109,7 +109,7 @@ Resolution rules from `resolveRunnerAndTask()`:
   - Runtime command execution honors the passed abort signal through `BashTool`.
 
 ## Limits & Caps
-- Prompt task listing is capped at `PRGJCT_TASK_LIMIT = 20` per runner in `packages/coding-agent/src/tools/recipe/runner.ts`; this affects the rendered tool description, not execution.
+- Prompt task listing is capped at `PROMPT_TASK_LIMIT = 20` per runner in `packages/coding-agent/src/tools/recipe/runner.ts`; this affects the rendered tool description, not execution.
 - Recipe itself defines no timeout input; delegated bash execution therefore uses bash's default `timeout = 300` seconds from `packages/coding-agent/src/tools/bash.ts`.
 - Bash clamps timeouts to the configured bash range (`clampTimeout("bash", ...)` in `packages/coding-agent/src/tools/bash.ts`), but recipe cannot request a custom value.
 - `pkg` workspace discovery normalizes workspace globs to `.../package.json` and sorts matched package files lexicographically before task generation.

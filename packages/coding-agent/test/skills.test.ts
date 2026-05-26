@@ -159,6 +159,42 @@ describe("skills", () => {
 			expect(skills.map(s => s.name)).toEqual(expectedFixtureSkillOrder);
 		});
 
+		it("should ignore Codex and Claude skills even when their source toggles are enabled", async () => {
+			const tempHomeDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-external-skills-home-"));
+			const tempProjectDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-external-skills-project-"));
+
+			try {
+				for (const root of [
+					path.join(tempHomeDir, ".codex", "skills", "codex-user-skill"),
+					path.join(tempProjectDir, ".codex", "skills", "codex-project-skill"),
+					path.join(tempHomeDir, ".claude", "skills", "claude-user-skill"),
+					path.join(tempProjectDir, ".claude", "skills", "claude-project-skill"),
+				]) {
+					await fs.mkdir(root, { recursive: true });
+					await fs.writeFile(
+						path.join(root, "SKILL.md"),
+						["---", `name: ${path.basename(root)}`, "description: External skill", "---", "", "# External"].join(
+							"\n",
+						),
+					);
+				}
+
+				const { skills } = await loadSkills({
+					cwd: tempProjectDir,
+					enableCodexUser: true,
+					enableClaudeUser: true,
+					enableClaudeProject: true,
+					enablePiUser: false,
+					enablePiProject: false,
+				});
+
+				expect(skills).toEqual([]);
+			} finally {
+				await fs.rm(tempProjectDir, { recursive: true, force: true });
+				await fs.rm(tempHomeDir, { recursive: true, force: true });
+			}
+		});
+
 		it("should keep user Claude skills when project .claude/skills is missing", async () => {
 			const tempHomeDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-claude-home-"));
 			const tempProjectDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-claude-project-"));
@@ -218,7 +254,7 @@ describe("skills", () => {
 		});
 
 		it("should skip skills disabled via frontmatter", async () => {
-			const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-disabled-skill-"));
+			const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-disabled-skill-"));
 			const skillDir = path.join(tempDir, "disabled-skill");
 			await fs.mkdir(skillDir, { recursive: true });
 			await fs.writeFile(

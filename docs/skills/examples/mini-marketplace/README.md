@@ -30,7 +30,7 @@ mini-marketplace/
     marketplace.json      ← catalog
   README.md
   my-plugin/
-    package.json          ← omp.extensions manifest
+    package.json          ← gjc.extensions manifest
     index.ts              ← extension entry point
 ```
 

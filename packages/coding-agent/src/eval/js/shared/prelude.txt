@@ -1,8 +1,8 @@
-if (!globalThis.__omp_js_prelude_loaded__) {
-	globalThis.__omp_js_prelude_loaded__ = true;
+if (!globalThis.__gjc_js_prelude_loaded__) {
+	globalThis.__gjc_js_prelude_loaded__ = true;
 
 	const toOptions = value => (value && typeof value === "object" && !Array.isArray(value) ? value : {});
-	const callHelper = (name, ...args) => globalThis.__omp_helpers__[name](...args);
+	const callHelper = (name, ...args) => globalThis.__gjc_helpers__[name](...args);
 
 	const read = (path, opts = {}) => callHelper("read", path, toOptions(opts));
 	const write = async (path, data) => callHelper("writeFile", path, data);
@@ -19,7 +19,7 @@ if (!globalThis.__omp_js_prelude_loaded__) {
 		{
 			get(_target, prop) {
 				if (typeof prop !== "string") return undefined;
-				return async args => globalThis.__omp_call_tool__(prop, args ?? {});
+				return async args => globalThis.__gjc_call_tool__(prop, args ?? {});
 			},
 		},
 	);
@@ -40,17 +40,17 @@ if (!globalThis.__omp_js_prelude_loaded__) {
 	};
 
 	const display = value => {
-		globalThis.__omp_display__(value);
+		globalThis.__gjc_display__(value);
 	};
 
 	const formatArgs = args => args.map(arg => (typeof arg === "string" ? arg : arg));
 
 	const consoleBridge = {
-		log: (...args) => globalThis.__omp_log__("log", ...formatArgs(args)),
-		info: (...args) => globalThis.__omp_log__("info", ...formatArgs(args)),
-		warn: (...args) => globalThis.__omp_log__("warn", ...formatArgs(args)),
-		error: (...args) => globalThis.__omp_log__("error", ...formatArgs(args)),
-		debug: (...args) => globalThis.__omp_log__("debug", ...formatArgs(args)),
+		log: (...args) => globalThis.__gjc_log__("log", ...formatArgs(args)),
+		info: (...args) => globalThis.__gjc_log__("info", ...formatArgs(args)),
+		warn: (...args) => globalThis.__gjc_log__("warn", ...formatArgs(args)),
+		error: (...args) => globalThis.__gjc_log__("error", ...formatArgs(args)),
+		debug: (...args) => globalThis.__gjc_log__("debug", ...formatArgs(args)),
 	};
 
 	globalThis.console = consoleBridge;

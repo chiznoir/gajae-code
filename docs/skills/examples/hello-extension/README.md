@@ -7,15 +7,15 @@ A minimal `gajae-code` extension that demonstrates the two most common authoring
 **Option A — drop into user extensions directory:**
 
 ```
-cp -r . ~/.omp/agent/extensions/hello-extension
+cp -r . ~/.gjc/agent/extensions/hello-extension
 ```
 
-Restart `omp`. You will see the startup notification immediately.
+Restart `gjc`. You will see the startup notification immediately.
 
 **Option B — point the settings `extensions` array at it:**
 
 ```yaml
-# ~/.omp/agent/config.yml
+# ~/.gjc/agent/config.yml
 extensions:
   - /path/to/hello-extension
 ```
@@ -36,4 +36,4 @@ After loading, type `/hello` in the gjc prompt to trigger the notification.
 - `pi.on("session_start", ...)` — session lifecycle hook
 - `pi.registerCommand(...)` — slash command registration
 - `ctx.ui.notify(...)` — user-facing notification
-- `package.json` with `omp.extensions` manifest field
+- `package.json` with `gjc.extensions` manifest field

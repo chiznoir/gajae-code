@@ -145,11 +145,11 @@ export function isBunTestRuntime(): boolean {
  * binary. Detects via the embedded virtual-filesystem path markers
  * (`$bunfs`, `~BUN`, or its URL-encoded form `%7EBUN`) in `import.meta.url`,
  * which Bun rewrites for every module bundled into the executable. The
- * `PI_CGJCILED` env var (set by the build script's `--define`) is checked
+ * `PI_COMPILED` env var (set by the build script's `--define`) is checked
  * first for cheap fast-path detection.
  */
 export function isCompiledBinary(): boolean {
-	if (Bun.env.PI_CGJCILED) return true;
+	if (Bun.env.PI_COMPILED) return true;
 	const url = import.meta.url;
 	return url.includes("$bunfs") || url.includes("~BUN") || url.includes("%7EBUN");
 }

@@ -106,9 +106,9 @@ Do not add new runtime asset copy steps. Keep assets in repo and prefer Bun embe
 - Eliminate copy scripts unless the user explicitly requests them or the package already has an intentional generation step.
 - If upstream reads a bundled fallback file at runtime, replace filesystem reads with a Bun text embed import unless the current package already uses a generated asset pipeline.
   - Example (Codex instructions fallback):
-    - `const FALLBACK_PRGJCT_PATH = join(import.meta.dir, "codex-instructions.md");` -> removed
+    - `const FALLBACK_PROMPT_PATH = join(import.meta.dir, "codex-instructions.md");` -> removed
     - `import FALLBACK_INSTRUCTIONS from "./codex-instructions.md" with { type: "text" };`
-    - Use `return FALLBACK_INSTRUCTIONS;` instead of `readFileSync(FALLBACK_PRGJCT_PATH, "utf8")`
+    - Use `return FALLBACK_INSTRUCTIONS;` instead of `readFileSync(FALLBACK_PROMPT_PATH, "utf8")`
 
 ## 6) Port `package.json` carefully
 

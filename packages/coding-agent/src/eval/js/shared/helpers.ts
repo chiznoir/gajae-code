@@ -28,7 +28,7 @@ export interface HelperContext {
 }
 
 /**
- * The set of functions exposed to user code via `globalThis.__omp_helpers__`. The JS
+ * The set of functions exposed to user code via `globalThis.__gjc_helpers__`. The JS
  * prelude reads from this bag and attaches short aliases (`read`, `write`, `tree`, ...)
  * onto the global scope.
  */

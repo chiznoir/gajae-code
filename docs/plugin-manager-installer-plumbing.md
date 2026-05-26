@@ -20,7 +20,7 @@ gjc plugin <action> ...
   -> src/commands/plugin.ts
   -> runPluginCommand(...) in src/cli/plugin-cli.ts
   -> PluginManager method (install/list/uninstall/link/...)
-  -> mutate ~/.gjc/plugins/{package.json,node_modules,omp-plugins.lock.json}
+  -> mutate ~/.gjc/plugins/{package.json,node_modules,gjc-plugins.lock.json}
   -> runtime discovery: discoverAndLoadCustomTools(...) and discoverAndLoadExtensions(...)
   -> getAllPluginToolPaths(cwd) / getAllPluginExtensionPaths(cwd)
   -> custom tool loader imports tool modules; extension loader imports extension modules
@@ -39,7 +39,7 @@ Global plugin state lives under `~/.gjc/plugins`:
 
 - `package.json` — dependency manifest used by `bun install`/`bun uninstall`
 - `node_modules/` — installed plugin packages or symlinks
-- `omp-plugins.lock.json` — runtime state:
+- `gjc-plugins.lock.json` — runtime state:
   - enabled/disabled per plugin
   - selected feature set per plugin
   - persisted plugin settings
@@ -85,7 +85,7 @@ Malformed `package.json` JSON is a hard failure at read time; malformed manifest
 
 1. Parse feature bracket syntax from install spec.
 2. Validate package name against regex + shell-metacharacter denylist.
-3. Ensure plugin `package.json` exists (`omp-plugins`, private dependencies map).
+3. Ensure plugin `package.json` exists (`gjc-plugins`, private dependencies map).
 4. Run `bun install <packageSpec>` in `~/.gjc/plugins`.
 5. Read installed package `node_modules/<name>/package.json`.
 6. Resolve manifest and compute `enabledFeatures`:

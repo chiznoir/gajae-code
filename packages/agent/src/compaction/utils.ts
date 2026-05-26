@@ -182,4 +182,4 @@ export function serializeConversation(messages: Message[]): string {
 // Summarization System Prompt
 // ============================================================================
 
-export const SUMMARIZATION_SYSTEM_PRGJCT = prompt.render(summarizationSystemPrompt);
+export const SUMMARIZATION_SYSTEM_PROMPT = prompt.render(summarizationSystemPrompt);

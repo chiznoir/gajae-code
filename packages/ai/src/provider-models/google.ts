@@ -4,6 +4,7 @@ import { fetchGeminiModels } from "../utils/discovery/gemini";
 
 export interface GoogleModelManagerConfig {
 	apiKey?: string;
+	baseUrl?: string;
 }
 
 export interface GoogleVertexModelManagerConfig {
@@ -28,7 +29,7 @@ export function googleModelManagerOptions(
 	const apiKey = config?.apiKey;
 	return {
 		providerId: "google",
-		...(apiKey ? { fetchDynamicModels: () => fetchGeminiModels({ apiKey }) } : undefined),
+		...(apiKey ? { fetchDynamicModels: () => fetchGeminiModels({ apiKey, baseUrl: config?.baseUrl }) } : undefined),
 	};
 }
 

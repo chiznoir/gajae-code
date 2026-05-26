@@ -1,6 +1,6 @@
 ---
 name: authoring-extensions
-description: Use when creating a new omp extension. Covers ExtensionAPI, factory signature, tool/command/event registration, and local-dev testing.
+description: Use when creating a new gjc extension. Covers ExtensionAPI, factory signature, tool/command/event registration, and local-dev testing.
 ---
 
 # Authoring Extensions
@@ -19,7 +19,7 @@ export default function (pi: ExtensionAPI) {
 }
 ```
 
-That is a working extension. Drop it into `~/.omp/agent/extensions/hello.ts` and restart gjc to see the notification.
+That is a working extension. Drop it into `~/.gjc/agent/extensions/hello.ts` and restart gjc to see the notification.
 
 ## Full example
 
@@ -77,29 +77,29 @@ export default function myExtension(pi: ExtensionAPI) {
 
 gjc discovers extension modules in this order:
 
-1. **Project-scoped auto-discovery** — `<cwd>/.omp/extensions/`
-2. **User-scoped auto-discovery** — `~/.omp/agent/extensions/`
-3. **Marketplace-installed plugins** — `~/.omp/plugins/node_modules/` (extensions shipped inside installed plugin packages)
-4. **CLI flag** — `omp --extension ./my-ext.ts` (also `-e`; `--hook` is treated as an alias)
-5. **Settings `extensions` array** — paths listed in `~/.omp/agent/config.yml` or `<cwd>/.omp/settings.json`
+1. **Project-scoped auto-discovery** — `<cwd>/.gjc/extensions/`
+2. **User-scoped auto-discovery** — `~/.gjc/agent/extensions/`
+3. **Marketplace-installed plugins** — `~/.gjc/plugins/node_modules/` (extensions shipped inside installed plugin packages)
+4. **CLI flag** — `gjc --extension ./my-ext.ts` (also `-e`; `--hook` is treated as an alias)
+5. **Settings `extensions` array** — paths listed in `~/.gjc/agent/config.yml` or `<cwd>/.gjc/settings.json`
 
 Within each scope, de-duplication is by resolved absolute path — first seen wins.
 
-When a path points to a directory, omp resolves the entry point in this order:
+When a path points to a directory, gjc resolves the entry point in this order:
 
-1. `package.json` with `omp.extensions` (or legacy `pi.extensions`) field
+1. `package.json` with `gjc.extensions` (or legacy `pi.extensions`) field
 2. `index.ts`
 3. `index.js`
 4. One-level scan for `*.ts` / `*.js` files and subdir `index.*` / `package.json` manifests
 
 ## package.json manifest
 
-To package an extension as an installable plugin, add an `omp` field to `package.json`:
+To package an extension as an installable plugin, add an `gjc` field to `package.json`:
 
 ```json
 {
-  "name": "my-omp-extension",
-  "omp": {
+  "name": "my-gjc-extension",
+  "gjc": {
     "extensions": ["./src/main.ts"]
   }
 }
@@ -119,7 +119,7 @@ Multiple entry points are supported:
 
 ```json
 {
-  "omp": {
+  "gjc": {
     "extensions": ["./src/safety.ts", "./src/tools.ts"]
   }
 }
@@ -224,14 +224,14 @@ gjc --log-level debug
 Watch for lines like:
 
 ```
-[extension-loader] loading /home/you/.omp/agent/extensions/my-ext.ts
+[extension-loader] loading /home/you/.gjc/agent/extensions/my-ext.ts
 [extension-loader] loaded: my-ext (1 tool, 1 command, 2 handlers)
 ```
 
 To temporarily disable a specific extension by name without removing the file:
 
 ```yaml
-# ~/.omp/agent/config.yml
+# ~/.gjc/agent/config.yml
 disabledExtensions:
   - extension-module:my-ext
 ```

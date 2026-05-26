@@ -22,7 +22,7 @@ export const NON_INTERACTIVE_ENV: Readonly<Record<string, string>> = {
 	GIT_EDITOR: "true",
 	VISUAL: "true",
 	EDITOR: "true",
-	GIT_TERMINAL_PRGJCT: "0",
+	GIT_TERMINAL_PROMPT: "0",
 	SSH_ASKPASS: "/usr/bin/false",
 	CI: "1",
 	// Package manager defaults for unattended execution.
@@ -42,7 +42,7 @@ export const NON_INTERACTIVE_ENV: Readonly<Record<string, string>> = {
 	PIP_DISABLE_PIP_VERSION_CHECK: "1",
 	TF_INPUT: "0",
 	TF_IN_AUTOMATION: "1",
-	GH_PRGJCT_DISABLED: "1",
-	CGJCOSER_NO_INTERACTION: "1",
-	CLOUDSDK_CORE_DISABLE_PRGJCTS: "1",
+	GH_PROMPT_DISABLED: "1",
+	COMPOSER_NO_INTERACTION: "1",
+	CLOUDSDK_CORE_DISABLE_PROMPTS: "1",
 };

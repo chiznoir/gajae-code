@@ -26,8 +26,8 @@ import {
 
 /**
  * Anthropic Messages API (https://docs.anthropic.com/en/api/messages) ↔ pi-ai
- * gateway translation. Inbound: foreign HTTP body → omp Context. Outbound:
- * omp AssistantMessage[Stream] → Anthropic-shaped JSON / SSE.
+ * gateway translation. Inbound: foreign HTTP body → gjc Context. Outbound:
+ * gjc AssistantMessage[Stream] → Anthropic-shaped JSON / SSE.
  */
 
 import type { AuthGatewayParsedRequest as ParsedRequest } from "../auth-gateway/types";

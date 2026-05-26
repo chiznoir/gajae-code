@@ -10,7 +10,7 @@ import { complete, type UserMessage } from "@gajae-code/ai";
 import type { HookAPI } from "@gajae-code/coding-agent";
 import { BorderedLoader } from "@gajae-code/coding-agent";
 
-const SYSTEM_PRGJCT = `You are a question extractor. Given text from a conversation, extract any questions that need answering and format them for the user to fill in.
+const SYSTEM_PROMPT = `You are a question extractor. Given text from a conversation, extract any questions that need answering and format them for the user to fill in.
 
 Output format:
 - List each question on its own line, prefixed with "Q: "
@@ -85,7 +85,7 @@ export default function (pi: HookAPI) {
 
 					const response = await complete(
 						ctx.model!,
-						{ systemPrompt: [SYSTEM_PRGJCT], messages: [userMessage] },
+						{ systemPrompt: [SYSTEM_PROMPT], messages: [userMessage] },
 						{ apiKey, signal: loader.signal },
 					);
 

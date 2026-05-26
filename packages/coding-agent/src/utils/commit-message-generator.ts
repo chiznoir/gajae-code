@@ -13,7 +13,7 @@ import MODEL_PRIO from "../priority.json" with { type: "json" };
 import commitSystemPrompt from "../prompts/system/commit-message-system.md" with { type: "text" };
 import { toReasoningEffort } from "../thinking";
 
-const COMMIT_SYSTEM_PRGJCT = prompt.render(commitSystemPrompt);
+const COMMIT_SYSTEM_PROMPT = prompt.render(commitSystemPrompt);
 const MAX_DIFF_CHARS = 4000;
 const COMMIT_MAX_TOKENS = 60;
 const REASONING_SAFE_MAX_TOKENS = 1024;
@@ -107,7 +107,7 @@ export async function generateCommitMessage(
 			const response = await completeSimple(
 				candidate.model,
 				{
-					systemPrompt: [COMMIT_SYSTEM_PRGJCT],
+					systemPrompt: [COMMIT_SYSTEM_PROMPT],
 					messages: [{ role: "user", content: userMessage, timestamp: Date.now() }],
 				},
 				{ apiKey, maxTokens, reasoning: toReasoningEffort(candidate.thinkingLevel) },

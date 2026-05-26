@@ -12,7 +12,7 @@ import {
 	type CompactionPreparation,
 	compact,
 	createFileOps,
-	DEFAULT_CGJCACTION_SETTINGS,
+	DEFAULT_COMPACTION_SETTINGS,
 	generateBranchSummary,
 	generateHandoff,
 	generateSummary,
@@ -113,7 +113,7 @@ function makePreparation(overrides: Partial<CompactionPreparation> = {}): Compac
 		isSplitTurn: false,
 		tokensBefore: 12345,
 		fileOps: createFileOps(),
-		settings: { ...DEFAULT_CGJCACTION_SETTINGS, remoteEnabled: false },
+		settings: { ...DEFAULT_COMPACTION_SETTINGS, remoteEnabled: false },
 		...overrides,
 	};
 }

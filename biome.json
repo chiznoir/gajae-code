@@ -65,7 +65,7 @@
 			"!**/gen/agent_pb.ts",
 			"!.worktrees/**/*",
 			"!.wt/**/*",
-			"!.omx/**/*"
+			"!.gjc/**/*"
 		]
 	},
 	"assist": {

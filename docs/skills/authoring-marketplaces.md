@@ -1,6 +1,6 @@
 ---
 name: authoring-marketplaces
-description: Use when creating a new omp marketplace. Covers marketplace.json schema, source types, install commands, and publishing.
+description: Use when creating a new gjc marketplace. Covers marketplace.json schema, source types, install commands, and publishing.
 ---
 
 # Authoring Marketplaces
@@ -93,7 +93,7 @@ The catalog file must live at `.claude-plugin/marketplace.json` in the repositor
       "category": "devops",
       "source": {
         "source": "github",
-        "repo": "acme-corp/omp-deploy-plugin",
+        "repo": "acme-corp/gjc-deploy-plugin",
         "ref": "main"
       }
     }
@@ -174,7 +174,7 @@ Declares the plugin as an npm package. `version` is optional:
 ```json
 "source": {
   "source": "npm",
-  "package": "@acme/omp-plugin",
+  "package": "@acme/gjc-plugin",
   "version": "1.2.0"
 }
 ```
@@ -187,7 +187,7 @@ Each plugin directory (regardless of source type) should contain:
 
 ```
 my-plugin/
-  package.json          ← required: declares omp.extensions entry points
+  package.json          ← required: declares gjc.extensions entry points
   src/
     main.ts             ← extension factory
   README.md             ← recommended: description + usage
@@ -198,7 +198,7 @@ Minimum `package.json`:
 ```json
 {
   "name": "my-plugin",
-  "omp": {
+  "gjc": {
     "extensions": ["./src/main.ts"]
   }
 }
@@ -221,8 +221,8 @@ gjc plugin install name@marketplace-name
 
 Scope behavior:
 
-- **user** (default) — installed in `~/.omp/plugins/installed_plugins.json`, available in all projects
-- **project** — installed in `<project>/.omp/plugins/installed_plugins.json`, available only in that project
+- **user** (default) — installed in `~/.gjc/plugins/installed_plugins.json`, available in all projects
+- **project** — installed in `<project>/.gjc/plugins/installed_plugins.json`, available only in that project
 
 Project-scoped installs shadow user-scoped installs of the same plugin name.
 

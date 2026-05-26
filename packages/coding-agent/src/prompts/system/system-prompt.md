@@ -62,7 +62,7 @@ With most FS/bash-like tools, static references to them will automatically resol
 - `mcp://<uri>`: MCP resource
 - `issue://<N>` (or `issue://<owner>/<repo>/<N>`): GitHub issue view; cached on disk so re-reads are free. Bare `issue://` (or `issue://<owner>/<repo>`) lists recent issues; supports `?state=open|closed|all&limit=&author=&label=`.
 - `pr://<N>` (or `pr://<owner>/<repo>/<N>`): GitHub PR view; same cache. Append `?comments=0` to drop the comments section. Bare `pr://` (or `pr://<owner>/<repo>`) lists recent PRs; supports `?state=open|closed|merged|all&limit=&author=&label=`.
-- `omp://`: Harness documentation; AVOID reading unless user mentions the harness itself
+- `gjc://`: Harness documentation; AVOID reading unless user mentions the harness itself
 
 {{#if skills.length}}
 # Skills
@@ -191,11 +191,6 @@ You MUST use the specialized tool over its shell equivalent:
   - You NEVER use `2>&1` or `2>/dev/null` — stdout and stderr are already merged.
   - You NEVER suffix commands with `| head -n N` or `| tail -n N` — the harness already streams output and returns a truncated view, with the full result available via `artifact://<id>`.
   - If you catch yourself typing `cat`, `head`, `tail`, `less`, `more`, `ls`, `grep`, `rg`, `find`, `fd`, `sed -i`, `awk -i`, or a heredoc redirect inside a Bash call, stop and switch to the dedicated tool.{{/has}}
-{{#has tools "report_tool_issue"}}
-<critical>
-The `{{toolRefs.report_tool_issue}}` tool is available for automated QA. If ANY tool you call returns output that is unexpected, incorrect, malformed, or otherwise inconsistent with what you anticipated given the tool's described behavior and your parameters, call `{{toolRefs.report_tool_issue}}` with the tool name and a concise description of the discrepancy. Do not hesitate to report — false positives are acceptable.
-</critical>
-{{/has}}
 [/ENV]
 
 [CONTRACT]

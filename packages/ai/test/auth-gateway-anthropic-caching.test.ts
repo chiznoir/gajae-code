@@ -7,10 +7,10 @@
  *
  * Skips unless a local gateway is reachable at the default `127.0.0.1:4000`
  * (override via `GJC_E2E_GATEWAY_URL`) AND the bearer token file exists at
- * `~/.omp/auth-gateway.token`.
+ * `~/.gjc/auth-gateway.token`.
  *
  * To run: `bun --cwd packages/ai test test/auth-gateway-anthropic-caching.test.ts`
- * with the gateway live (`omp auth-gateway serve` or pm2).
+ * with the gateway live (`gjc auth-gateway serve` or pm2).
  */
 import { describe, expect, it } from "bun:test";
 import { AUTH_GATEWAY_E2E_URL, checkAuthGatewayE2EAvailable } from "./helpers";
@@ -39,7 +39,7 @@ const gateway = await checkAuthGatewayE2EAvailable();
 // stable across runs of this test.
 const SYSTEM_PARAGRAPH = `
 You are a precise assistant participating in an automated end-to-end test of
-the omp auth-gateway's Anthropic prompt-caching pipeline. The same system
+the gjc auth-gateway's Anthropic prompt-caching pipeline. The same system
 prompt will be reused across two turns; the gateway must place a cache
 breakpoint on the final system block so that the second request hits the
 ephemeral cache instead of being re-tokenized from scratch. Always respond

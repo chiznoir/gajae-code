@@ -18,7 +18,7 @@ describe("plugin extension discovery", () => {
 		projectDir = TempDir.createSync("@pi-plugin-ext-");
 		originalXdgDataHome = process.env.XDG_DATA_HOME;
 		tempXdgDataHome = fs.mkdtempSync(path.join(os.tmpdir(), "pi-plugin-data-"));
-		fs.mkdirSync(path.join(tempXdgDataHome, "omp"), { recursive: true });
+		fs.mkdirSync(path.join(tempXdgDataHome, "gjc"), { recursive: true });
 		process.env.XDG_DATA_HOME = tempXdgDataHome;
 		// Rebuild path caches after changing XDG env so plugin discovery resolves into the temp root.
 		setAgentDir(originalAgentDir);
@@ -29,7 +29,7 @@ describe("plugin extension discovery", () => {
 		fs.writeFileSync(
 			path.join(pluginsDir, "package.json"),
 			JSON.stringify({
-				name: "omp-plugins",
+				name: "gjc-plugins",
 				private: true,
 				dependencies: {
 					"@demo/plugin": "1.0.0",
@@ -41,7 +41,7 @@ describe("plugin extension discovery", () => {
 			JSON.stringify({
 				name: "@demo/plugin",
 				version: "1.0.0",
-				omp: {
+				gjc: {
 					extensions: ["./dist/extension.ts"],
 				},
 			}),
@@ -85,7 +85,7 @@ describe("plugin extension discovery", () => {
 		fs.writeFileSync(
 			path.join(pluginsDir, "package.json"),
 			JSON.stringify({
-				name: "omp-plugins",
+				name: "gjc-plugins",
 				private: true,
 				dependencies: {
 					"legacy-pi-plugin": "1.0.0",
@@ -149,7 +149,7 @@ describe("plugin extension discovery", () => {
 		fs.writeFileSync(
 			path.join(pluginsDir, "package.json"),
 			JSON.stringify({
-				name: "omp-plugins",
+				name: "gjc-plugins",
 				private: true,
 				dependencies: {
 					"dir-entry-plugin": "1.0.0",

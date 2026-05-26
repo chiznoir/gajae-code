@@ -356,8 +356,8 @@ interface ExtensionManifest {
 
 async function readExtensionManifest(packageJsonPath: string): Promise<ExtensionManifest | null> {
 	try {
-		const pkg = (await Bun.file(packageJsonPath).json()) as { omp?: ExtensionManifest; pi?: ExtensionManifest };
-		const manifest = pkg.omp ?? pkg.pi;
+		const pkg = (await Bun.file(packageJsonPath).json()) as { gjc?: ExtensionManifest; pi?: ExtensionManifest };
+		const manifest = pkg.gjc ?? pkg.pi;
 		if (manifest && typeof manifest === "object") {
 			return manifest;
 		}
@@ -430,7 +430,7 @@ async function resolveExtensionEntries(dir: string): Promise<string[] | null> {
  * Discovery rules:
  * 1. Direct files: `extensions/*.ts` or `*.js` → load
  * 2. Subdirectory with index: `extensions/<ext>/index.ts` or `index.js` → load
- * 3. Subdirectory with package.json: `extensions/<ext>/package.json` with "omp"/"pi" field → load declared paths
+ * 3. Subdirectory with package.json: `extensions/<ext>/package.json` with "gjc"/"pi" field → load declared paths
  *
  * No recursion beyond one level. Complex packages must use package.json manifest.
  */
@@ -502,7 +502,7 @@ export async function discoverAndLoadExtensions(
 		}
 	};
 
-	// 1. Discover extension modules via capability API (native .omp/.pi only)
+	// 1. Discover extension modules via capability API (native .gjc/.pi only)
 	const discovered = await loadCapability<ExtensionModule>(extensionModuleCapability.id, { cwd });
 	for (const ext of discovered.items) {
 		if (ext._source.provider !== "native") continue;

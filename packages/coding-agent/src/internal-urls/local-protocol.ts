@@ -116,7 +116,7 @@ export function resolveLocalRoot(options: LocalProtocolOptions): string {
 
 	const sessionId = options.getSessionId?.() ?? "session";
 	const safeSessionId = sessionId.replace(/[^a-zA-Z0-9_.-]/g, "_");
-	return path.join(os.tmpdir(), "omp-local", safeSessionId);
+	return path.join(os.tmpdir(), "gjc-local", safeSessionId);
 }
 
 export function resolveLocalUrlToPath(input: string | InternalUrl, options: LocalProtocolOptions): string {

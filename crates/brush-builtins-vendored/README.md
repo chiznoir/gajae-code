@@ -83,7 +83,7 @@ More detailed installation instructions are available below.
 |--|---------|-------------|
 | ✅ | **Syntax highlighting** | Real-time as you type ([reedline](https://github.com/nushell/reedline)) |
 | ✅ | **Auto-suggestions** | History-based hints as you type ([reedline](https://github.com/nushell/reedline)) |
-| ✅ | **Rich prompts** | `PS1`/`PRGJCT_COMMAND`, right prompts, [starship](https://starship.rs) compatible |
+| ✅ | **Rich prompts** | `PS1`/`PROMPT_COMMAND`, right prompts, [starship](https://starship.rs) compatible |
 | ✅ | **TOML config** | `~/.config/brush/config.toml` for persistent settings |
 | 🧪 | **Extras** | `fzf`/`atuin` support, zsh-style `precmd`/`preexec` hooks (experimental), VS Code terminal integration |
 

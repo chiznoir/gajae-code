@@ -189,7 +189,7 @@ Final stored summary is merged as:
 3. Wrap in `<conversation>...</conversation>`.
 4. Optionally include `<previous-summary>...</previous-summary>`.
 5. Optionally inject hook context as `<additional-context>` list.
-6. Execute summarization prompt with `SUMMARIZATION_SYSTEM_PRGJCT`.
+6. Execute summarization prompt with `SUMMARIZATION_SYSTEM_PROMPT`.
 
 Prompt selection:
 
@@ -301,7 +301,7 @@ Branch summarization:
 1. Converts and serializes selected messages.
 2. Wraps in `<conversation>`.
 3. Uses custom instructions if supplied, otherwise `branch-summary.md`.
-4. Calls summarization model with `SUMMARIZATION_SYSTEM_PRGJCT`.
+4. Calls summarization model with `SUMMARIZATION_SYSTEM_PROMPT`.
 5. Prepends `branch-summary-preamble.md`.
 6. Appends file-operation tags.
 

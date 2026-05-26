@@ -32,14 +32,14 @@ At module initialization, `native/index.js` computes:
   - `execDir`: directory containing `process.execPath`.
   - `versionedDir`: `<getNativesDir()>/<packageVersion>`.
   - `userDataDir` fallback:
-    - Windows: `%LOCALAPPDATA%/gjc` or `%USERPROFILE%/AppData/Local/omp`.
+    - Windows: `%LOCALAPPDATA%/gjc` or `%USERPROFILE%/AppData/Local/gjc`.
     - Non-Windows: `~/.local/bin`.
 - **Natives cache root** (`getNativesDir()`):
   - if `$XDG_DATA_HOME/gjc` exists, `$XDG_DATA_HOME/gjc/natives`;
   - otherwise `~/.gjc/natives`.
 - **Compiled-binary mode** (`detectCompiledBinary`): true if any of:
   - embedded-addon manifest is non-null,
-  - `GJC_CGJCILED` env var is set,
+  - `GJC_COMPILED` env var is set,
   - `import.meta.url` contains Bun embedded markers (`$bunfs`, `~BUN`, `%7EBUN`).
 - **Variant override**: `GJC_NATIVE_VARIANT` (`modern`/`baseline` only; invalid values ignored).
 - **Selected variant**: explicit override, otherwise runtime AVX2 detection on x64 (`modern` if AVX2, else `baseline`).

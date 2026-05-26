@@ -39,7 +39,7 @@ import {
 	createFileOps,
 	extractFileOpsFromMessage,
 	type FileOperations,
-	SUMMARIZATION_SYSTEM_PRGJCT,
+	SUMMARIZATION_SYSTEM_PROMPT,
 	serializeConversation,
 	upsertFileOperations,
 } from "./utils";
@@ -143,7 +143,7 @@ export interface CompactionSettings {
 	remoteEndpoint?: string;
 }
 
-export const DEFAULT_CGJCACTION_SETTINGS: CompactionSettings = {
+export const DEFAULT_COMPACTION_SETTINGS: CompactionSettings = {
 	enabled: true,
 	strategy: "context-full",
 	thresholdPercent: -1,
@@ -486,13 +486,13 @@ export function findCutPoint(
 // Summarization
 // ============================================================================
 
-const SUMMARIZATION_PRGJCT = prompt.render(compactionSummaryPrompt);
+const SUMMARIZATION_PROMPT = prompt.render(compactionSummaryPrompt);
 
-const UPDATE_SUMMARIZATION_PRGJCT = prompt.render(compactionUpdateSummaryPrompt);
+const UPDATE_SUMMARIZATION_PROMPT = prompt.render(compactionUpdateSummaryPrompt);
 
-const SHORT_SUMMARY_PRGJCT = prompt.render(compactionShortSummaryPrompt);
+const SHORT_SUMMARY_PROMPT = prompt.render(compactionShortSummaryPrompt);
 
-const HANDOFF_DOCUMENT_PRGJCT = prompt.render(handoffDocumentPrompt);
+const HANDOFF_DOCUMENT_PROMPT = prompt.render(handoffDocumentPrompt);
 
 export const AUTO_HANDOFF_THRESHOLD_FOCUS = prompt.render(autoHandoffThresholdFocusPrompt);
 
@@ -536,7 +536,7 @@ export async function generateSummary(
 	const maxTokens = Math.floor(0.8 * reserveTokens);
 
 	// Use update prompt if we have a previous summary, otherwise initial prompt
-	let basePrompt = previousSummary ? UPDATE_SUMMARIZATION_PRGJCT : SUMMARIZATION_PRGJCT;
+	let basePrompt = previousSummary ? UPDATE_SUMMARIZATION_PROMPT : SUMMARIZATION_PROMPT;
 	if (options?.promptOverride) {
 		basePrompt = options.promptOverride;
 	}
@@ -569,7 +569,7 @@ export async function generateSummary(
 		const remote = await requestRemoteCompaction(
 			options.remoteEndpoint,
 			{
-				systemPrompt: SUMMARIZATION_SYSTEM_PRGJCT,
+				systemPrompt: SUMMARIZATION_SYSTEM_PROMPT,
 				prompt: promptText,
 			},
 			signal,
@@ -579,7 +579,7 @@ export async function generateSummary(
 
 	const response = await instrumentedCompleteSimple(
 		model,
-		{ systemPrompt: [SUMMARIZATION_SYSTEM_PRGJCT], messages: summarizationMessages },
+		{ systemPrompt: [SUMMARIZATION_SYSTEM_PROMPT], messages: summarizationMessages },
 		{
 			maxTokens,
 			signal,
@@ -624,7 +624,7 @@ export interface HandoffOptions {
 }
 
 export function renderHandoffPrompt(customInstructions?: string): string {
-	if (!customInstructions) return HANDOFF_DOCUMENT_PRGJCT;
+	if (!customInstructions) return HANDOFF_DOCUMENT_PROMPT;
 	return prompt.render(handoffDocumentPrompt, {
 		additionalFocus: customInstructions,
 	});
@@ -694,13 +694,13 @@ async function generateShortSummary(
 		promptText += `<previous-summary>\n${historySummary}\n</previous-summary>\n\n`;
 	}
 	promptText += formatAdditionalContext(options?.extraContext);
-	promptText += SHORT_SUMMARY_PRGJCT;
+	promptText += SHORT_SUMMARY_PROMPT;
 
 	if (options?.remoteEndpoint) {
 		const remote = await requestRemoteCompaction(
 			options.remoteEndpoint,
 			{
-				systemPrompt: SUMMARIZATION_SYSTEM_PRGJCT,
+				systemPrompt: SUMMARIZATION_SYSTEM_PROMPT,
 				prompt: promptText,
 			},
 			signal,
@@ -711,7 +711,7 @@ async function generateShortSummary(
 	const response = await instrumentedCompleteSimple(
 		model,
 		{
-			systemPrompt: [SUMMARIZATION_SYSTEM_PRGJCT],
+			systemPrompt: [SUMMARIZATION_SYSTEM_PROMPT],
 			messages: [{ role: "user", content: [{ type: "text", text: promptText }], timestamp: Date.now() }],
 		},
 		{
@@ -866,7 +866,7 @@ export function prepareCompaction(
 // Main compaction function
 // ============================================================================
 
-const TURN_PREFIX_SUMMARIZATION_PRGJCT = prompt.render(compactionTurnPrefixPrompt);
+const TURN_PREFIX_SUMMARIZATION_PROMPT = prompt.render(compactionTurnPrefixPrompt);
 
 /**
  * Generate summaries for compaction using prepared data.
@@ -926,7 +926,7 @@ export async function compact(
 					model,
 					apiKey,
 					remoteHistory,
-					summaryOptions.remoteInstructions ?? SUMMARIZATION_SYSTEM_PRGJCT,
+					summaryOptions.remoteInstructions ?? SUMMARIZATION_SYSTEM_PROMPT,
 					signal,
 				);
 				preserveData = withOpenAiRemoteCompactionPreserveData(previousPreserveData, remote);
@@ -1031,7 +1031,7 @@ async function generateTurnPrefixSummary(
 
 	const llmMessages = (options?.convertToLlm ?? convertToLlm)(messages);
 	const conversationText = serializeConversation(llmMessages);
-	const promptText = `<conversation>\n${conversationText}\n</conversation>\n\n${TURN_PREFIX_SUMMARIZATION_PRGJCT}`;
+	const promptText = `<conversation>\n${conversationText}\n</conversation>\n\n${TURN_PREFIX_SUMMARIZATION_PROMPT}`;
 	const summarizationMessages = [
 		{
 			role: "user" as const,
@@ -1042,7 +1042,7 @@ async function generateTurnPrefixSummary(
 
 	const response = await instrumentedCompleteSimple(
 		model,
-		{ systemPrompt: [SUMMARIZATION_SYSTEM_PRGJCT], messages: summarizationMessages },
+		{ systemPrompt: [SUMMARIZATION_SYSTEM_PROMPT], messages: summarizationMessages },
 		{
 			maxTokens,
 			signal,

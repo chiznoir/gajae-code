@@ -29,7 +29,7 @@ import { createAgentSession, discoverAuthStorage } from "../sdk";
 import type { AgentSession, AgentSessionEvent } from "../session/agent-session";
 import type { ArtifactManager } from "../session/artifacts";
 import type { AuthStorage } from "../session/auth-storage";
-import { SKILL_PRGJCT_MESSAGE_TYPE } from "../session/messages";
+import { SKILL_PROMPT_MESSAGE_TYPE } from "../session/messages";
 import { SessionManager } from "../session/session-manager";
 import { truncateTail } from "../session/streaming-output";
 import type { ContextFileEntry } from "../tools";
@@ -1431,7 +1431,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					const { message } = await buildSkillPromptMessage(skill, "");
 					await session.sendCustomMessage(
 						{
-							customType: SKILL_PRGJCT_MESSAGE_TYPE,
+							customType: SKILL_PROMPT_MESSAGE_TYPE,
 							content: message,
 							display: false,
 							details: { name: skill.name, path: skill.filePath },

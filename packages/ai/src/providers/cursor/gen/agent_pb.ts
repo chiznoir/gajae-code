@@ -14910,9 +14910,9 @@ export enum TodoStatus {
 	IN_PROGRESS = 2,
 
 	/**
-	 * @generated from enum value: TODO_STATUS_CGJCLETED = 3;
+	 * @generated from enum value: TODO_STATUS_COMPLETED = 3;
 	 */
-	CGJCLETED = 3,
+	COMPLETED = 3,
 
 	/**
 	 * @generated from enum value: TODO_STATUS_CANCELLED = 4;

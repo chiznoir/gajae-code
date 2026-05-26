@@ -84,7 +84,7 @@ function parseWmicTable(output: string, header: string): string | null {
 	return filtered[0] ?? null;
 }
 
-const SYSTEM_PRGJCT_PREP_TIMEOUT_MS = 5000;
+const SYSTEM_PROMPT_PREP_TIMEOUT_MS = 5000;
 
 async function getGpuModel(): Promise<string | null> {
 	switch (process.platform) {
@@ -370,7 +370,7 @@ export interface BuildSystemPromptResult {
 
 /** Build the system prompt with tools, guidelines, and context */
 export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}): Promise<BuildSystemPromptResult> {
-	if ($env.NULL_PRGJCT === "true") {
+	if ($env.NULL_PROMPT === "true") {
 		return { systemPrompt: [] };
 	}
 
@@ -410,7 +410,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		} satisfies WorkspaceTree,
 	};
 
-	const deadline = Bun.sleep(SYSTEM_PRGJCT_PREP_TIMEOUT_MS).then(() => "__timeout__" as const);
+	const deadline = Bun.sleep(SYSTEM_PROMPT_PREP_TIMEOUT_MS).then(() => "__timeout__" as const);
 	const timedOut: string[] = [];
 	const failed: Array<{ name: string; error: unknown }> = [];
 
@@ -448,7 +448,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		providedWorkspaceTree !== undefined
 			? Promise.resolve(providedWorkspaceTree)
 			: logger.time("buildWorkspaceTree", () =>
-					buildWorkspaceTree(resolvedCwd, { timeoutMs: SYSTEM_PRGJCT_PREP_TIMEOUT_MS }),
+					buildWorkspaceTree(resolvedCwd, { timeoutMs: SYSTEM_PROMPT_PREP_TIMEOUT_MS }),
 				);
 	const skillsPromise: Promise<Skill[]> =
 		providedSkills !== undefined
@@ -485,11 +485,11 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 	if (timedOut.length > 0) {
 		logger.warn("System prompt preparation steps timed out; using minimal fallback for those steps", {
 			cwd: resolvedCwd,
-			timeoutMs: SYSTEM_PRGJCT_PREP_TIMEOUT_MS,
+			timeoutMs: SYSTEM_PROMPT_PREP_TIMEOUT_MS,
 			steps: timedOut,
 		});
 		process.stderr.write(
-			`Warning: system prompt preparation steps timed out after ${SYSTEM_PRGJCT_PREP_TIMEOUT_MS}ms (${timedOut.join(", ")}); using minimal fallback for those steps.\n`,
+			`Warning: system prompt preparation steps timed out after ${SYSTEM_PROMPT_PREP_TIMEOUT_MS}ms (${timedOut.join(", ")}); using minimal fallback for those steps.\n`,
 		);
 	}
 	if (failed.length > 0) {

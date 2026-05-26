@@ -28,35 +28,21 @@ const expectedVisibleDefinitions = ["deep-interview", "ralplan", "team", "ultrag
 const expectedPackageScope = "@gajae-code/";
 const expectedCliBins = ["gjc", "gjc-stats", "gjc-swarm"] as const;
 
-const ignoredDirs = new Set([".git", "node_modules", "dist", "build", "coverage", ".turbo"]);
+const ignoredDirs = new Set([".git", "node_modules", ".gjc", "dist", "build", "coverage", ".turbo"]);
 const ignoredFiles = new Set(["bun.lock", "Cargo.lock"]);
+const ignoredExtensions = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".node", ".wasm"]);
 
-const legacyTokenPatterns = [
-	{ token: "@oh-my-pi", pattern: /@oh-my-pi\b/gi },
-	{ token: "oh-my-pi", pattern: /\boh-my-pi\b/gi },
-	{ token: "omp", pattern: /\bomp\b/gi },
-];
+const forbiddenLegacyTokens = ["@oh-my" + "-pi", "oh-my" + "-pi", "om" + "p"] as const;
+const legacyTokenPatterns = forbiddenLegacyTokens.map(token => ({
+	token,
+	pattern: new RegExp(token === "om" + "p" ? String.raw`\b${token}\b` : token.replaceAll("-", String.raw`\-`), "gi"),
+}));
 
 const legacyAllowlist = [
 	{
 		name: "attribution-and-license",
 		path: /(^LICENSE$|(^|\/)(CHANGELOG|NOTICE|AUTHORS)\.md$)/,
-		rationale: "Historical attribution may mention upstream OMP/Pi names.",
-	},
-	{
-		name: "compatibility-docs",
-		path: /^docs\/(environment-variables|python-repl|task-agent-discovery)\.md$/,
-		rationale: "Compatibility docs may describe retained legacy env/protocol names.",
-	},
-	{
-		name: "runtime-compatibility-internals",
-		path: /^packages\/(coding-agent|agent|ai|tui|utils|stats|swarm-extension|natives)\//,
-		rationale: "Runtime internals may retain legacy aliases while user-facing copy is rebranded.",
-	},
-	{
-		name: "repo-shipped-skill-provider-path",
-		path: /^\.omp\/skills\/(deep-interview|ralplan|team|ultragoal)\/SKILL\.md$/,
-		rationale: "The .omp provider path is retained as a private compatibility container for the four visible skills.",
+		rationale: "Historical attribution files may mention upstream names.",
 	},
 ] as const;
 
@@ -75,7 +61,7 @@ function walk(dir: string, files: string[] = []): string[] {
 			if (!ignoredDirs.has(entry.name)) walk(path.join(dir, entry.name), files);
 			continue;
 		}
-		if (entry.isFile() && !ignoredFiles.has(entry.name)) files.push(path.join(dir, entry.name));
+		if (entry.isFile() && !ignoredFiles.has(entry.name) && !ignoredExtensions.has(path.extname(entry.name).toLowerCase())) files.push(path.join(dir, entry.name));
 	}
 	return files;
 }
@@ -134,14 +120,10 @@ function listSkillDirs(dir: string): VisibleDefinition[] {
 
 function listVisibleDefinitions(): VisibleDefinition[] {
 	return [
-		...listSkillDirs(".omp/skills"),
-		...listSkillDirs(".codex/skills"),
-		...listDefinitionFiles(".omp/agents", "agent", [".md", ".toml"]),
-		...listDefinitionFiles(".codex/agents", "agent", [".md", ".toml"]),
-		...listDefinitionFiles(".omp/commands", "command", [".md"]),
-		...listDefinitionFiles(".codex/commands", "command", [".md"]),
-		...listDefinitionFiles(".omp/rules", "rule", [".md"]),
-		...listDefinitionFiles(".codex/rules", "rule", [".md"]),
+		...listSkillDirs(".gjc/skills"),
+		...listDefinitionFiles(".gjc/agents", "agent", [".md", ".toml"]),
+		...listDefinitionFiles(".gjc/commands", "command", [".md"]),
+		...listDefinitionFiles(".gjc/rules", "rule", [".md"]),
 	].sort((a, b) => a.name.localeCompare(b.name) || a.path.localeCompare(b.path));
 }
 
@@ -150,7 +132,7 @@ function allowlistFor(filePath: string): string | undefined {
 }
 
 function scanLegacyHits(): LegacyHit[] {
-	const roots = ["README.md", "docs", "packages", ".omp", ".codex", "assets", "package.json"];
+	const roots = ["README.md", "docs", "packages", "python", "scripts", ".gjc", "assets", "package.json", "Cargo.toml", "Dockerfile", "Dockerfile.robogjc", "Dockerfile.dockerignore", "Dockerfile.robogjc.dockerignore"];
 	const files = roots.flatMap(root => {
 		const full = path.join(repoRoot, root);
 		if (!fs.existsSync(full)) return [];

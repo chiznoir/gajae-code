@@ -33,7 +33,7 @@ async function runGit(repo: string, args: string[]): Promise<string> {
 }
 
 async function createGitRepo(): Promise<{ baseBranch: string; repo: string }> {
-	const repo = await fs.mkdtemp(path.join(os.tmpdir(), "omp-worktree-"));
+	const repo = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-worktree-"));
 	tempDirs.push(repo);
 	await runGit(repo, ["init"]);
 	await runGit(repo, ["config", "user.email", "test@example.com"]);

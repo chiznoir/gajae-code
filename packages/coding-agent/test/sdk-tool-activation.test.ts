@@ -112,7 +112,7 @@ describe("createAgentSession defaultInactive tool activation", () => {
 		}
 	});
 
-	it("preserves inline and local OMP tools when MCP is not enabled", async () => {
+	it("preserves inline and local GJC tools when MCP is not enabled", async () => {
 		const tempDir = path.join(os.tmpdir(), `pi-sdk-tool-activation-${Snowflake.next()}`);
 		tempDirs.push(tempDir);
 		fs.mkdirSync(tempDir, { recursive: true });

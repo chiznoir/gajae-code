@@ -463,7 +463,7 @@ describe("openai-codex streaming", () => {
 				return new Response(JSON.stringify({ tag_name: "rust-v0.0.0" }), { status: 200 });
 			}
 			if (url.startsWith("https://raw.githubusercontent.com/openai/codex/")) {
-				return new Response("PRGJCT", { status: 200, headers: { etag: '"etag"' } });
+				return new Response("PROMPT", { status: 200, headers: { etag: '"etag"' } });
 			}
 			if (url === "https://chatgpt.com/backend-api/codex/responses") {
 				const headers = init?.headers instanceof Headers ? init.headers : undefined;
@@ -860,7 +860,7 @@ describe("openai-codex streaming", () => {
 				return new Response(JSON.stringify({ tag_name: "rust-v0.0.0" }), { status: 200 });
 			}
 			if (url.startsWith("https://raw.githubusercontent.com/openai/codex/")) {
-				return new Response("PRGJCT", { status: 200, headers: { etag: '"etag"' } });
+				return new Response("PROMPT", { status: 200, headers: { etag: '"etag"' } });
 			}
 			if (url === "https://chatgpt.com/backend-api/codex/responses") {
 				const headers = init?.headers instanceof Headers ? init.headers : undefined;
@@ -960,7 +960,7 @@ describe("openai-codex streaming", () => {
 				return new Response(JSON.stringify({ tag_name: "rust-v0.0.0" }), { status: 200 });
 			}
 			if (url.startsWith("https://raw.githubusercontent.com/openai/codex/")) {
-				return new Response("PRGJCT", { status: 200, headers: { etag: '"etag"' } });
+				return new Response("PROMPT", { status: 200, headers: { etag: '"etag"' } });
 			}
 			if (url === "https://chatgpt.com/backend-api/codex/responses") {
 				const body = typeof init?.body === "string" ? (JSON.parse(init.body) as Record<string, unknown>) : null;
@@ -1050,7 +1050,7 @@ describe("openai-codex streaming", () => {
 				return new Response(JSON.stringify({ tag_name: "rust-v0.0.0" }), { status: 200 });
 			}
 			if (url.startsWith("https://raw.githubusercontent.com/openai/codex/")) {
-				return new Response("PRGJCT", { status: 200, headers: { etag: '"etag"' } });
+				return new Response("PROMPT", { status: 200, headers: { etag: '"etag"' } });
 			}
 			if (url === "https://chatgpt.com/backend-api/codex/responses") {
 				const headers = init?.headers instanceof Headers ? init.headers : undefined;

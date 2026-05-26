@@ -41,11 +41,11 @@ describe("parseEnvFile", () => {
 		});
 	});
 
-	it("keeps legacy OMP_ variables from becoming PI_ defaults", () => {
-		const filePath = writeTempEnv("OMP_FEATURE=enabled\nOMP_BAD=before\0after\n");
+	it("keeps legacy GJC_ variables from becoming PI_ defaults", () => {
+		const filePath = writeTempEnv("GJC_FEATURE=enabled\nGJC_BAD=before\0after\n");
 
 		expect(parseEnvFile(filePath)).toEqual({
-			OMP_FEATURE: "enabled",
+			GJC_FEATURE: "enabled",
 		});
 	});
 });

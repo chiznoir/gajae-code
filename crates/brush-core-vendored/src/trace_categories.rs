@@ -3,7 +3,7 @@
 /// Trace category for command execution.
 pub const COMMANDS: &str = "commands";
 /// Trace category for completion.
-pub const CGJCLETION: &str = "completion";
+pub const COMPLETION: &str = "completion";
 /// Trace category for word expansion.
 pub const EXPANSION: &str = "expansion";
 /// Trace category for function calls.

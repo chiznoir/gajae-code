@@ -7,7 +7,7 @@
  *
  * Pipeline under test:
  *   client → POST /v1/responses (OpenAI shape)
- *     → openai-responses parser → omp Context
+ *     → openai-responses parser → gjc Context
  *     → pi-ai anthropic provider (auto cache_control via cacheRetention)
  *     → upstream Anthropic (Messages API)
  *     → assistant stream → openai-responses encoder
@@ -21,10 +21,10 @@
  *
  * Skips unless a local gateway is reachable at the default `127.0.0.1:4000`
  * (override via `GJC_E2E_GATEWAY_URL`) AND the bearer token file exists at
- * `~/.omp/auth-gateway.token`.
+ * `~/.gjc/auth-gateway.token`.
  *
  * To run: `bun --cwd packages/ai test test/auth-gateway-cross-protocol-caching.test.ts`
- * with the gateway live (`omp auth-gateway serve` or pm2).
+ * with the gateway live (`gjc auth-gateway serve` or pm2).
  */
 import { describe, expect, it } from "bun:test";
 import { AUTH_GATEWAY_E2E_URL, checkAuthGatewayE2EAvailable } from "./helpers";
@@ -55,7 +55,7 @@ const gateway = await checkAuthGatewayE2EAvailable();
 // cache floor for Sonnet.
 const INSTRUCTIONS_PARAGRAPH = `
 You are a precise assistant participating in an automated end-to-end test of
-the omp auth-gateway's cross-protocol prompt-caching pipeline. The request
+the gjc auth-gateway's cross-protocol prompt-caching pipeline. The request
 arrives over the OpenAI Responses wire format but is fulfilled by an
 Anthropic backend, so the gateway must preserve the cached prefix across the
 translation. Always respond with extreme brevity: a single short word or

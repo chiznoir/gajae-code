@@ -10,7 +10,7 @@ import { resolveRoleSelection } from "../config/model-resolver";
 import type { Settings } from "../config/settings";
 import titleSystemPrompt from "../prompts/system/title-system.md" with { type: "text" };
 
-const TITLE_SYSTEM_PRGJCT = prompt.render(titleSystemPrompt);
+const TITLE_SYSTEM_PROMPT = prompt.render(titleSystemPrompt);
 
 const DEFAULT_TERMINAL_TITLE = "π";
 const TERMINAL_TITLE_CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f]/g;
@@ -102,7 +102,7 @@ ${truncatedMessage}
 	const maxTokens = model.reasoning ? Math.max(TITLE_MAX_TOKENS, REASONING_SAFE_MAX_TOKENS) : TITLE_MAX_TOKENS;
 	const request = {
 		model: `${model.provider}/${model.id}`,
-		systemPrompt: TITLE_SYSTEM_PRGJCT,
+		systemPrompt: TITLE_SYSTEM_PROMPT,
 		userMessage,
 		maxTokens,
 	};

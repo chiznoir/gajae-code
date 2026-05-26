@@ -78,7 +78,7 @@ async function login(provider: OAuthProvider): Promise<void> {
 				return promptFn(`${p.message}${p.placeholder ? ` (${p.placeholder})` : ""}:`);
 			},
 		});
-		console.log(`\nCredentials saved to ~/.omp/agent/agent.db`);
+		console.log(`\nCredentials saved to ~/.gjc/agent/agent.db`);
 	} finally {
 		store.close();
 		rl.close();

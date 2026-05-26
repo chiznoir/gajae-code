@@ -32,7 +32,7 @@ import { logger } from "@gajae-code/utils";
 // Public types
 // ============================================================================
 
-export const OPENAI_REMOTE_CGJCACTION_PRESERVE_KEY = "openaiRemoteCompaction";
+export const OPENAI_REMOTE_COMPACTION_PRESERVE_KEY = "openaiRemoteCompaction";
 
 export type OpenAiRemoteCompactionItem = {
 	type: "compaction" | "compaction_summary";
@@ -103,7 +103,7 @@ function normalizeOpenAiCompactionToolCallId(id: string): string {
 export function getPreservedOpenAiRemoteCompactionData(
 	preserveData: Record<string, unknown> | undefined,
 ): OpenAiRemoteCompactionPreserveData | undefined {
-	const candidate = preserveData?.[OPENAI_REMOTE_CGJCACTION_PRESERVE_KEY];
+	const candidate = preserveData?.[OPENAI_REMOTE_COMPACTION_PRESERVE_KEY];
 	if (!candidate || typeof candidate !== "object") return undefined;
 	const maybeData = candidate as { provider?: unknown; replacementHistory?: unknown; compactionItem?: unknown };
 	if (!Array.isArray(maybeData.replacementHistory)) return undefined;
@@ -130,15 +130,15 @@ export function withOpenAiRemoteCompactionPreserveData(
 	if (remoteCompaction) {
 		return {
 			...(preserveData ?? {}),
-			[OPENAI_REMOTE_CGJCACTION_PRESERVE_KEY]: remoteCompaction,
+			[OPENAI_REMOTE_COMPACTION_PRESERVE_KEY]: remoteCompaction,
 		};
 	}
 
-	if (!preserveData || !(OPENAI_REMOTE_CGJCACTION_PRESERVE_KEY in preserveData)) {
+	if (!preserveData || !(OPENAI_REMOTE_COMPACTION_PRESERVE_KEY in preserveData)) {
 		return preserveData;
 	}
 
-	const { [OPENAI_REMOTE_CGJCACTION_PRESERVE_KEY]: _removed, ...rest } = preserveData;
+	const { [OPENAI_REMOTE_COMPACTION_PRESERVE_KEY]: _removed, ...rest } = preserveData;
 	return Object.keys(rest).length > 0 ? rest : undefined;
 }
 

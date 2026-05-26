@@ -57,7 +57,7 @@ import { theme } from "../../modes/theme/theme";
 import { MCPManager } from "../../runtime-mcp/manager";
 import type { MCPServerConfig } from "../../runtime-mcp/types";
 import type { AgentSession, AgentSessionEvent } from "../../session/agent-session";
-import { isSilentAbort, SKILL_PRGJCT_MESSAGE_TYPE } from "../../session/messages";
+import { isSilentAbort, SKILL_PROMPT_MESSAGE_TYPE } from "../../session/messages";
 import {
 	SessionManager,
 	type SessionInfo as StoredSessionInfo,
@@ -389,7 +389,7 @@ export class AcpAgent implements Agent {
 			{
 				id: "agent",
 				name: "Use existing local credentials",
-				description: "Authenticate via the provider keys/OAuth state already configured under ~/.omp.",
+				description: "Authenticate via the provider keys/OAuth state already configured under ~/.gjc.",
 			},
 		];
 		if (params.clientCapabilities?.auth?.terminal === true) {
@@ -397,7 +397,7 @@ export class AcpAgent implements Agent {
 				type: "terminal",
 				id: "terminal",
 				name: "Set up Gajae Code in terminal",
-				description: "Launch the omp TUI to add provider keys and select models.",
+				description: "Launch the gjc TUI to add provider keys and select models.",
 				args: [ACP_TERMINAL_AUTH_FLAG],
 			});
 		}
@@ -706,7 +706,7 @@ export class AcpAgent implements Agent {
 		}
 		const built = await buildSkillPromptMessage(skill, args);
 		await record.session.promptCustomMessage({
-			customType: SKILL_PRGJCT_MESSAGE_TYPE,
+			customType: SKILL_PROMPT_MESSAGE_TYPE,
 			content: built.message,
 			display: true,
 			details: built.details,

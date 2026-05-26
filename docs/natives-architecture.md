@@ -78,7 +78,7 @@ For compiled binaries, loader behavior is:
 
 1. Check versioned user cache path: `<getNativesDir()>/<packageVersion>/...`.
 2. Check legacy compiled-binary location:
-   - Windows: `%LOCALAPPDATA%/gjc` (fallback `%USERPROFILE%/AppData/Local/omp`)
+   - Windows: `%LOCALAPPDATA%/gjc` (fallback `%USERPROFILE%/AppData/Local/gjc`)
    - non-Windows: `~/.local/bin`
 3. Fall back to packaged `native/` and executable directory candidates.
 

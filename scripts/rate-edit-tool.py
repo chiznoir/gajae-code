@@ -23,9 +23,9 @@ from rich.table import Table
 from rich.text import Text
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO_ROOT / "python/omp-rpc/src"))
+sys.path.insert(0, str(REPO_ROOT / "python/gjc-rpc/src"))
 
-from omp_rpc import (  # noqa: E402
+from gjc_rpc import (  # noqa: E402
     AgentEndEvent,
     AutoRetryEndEvent,
     AutoRetryStartEvent,
@@ -53,7 +53,7 @@ MODELS = [
 
 ORACLE_MODEL = "openrouter/anthropic/claude-opus-4.6"
 
-PRGJCT = textwrap.dedent(
+PROMPT = textwrap.dedent(
     """\
     You are evaluating the **edit** tool on files in this directory. The `read` tool is available so you can inspect file state before and after edits, but it is not under review — do not report on it.
 
@@ -80,7 +80,7 @@ PRGJCT = textwrap.dedent(
     """
 ).strip()
 
-FINAL_REVIEW_PRGJCT = textwrap.dedent(
+FINAL_REVIEW_PROMPT = textwrap.dedent(
     """\
     Your prior turn completed without a final written review in the assistant text.
 
@@ -95,7 +95,7 @@ FINAL_REVIEW_PRGJCT = textwrap.dedent(
     """
 ).strip()
 
-ORACLE_REVIEW_PRGJCT = textwrap.dedent(
+ORACLE_REVIEW_PROMPT = textwrap.dedent(
     """\
     <context>
     You are the oracle reviewer for a tool-evaluation benchmark.
@@ -557,7 +557,7 @@ PYTHON_FIXTURE = (
 )
 
 REFERENCE_FILES = {
-    "PRGJCT.md": PRGJCT + "\n",
+    "PROMPT.md": PROMPT + "\n",
     "main.ts": TS_FIXTURE,
     "main.rs": RUST_FIXTURE,
     "main.py": PYTHON_FIXTURE,
@@ -591,7 +591,7 @@ def build_fixture_prompt() -> str:
         lines
     )
     return (
-        PRGJCT.format(FIXTURE_SURFACE=surface)
+        PROMPT.format(FIXTURE_SURFACE=surface)
         + "\n\nExercise every fixture in one session; do not skip any file type."
     )
 
@@ -946,12 +946,12 @@ def sync_reference_fixtures(fixtures_dir: Path) -> None:
         (fixtures_dir / name).write_text(content)
 
 
-def resolve_omp_bin(raw: str | None) -> str:
+def resolve_gjc_bin(raw: str | None) -> str:
     if raw:
         return raw
-    found = shutil.which("omp")
+    found = shutil.which("gjc")
     if not found:
-        raise SystemExit("Could not find `omp` on PATH. Set --omp-bin or GJC_BIN.")
+        raise SystemExit("Could not find `gjc` on PATH. Set --gjc-bin or GJC_BIN.")
     return found
 
 
@@ -1140,7 +1140,7 @@ class ModelRunRecorder:
 def run_model_sync(
     *,
     model: str,
-    omp_bin: str,
+    gjc_bin: str,
     results_dir: Path,
     workspace_root: Path,
     timeout: float,
@@ -1175,7 +1175,7 @@ def run_model_sync(
 
     try:
         with RpcClient(
-            executable=omp_bin,
+            executable=gjc_bin,
             model=model,
             cwd=workspace,
             thinking="high",
@@ -1251,7 +1251,7 @@ def run_model_sync(
             review_markdown = recorder.build_review_markdown()
             if not review_markdown.strip():
                 printer.mark_prompt_submitted(run_id)
-                client.prompt(FINAL_REVIEW_PRGJCT)
+                client.prompt(FINAL_REVIEW_PROMPT)
                 wait_for_settle()
                 review_markdown = recorder.build_review_markdown()
             if not review_markdown.strip():
@@ -1335,7 +1335,7 @@ def build_oracle_review_prompt(sources: list[tuple[str, str, str]]) -> str:
         raise ValueError("No review content available for oracle synthesis")
 
     review_payload = "\n\n".join(review_sections)
-    return ORACLE_REVIEW_PRGJCT.replace("{{REVIEWS}}", review_payload)
+    return ORACLE_REVIEW_PROMPT.replace("{{REVIEWS}}", review_payload)
 
 
 def oracle_sources_from_results(
@@ -1375,7 +1375,7 @@ def format_combined_reviews(sources: list[tuple[str, str, str]]) -> str:
 def run_oracle_review_sync(
     *,
     model: str,
-    omp_bin: str,
+    gjc_bin: str,
     sources: list[tuple[str, str, str]],
     results_dir: Path,
     timeout: float,
@@ -1385,7 +1385,7 @@ def run_oracle_review_sync(
     prompt_path.write_text(prompt, encoding="utf-8")
 
     with RpcClient(
-        executable=omp_bin,
+        executable=gjc_bin,
         model=model,
         cwd=results_dir,
         thinking="high",
@@ -1410,9 +1410,9 @@ def run_oracle_review_sync(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run OpenRouter fixture evaluations through omp RPC mode."
+        description="Run OpenRouter fixture evaluations through gjc RPC mode."
     )
-    parser.add_argument("--omp-bin", default=os.environ.get("GJC_BIN"))
+    parser.add_argument("--gjc-bin", default=os.environ.get("GJC_BIN"))
     parser.add_argument("--fixtures-dir", default=os.path.expanduser("~/tmp/fixtures"))
     parser.add_argument("--results-dir")
     parser.add_argument(
@@ -1448,7 +1448,7 @@ def parse_args() -> argparse.Namespace:
 
 
 async def run_all(args: argparse.Namespace) -> int:
-    omp_bin = resolve_omp_bin(args.omp_bin)
+    gjc_bin = resolve_gjc_bin(args.gjc_bin)
 
     if args.rerun or args.rerun_oracle:
         rerun_path = args.rerun_oracle or args.rerun
@@ -1465,7 +1465,7 @@ async def run_all(args: argparse.Namespace) -> int:
                 synthesis = await asyncio.to_thread(
                     run_oracle_review_sync,
                     model=args.oracle_model,
-                    omp_bin=omp_bin,
+                    gjc_bin=gjc_bin,
                     sources=sources,
                     results_dir=results_dir,
                     timeout=args.timeout,
@@ -1491,7 +1491,7 @@ async def run_all(args: argparse.Namespace) -> int:
     results_dir = (
         Path(args.results_dir)
         if args.results_dir
-        else tmp_root / f"omp-fixture-runs-{timestamp}"
+        else tmp_root / f"gjc-fixture-runs-{timestamp}"
     )
     results_dir.mkdir(parents=True, exist_ok=True)
     workspace_root = tmp_root / f"rate-edit-tool-workspaces-{timestamp}"
@@ -1506,7 +1506,7 @@ async def run_all(args: argparse.Namespace) -> int:
         asyncio.to_thread(
             run_model_sync,
             model=model,
-            omp_bin=omp_bin,
+            gjc_bin=gjc_bin,
             results_dir=results_dir,
             workspace_root=workspace_root,
             timeout=args.timeout,
@@ -1537,7 +1537,7 @@ async def run_all(args: argparse.Namespace) -> int:
         oracle_synthesis = await asyncio.to_thread(
             run_oracle_review_sync,
             model=args.oracle_model,
-            omp_bin=omp_bin,
+            gjc_bin=gjc_bin,
             sources=sources,
             results_dir=results_dir,
             timeout=args.timeout,

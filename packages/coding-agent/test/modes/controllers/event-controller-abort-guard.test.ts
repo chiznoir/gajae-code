@@ -26,7 +26,7 @@ beforeAll(() => {
 
 beforeEach(async () => {
 	resetSettingsForTest();
-	const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-abortguard-"));
+	const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-abortguard-"));
 	await Settings.init({ inMemory: true, cwd: tempDir });
 });
 

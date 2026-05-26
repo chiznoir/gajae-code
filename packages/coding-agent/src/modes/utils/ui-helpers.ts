@@ -22,7 +22,7 @@ import type { CompactionQueuedMessage, InteractiveModeContext } from "../../mode
 import {
 	type CustomMessage,
 	isSilentAbort,
-	SKILL_PRGJCT_MESSAGE_TYPE,
+	SKILL_PROMPT_MESSAGE_TYPE,
 	type SkillPromptDetails,
 } from "../../session/messages";
 import type { SessionContext } from "../../session/session-manager";
@@ -151,7 +151,7 @@ export class UiHelpers {
 						}
 						break;
 					}
-					if (message.customType === SKILL_PRGJCT_MESSAGE_TYPE) {
+					if (message.customType === SKILL_PROMPT_MESSAGE_TYPE) {
 						const component = new SkillMessageComponent(message as CustomMessage<SkillPromptDetails>);
 						component.setExpanded(this.ctx.toolOutputExpanded);
 						this.ctx.chatContainer.addChild(component);
@@ -535,7 +535,7 @@ export class UiHelpers {
 				theme.bold(theme.fg("warning", "Update Available")) +
 					"\n" +
 					theme.fg("muted", `New version ${newVersion} is available. Run: `) +
-					theme.fg("accent", "omp update"),
+					theme.fg("accent", "gjc update"),
 				1,
 				0,
 			),

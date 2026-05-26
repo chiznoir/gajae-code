@@ -8,10 +8,10 @@
  *
  * Skips unless a local gateway is reachable at the default `127.0.0.1:4000`
  * (override via `GJC_E2E_GATEWAY_URL`) AND the bearer token file exists at
- * `~/.omp/auth-gateway.token`.
+ * `~/.gjc/auth-gateway.token`.
  *
  * To run: `bun --cwd packages/ai test test/auth-gateway-openai-responses-caching.test.ts`
- * with the gateway live (`omp auth-gateway serve` or pm2).
+ * with the gateway live (`gjc auth-gateway serve` or pm2).
  */
 import { describe, expect, it } from "bun:test";
 import * as os from "node:os";
@@ -37,7 +37,7 @@ interface OpenAIResponse {
 }
 
 const GATEWAY_URL = Bun.env.GJC_E2E_GATEWAY_URL ?? "http://127.0.0.1:4000";
-const TOKEN_PATH = path.join(os.homedir(), ".omp", "auth-gateway.token");
+const TOKEN_PATH = path.join(os.homedir(), ".gjc", "auth-gateway.token");
 // `gpt-5.3-codex` is the model we've verified the ChatGPT-subscription Codex
 // backend accepts; older or higher-tier ids 4xx with "model not supported".
 const MODEL = Bun.env.GJC_E2E_OPENAI_RESPONSES_MODEL ?? "gpt-5.3-codex";
@@ -67,7 +67,7 @@ const gateway = await checkGatewayAvailable();
 // automatic-caching floor with plenty of headroom.
 const INSTRUCTIONS_PARAGRAPH = `
 You are a precise assistant participating in an automated end-to-end test of
-the omp auth-gateway's OpenAI Responses prompt-caching pipeline. The same
+the gjc auth-gateway's OpenAI Responses prompt-caching pipeline. The same
 instructions block will be reused across two turns; OpenAI automatically
 caches identical prefixes ≥1024 tokens, so the second turn must see the
 same prefix bytes as the first or the cache misses silently. Always respond
@@ -141,7 +141,7 @@ describe.skipIf(!gateway.ok)("auth-gateway: openai-responses prompt caching e2e"
 		// `prompt_cache_key` is set — caching is opt-in there, unlike public
 		// OpenAI Responses which caches automatically. Reusing the same key
 		// across both turns is the contract that makes turn 2 hit.
-		const cacheKey = `omp-e2e-${nonce}`;
+		const cacheKey = `gjc-e2e-${nonce}`;
 
 		// ── Turn 1 ───────────────────────────────────────────────────────
 		const turn1Input: ResponseInputMessage[] = [{ role: "user", content: "Respond with the single word: alpha" }];

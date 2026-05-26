@@ -1,7 +1,7 @@
 {
 	"type": "module",
 	"name": "@gajae-code/utils",
-	"version": "15.3.2",
+	"version": "0.1.0",
 	"description": "Shared utilities for pi packages",
 	"homepage": "https://gajae-code.dev",
 	"author": "Can Boluk",

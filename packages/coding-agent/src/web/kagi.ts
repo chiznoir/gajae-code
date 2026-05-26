@@ -136,7 +136,7 @@ export async function searchWithKagi(
 ): Promise<KagiSearchResult> {
 	const apiKey = await findKagiApiKey(authStorage, options.sessionId, options.signal);
 	if (!apiKey) {
-		throw new KagiApiError("Kagi credentials not found. Set KAGI_API_KEY or login with 'omp /login kagi'.");
+		throw new KagiApiError("Kagi credentials not found. Set KAGI_API_KEY or login with 'gjc /login kagi'.");
 	}
 
 	const requestUrl = new URL(KAGI_SEARCH_URL);

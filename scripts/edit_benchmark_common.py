@@ -19,9 +19,9 @@ from pathlib import Path
 from typing import Any, Callable
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO_ROOT / "python/omp-rpc/src"))
+sys.path.insert(0, str(REPO_ROOT / "python/gjc-rpc/src"))
 
-from omp_rpc import MessageEndEvent, MessageStartEvent, MessageUpdateEvent, RpcClient, ToolExecutionStartEvent  # noqa: E402
+from gjc_rpc import MessageEndEvent, MessageStartEvent, MessageUpdateEvent, RpcClient, ToolExecutionStartEvent  # noqa: E402
 
 MODELS = [
     "openrouter/moonshotai/kimi-k2.5",
@@ -468,7 +468,7 @@ def _compute_edit_diff() -> str:
 
 EDIT_DIFF = _compute_edit_diff()
 
-FEEDBACK_PRGJCT = """\
+FEEDBACK_PROMPT = """\
 STOP. The editing task is complete. Do NOT make any more edits or tool calls.
 
 This is a survey. Answer these 6 questions about your experience using the editing tool (2-3 sentences each):
@@ -482,7 +482,7 @@ This is a survey. Answer these 6 questions about your experience using the editi
 """
 
 DEFAULT_MAX_TURNS = 5
-MAX_TOOL_CALLS_PER_PRGJCT = 6
+MAX_TOOL_CALLS_PER_PROMPT = 6
 _PRINT_LOCK = threading.Lock()
 
 
@@ -609,22 +609,22 @@ class VerbosePrinter:
             sys.stderr.flush()
 
 
-def resolve_repo_omp_bin() -> str | None:
+def resolve_repo_gjc_bin() -> str | None:
     cli_path = REPO_ROOT / "packages/coding-agent" / "src/cli.ts"
     if not cli_path.exists():
         return None
     return str(cli_path)
 
 
-def resolve_omp_bin(raw: str | None) -> str:
+def resolve_gjc_bin(raw: str | None) -> str:
     if raw:
         return raw
-    repo_bin = resolve_repo_omp_bin()
+    repo_bin = resolve_repo_gjc_bin()
     if repo_bin:
         return repo_bin
-    found = shutil.which("omp")
+    found = shutil.which("gjc")
     if not found:
-        raise SystemExit("Could not find `omp` on PATH and could not resolve the repo CLI. Set --omp-bin or GJC_BIN.")
+        raise SystemExit("Could not find `gjc` on PATH and could not resolve the repo CLI. Set --gjc-bin or GJC_BIN.")
     return found
 
 
@@ -707,7 +707,7 @@ def run_benchmark_for_model(
     *,
     spec: BenchmarkSpec,
     model: str,
-    omp_bin: str,
+    gjc_bin: str,
     workspace: Path,
     timeout: float,
     log_mode: str | None,
@@ -730,7 +730,7 @@ def run_benchmark_for_model(
 
     try:
         with RpcClient(
-            executable=omp_bin,
+            executable=gjc_bin,
             model=model,
             cwd=workspace,
             env={**spec.env},
@@ -789,7 +789,7 @@ def run_benchmark_for_model(
                 token_output = stats.tokens.output
 
                 counting_edit_turns = False
-                client.prompt(FEEDBACK_PRGJCT)
+                client.prompt(FEEDBACK_PROMPT)
                 client.wait_for_idle(timeout=timeout)
                 feedback = client.get_last_assistant_text() or ""
 
@@ -817,7 +817,7 @@ def run_benchmark_for_model(
 
 
 async def run_all(spec: BenchmarkSpec, args: argparse.Namespace) -> dict[str, dict[str, Any]]:
-    omp_bin = resolve_omp_bin(args.omp_bin)
+    gjc_bin = resolve_gjc_bin(args.gjc_bin)
 
     timestamp = time.strftime("%Y%m%d-%H%M%S")
     workspace_root = Path(tempfile.gettempdir()) / f"{spec.workspace_prefix}-{timestamp}"
@@ -836,7 +836,7 @@ async def run_all(spec: BenchmarkSpec, args: argparse.Namespace) -> dict[str, di
                 run_benchmark_for_model,
                 spec=spec,
                 model=model,
-                omp_bin=omp_bin,
+                gjc_bin=gjc_bin,
                 workspace=workspace,
                 timeout=args.timeout,
                 log_mode="verbose" if args.verbose else ("print" if args.print else None),
@@ -882,9 +882,9 @@ async def run_all(spec: BenchmarkSpec, args: argparse.Namespace) -> dict[str, di
 def parse_args(description: str) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=description)
     parser.add_argument(
-        "--omp-bin",
+        "--gjc-bin",
         default=os.environ.get("GJC_BIN"),
-        help="Executable to launch. Defaults to the repo checkout CLI, then falls back to `omp` on PATH.",
+        help="Executable to launch. Defaults to the repo checkout CLI, then falls back to `gjc` on PATH.",
     )
     parser.add_argument(
         "--timeout", type=float, default=60.0, help="Per-turn timeout in seconds."

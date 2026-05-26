@@ -139,7 +139,7 @@ Artifacts and side channels:
   - `fuse-projfs` — Windows ProjFS overlay.
 - Isolation merge strategy
   - Patch mode — capture/apply root patches, keep patch artifacts when application fails.
-  - Branch mode — commit each task onto `omp/task/<id>` branch, cherry-pick into parent, preserve failed branches for manual resolution.
+  - Branch mode — commit each task onto `gjc/task/<id>` branch, cherry-pick into parent, preserve failed branches for manual resolution.
 - Agent source
   - Project custom agents — nearest project config/plugin agent directories, first by source-family precedence.
   - User custom agents — user config/plugin agent directories after project dirs of the same source family.

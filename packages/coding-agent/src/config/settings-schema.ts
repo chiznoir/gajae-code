@@ -235,7 +235,7 @@ export const SETTINGS_SCHEMA = {
 	// ────────────────────────────────────────────────────────────────────────
 	lastChangelogVersion: { type: "string", default: undefined },
 
-	// Auth broker — credentials proxied through a remote `omp auth-broker serve`
+	// Auth broker — credentials proxied through a remote `gjc auth-broker serve`
 	// host. Hidden from the UI; populate via env vars or hand-edited config.yml.
 	// Env (`GJC_AUTH_BROKER_URL` / `GJC_AUTH_BROKER_TOKEN`) takes precedence so
 	// per-machine overrides remain trivial.
@@ -1410,7 +1410,7 @@ export const SETTINGS_SCHEMA = {
 	},
 	"hindsight.retainEveryNTurns": { type: "number", default: 3 },
 	"hindsight.retainOverlapTurns": { type: "number", default: 2 },
-	"hindsight.retainContext": { type: "string", default: "omp" },
+	"hindsight.retainContext": { type: "string", default: "gjc" },
 
 	"hindsight.recallBudget": {
 		type: "enum",
@@ -1992,7 +1992,7 @@ export const SETTINGS_SCHEMA = {
 		ui: {
 			tab: "tools",
 			label: "GitHub view cache",
-			description: "Cache rendered issue/PR view output in ~/.omp/cache/github-cache.db so repeated reads are free",
+			description: "Cache rendered issue/PR view output in ~/.gjc/cache/github-cache.db so repeated reads are free",
 		},
 	},
 
@@ -2737,52 +2737,6 @@ export const SETTINGS_SCHEMA = {
 	"commit.mapReduceMaxConcurrency": { type: "number", default: 5 },
 
 	"commit.changelogMaxDiffChars": { type: "number", default: 120000 },
-
-	"dev.autoqa": {
-		type: "boolean",
-		default: false,
-		ui: {
-			tab: "tools",
-			label: "Auto QA",
-			description: "Enable automated tool issue reporting (report_tool_issue) for all agents",
-		},
-	},
-
-	"dev.autoqaPush.endpoint": {
-		type: "string",
-		// Bundled QA collector — runs `the configured gajae-code Auto QA collector` behind qa.gajae-code.local.
-		// Override via `PI_AUTO_QA_PUSH_URL` or `dev.autoqaPush.endpoint`
-		// in `config.yml` to point at a self-hosted instance.
-		default: "https://qa.gajae-code.local/v1/grievances" as const,
-		ui: {
-			tab: "tools",
-			label: "Auto QA Push Endpoint",
-			description:
-				"Full URL that receives the JSON payload (default ships to https://qa.gajae-code.local/v1/grievances)",
-		},
-	},
-
-	"dev.autoqaPush.token": {
-		type: "string",
-		default: undefined,
-	},
-
-	/**
-	 * User decision on sharing automatic `report_tool_issue` grievances.
-	 *
-	 *   - `"unset"`  — never asked; the first `report_tool_issue` invocation
-	 *                  pops a consent dialog and persists the answer here.
-	 *   - `"granted"` — record and (when push is configured) ship grievances.
-	 *   - `"denied"`  — silently no-op every `report_tool_issue` call.
-	 *
-	 * Owned by `packages/coding-agent/src/tools/report-tool-issue.ts` via the
-	 * process-global consent handler registered by `InteractiveMode`.
-	 */
-	"dev.autoqa.consent": {
-		type: "enum",
-		values: ["unset", "granted", "denied"] as const,
-		default: "unset" as const,
-	},
 
 	"thinkingBudgets.minimal": { type: "number", default: 1024 },
 

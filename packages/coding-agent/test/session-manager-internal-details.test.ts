@@ -38,7 +38,7 @@ describe("SessionManager.appendCustomMessageEntry (allowlist strip + persistence
 				path: "/s.md",
 				args: "bar",
 				lineCount: 10,
-				__pendingDisplayTag: "omp-cmd-1-0",
+				__pendingDisplayTag: "gjc-cmd-1-0",
 			},
 			"user",
 		);

@@ -178,14 +178,14 @@ function Mci([string]$cmd) {
     return $r
 }
 
-$r = Mci "open new type waveaudio alias omp_rec"
+$r = Mci "open new type waveaudio alias gjc_rec"
 if ($r -ne 0) { exit 1 }
 
-Mci "set omp_rec channels 1 samplespersec 16000 bitspersample 16"
+Mci "set gjc_rec channels 1 samplespersec 16000 bitspersample 16"
 
-$r = Mci "record omp_rec"
+$r = Mci "record gjc_rec"
 if ($r -ne 0) {
-    Mci "close omp_rec"
+    Mci "close gjc_rec"
     exit 1
 }
 
@@ -196,13 +196,13 @@ Write-Output "RECORDING"
 try { [Console]::In.ReadLine() | Out-Null } catch {}
 
 # Stop and save
-Mci "stop omp_rec"
-$saveCmd = 'save omp_rec "' + $outPath + '"'
+Mci "stop gjc_rec"
+$saveCmd = 'save gjc_rec "' + $outPath + '"'
 $r = Mci $saveCmd
 if ($r -ne 0) {
     [Console]::Error.WriteLine("Save failed for: $saveCmd")
 }
-Mci "close omp_rec"
+Mci "close gjc_rec"
 
 if (Test-Path $outPath) {
     Write-Output "SAVED"
@@ -214,7 +214,7 @@ if (Test-Path $outPath) {
 
 async function startPowerShellRecording(outputPath: string): Promise<RecordingHandle> {
 	// Write script to temp file — avoids quoting/escaping issues with -Command
-	const scriptPath = path.join(os.tmpdir(), `omp-stt-record-${Snowflake.next()}.ps1`);
+	const scriptPath = path.join(os.tmpdir(), `gjc-stt-record-${Snowflake.next()}.ps1`);
 	await Bun.write(scriptPath, PS_RECORD_SCRIPT);
 
 	const proc = Bun.spawn(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", scriptPath, outputPath], {

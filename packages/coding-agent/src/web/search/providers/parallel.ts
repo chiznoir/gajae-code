@@ -119,7 +119,7 @@ async function searchWithAuthStorage(
 	const apiKey = await authStorage.getApiKey("parallel", sessionId, { signal: params.signal });
 	if (!apiKey) {
 		throw new ParallelApiError(
-			"Parallel credentials not found. Set PARALLEL_API_KEY or login with 'omp /login parallel'.",
+			"Parallel credentials not found. Set PARALLEL_API_KEY or login with 'gjc /login parallel'.",
 		);
 	}
 

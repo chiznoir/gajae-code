@@ -24,8 +24,8 @@ describe("auth-broker import (CLIProxyAPI)", () => {
 
 	beforeEach(async () => {
 		originalAgentDir = process.env.GJC_AGENT_DIR;
-		agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-import-agent-"));
-		cliproxyDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-import-cliproxy-"));
+		agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-import-agent-"));
+		cliproxyDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-import-cliproxy-"));
 		setAgentDir(agentDir);
 	});
 
@@ -43,7 +43,7 @@ describe("auth-broker import (CLIProxyAPI)", () => {
 		return file;
 	}
 
-	test("imports a directory of CLIProxyAPI JSONs and maps types to omp providers", async () => {
+	test("imports a directory of CLIProxyAPI JSONs and maps types to gjc providers", async () => {
 		await writeCliProxyJson("claude-sample.json", {
 			type: "claude",
 			access_token: "claude-access-1",
@@ -199,9 +199,9 @@ describe("auth-broker import (broker-routed)", () => {
 	beforeEach(async () => {
 		savedEnv.GJC_AUTH_BROKER_URL = process.env.GJC_AUTH_BROKER_URL;
 		savedEnv.GJC_AUTH_BROKER_TOKEN = process.env.GJC_AUTH_BROKER_TOKEN;
-		agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-import-client-"));
-		brokerAgentDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-import-broker-"));
-		cliproxyDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-import-cliproxy-broker-"));
+		agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-import-client-"));
+		brokerAgentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-import-broker-"));
+		cliproxyDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-import-cliproxy-broker-"));
 		setAgentDir(agentDir);
 
 		brokerStore = await SqliteAuthCredentialStore.open(path.join(brokerAgentDir, "agent.db"));

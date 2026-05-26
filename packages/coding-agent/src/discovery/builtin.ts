@@ -1,5 +1,5 @@
 /**
- * Builtin Provider (.omp)
+ * Builtin Provider (.gjc)
  *
  * Primary provider for GJC native configs. Supports all capabilities.
  */
@@ -36,10 +36,18 @@ import {
 
 const PROVIDER_ID = "native";
 const DISPLAY_NAME = "GJC";
-const DESCRIPTION = "Native GJC configuration from ~/.omp and .omp/";
+const DESCRIPTION = "Native GJC configuration from ~/.gjc and .gjc/";
 const PRIORITY = 100;
 
 const PATHS = SOURCE_PATHS.native;
+
+function getUserAgentDirs(): string[] {
+	return [PATHS.userAgent];
+}
+
+function getProjectConfigDirs(): string[] {
+	return [PATHS.projectDir];
+}
 
 async function ifNonEmptyDir(...seg: string[]): Promise<string | null> {
 	let dir = path.join(...seg);
@@ -56,13 +64,17 @@ async function ifNonEmptyDir(...seg: string[]): Promise<string | null> {
 async function getConfigDirs(ctx: LoadContext): Promise<Array<{ dir: string; level: "user" | "project" }>> {
 	const result: Array<{ dir: string; level: "user" | "project" }> = [];
 
-	const projectDir = await ifNonEmptyDir(ctx.cwd, PATHS.projectDir);
-	if (projectDir) {
-		result.push({ dir: projectDir, level: "project" });
+	for (const projectConfigDir of getProjectConfigDirs()) {
+		const projectDir = await ifNonEmptyDir(ctx.cwd, projectConfigDir);
+		if (projectDir) {
+			result.push({ dir: projectDir, level: "project" });
+		}
 	}
-	const userDir = await ifNonEmptyDir(ctx.home, PATHS.userAgent);
-	if (userDir) {
-		result.push({ dir: userDir, level: "user" });
+	for (const userAgentDir of getUserAgentDirs()) {
+		const userDir = await ifNonEmptyDir(ctx.home, userAgentDir);
+		if (userDir) {
+			result.push({ dir: userDir, level: "user" });
+		}
 	}
 
 	return result;
@@ -88,8 +100,10 @@ async function findNearestProjectConfigDir(
 	repoRoot?: string | null,
 ): Promise<{ dir: string; depth: number } | null> {
 	for (const ancestor of getAncestorDirs(cwd, repoRoot)) {
-		const configDir = await ifNonEmptyDir(ancestor.dir, PATHS.projectDir);
-		if (configDir) return { dir: configDir, depth: ancestor.depth };
+		for (const projectConfigDir of getProjectConfigDirs()) {
+			const configDir = await ifNonEmptyDir(ancestor.dir, projectConfigDir);
+			if (configDir) return { dir: configDir, depth: ancestor.depth };
+		}
 	}
 	return null;
 }
@@ -187,10 +201,14 @@ async function loadMCPServers(ctx: LoadContext): Promise<LoadResult<MCPServer>> 
 	};
 
 	const paths = [
-		{ path: path.join(ctx.cwd, PATHS.projectDir, "mcp.json"), level: "project" as const },
-		{ path: path.join(ctx.cwd, PATHS.projectDir, ".mcp.json"), level: "project" as const },
-		{ path: path.join(ctx.home, PATHS.userAgent, "mcp.json"), level: "user" as const },
-		{ path: path.join(ctx.home, PATHS.userAgent, ".mcp.json"), level: "user" as const },
+		...getProjectConfigDirs().flatMap(projectConfigDir => [
+			{ path: path.join(ctx.cwd, projectConfigDir, "mcp.json"), level: "project" as const },
+			{ path: path.join(ctx.cwd, projectConfigDir, ".mcp.json"), level: "project" as const },
+		]),
+		...getUserAgentDirs().flatMap(userAgentDir => [
+			{ path: path.join(ctx.home, userAgentDir, "mcp.json"), level: "user" as const },
+			{ path: path.join(ctx.home, userAgentDir, ".mcp.json"), level: "user" as const },
+		]),
 	];
 
 	const contents = await Promise.allSettled(
@@ -225,15 +243,17 @@ registerProvider<MCPServer>(mcpCapability.id, {
 async function loadSystemPrompt(ctx: LoadContext): Promise<LoadResult<SystemPrompt>> {
 	const items: SystemPrompt[] = [];
 
-	const userPath = path.join(ctx.home, PATHS.userAgent, "SYSTEM.md");
-	const userContent = await readFile(userPath);
-	if (userContent) {
-		items.push({
-			path: userPath,
-			content: userContent,
-			level: "user",
-			_source: createSourceMeta(PROVIDER_ID, userPath, "user"),
-		});
+	for (const userAgentDir of getUserAgentDirs()) {
+		const userPath = path.join(ctx.home, userAgentDir, "SYSTEM.md");
+		const userContent = await readFile(userPath);
+		if (userContent) {
+			items.push({
+				path: userPath,
+				content: userContent,
+				level: "user",
+				_source: createSourceMeta(PROVIDER_ID, userPath, "user"),
+			});
+		}
 	}
 
 	const nearestProjectConfigDir = await findNearestProjectConfigDir(ctx.cwd, ctx.repoRoot);
@@ -263,26 +283,30 @@ registerProvider<SystemPrompt>(systemPromptCapability.id, {
 
 // Skills
 async function loadSkills(ctx: LoadContext): Promise<LoadResult<Skill>> {
-	// Walk up from cwd finding .omp/skills/ in ancestors (closest first)
+	// Walk up from cwd finding .gjc/skills/ in ancestors (closest first)
 	const ancestors = getAncestorDirs(ctx.cwd, ctx.repoRoot ?? ctx.home);
-	const projectScans = ancestors.map(({ dir }) =>
+	const projectScans = ancestors.flatMap(({ dir }) =>
+		getProjectConfigDirs().map(projectConfigDir =>
+			scanSkillsFromDir(ctx, {
+				dir: path.join(dir, projectConfigDir, "skills"),
+				providerId: PROVIDER_ID,
+				level: "project",
+				requireDescription: true,
+			}),
+		),
+	);
+
+	// User-level scan from ~/.gjc/agent/skills/
+	const userScans = getUserAgentDirs().map(userAgentDir =>
 		scanSkillsFromDir(ctx, {
-			dir: path.join(dir, PATHS.projectDir, "skills"),
+			dir: path.join(ctx.home, userAgentDir, "skills"),
 			providerId: PROVIDER_ID,
-			level: "project",
+			level: "user",
 			requireDescription: true,
 		}),
 	);
 
-	// User-level scan from ~/.omp/agent/skills/
-	const userScan = scanSkillsFromDir(ctx, {
-		dir: path.join(ctx.home, PATHS.userAgent, "skills"),
-		providerId: PROVIDER_ID,
-		level: "user",
-		requireDescription: true,
-	});
-
-	const results = await Promise.all([...projectScans, userScan]);
+	const results = await Promise.all([...projectScans, ...userScans]);
 
 	return {
 		items: results.flatMap(r => r.items),
@@ -349,11 +373,13 @@ async function loadRules(ctx: LoadContext): Promise<LoadResult<Rule>> {
 	// Top-level RULES.md is a sticky always-apply rule. The context-file
 	// discovery contract treats it as the file "re-injected near the current
 	// turn so they keep hold across long conversations".
-	// User scope:    ~/.omp/agent/RULES.md
-	// Project scope: nearest .omp/RULES.md walking up from cwd to repoRoot
-	const userRulesFile = path.join(ctx.home, PATHS.userAgent, "RULES.md");
-	const userRule = await loadStickyRulesFile(userRulesFile, "user");
-	if (userRule) items.push(userRule);
+	// User scope:    ~/.gjc/agent/RULES.md
+	// Project scope: nearest .gjc/RULES.md walking up from cwd to repoRoot
+	for (const userAgentDir of getUserAgentDirs()) {
+		const userRulesFile = path.join(ctx.home, userAgentDir, "RULES.md");
+		const userRule = await loadStickyRulesFile(userRulesFile, "user");
+		if (userRule) items.push(userRule);
+	}
 
 	const nearestProjectConfigDir = await findNearestProjectConfigDir(ctx.cwd, ctx.repoRoot);
 	if (nearestProjectConfigDir) {
@@ -900,7 +926,7 @@ async function loadContextFiles(ctx: LoadContext): Promise<LoadResult<ContextFil
 registerProvider<ContextFile>(contextFileCapability.id, {
 	id: PROVIDER_ID,
 	displayName: DISPLAY_NAME,
-	description: "Load AGENTS.md from .omp/ directories",
+	description: "Load AGENTS.md from .gjc/ directories",
 	priority: PRIORITY,
 	load: loadContextFiles,
 });

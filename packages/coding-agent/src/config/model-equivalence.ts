@@ -46,7 +46,7 @@ const TRAILING_MARKER_PATTERN =
 const WRAPPER_PREFIXES = ["duo-chat-"] as const;
 
 let referenceDataCache: CanonicalReferenceData | undefined;
-const EMPTY_CGJCILED_EQUIVALENCE: CompiledEquivalenceConfig = {
+const EMPTY_COMPILED_EQUIVALENCE: CompiledEquivalenceConfig = {
 	overrides: new Map<string, string>(),
 	exclude: new Set<string>(),
 };
@@ -135,7 +135,7 @@ function compileEquivalenceConfig(config: ModelEquivalenceConfig | undefined): C
 	const overrides = buildOverrideMap(config?.overrides);
 	const exclude = buildExclusionSet(config?.exclude);
 	if (overrides.size === 0 && exclude.size === 0) {
-		return EMPTY_CGJCILED_EQUIVALENCE;
+		return EMPTY_COMPILED_EQUIVALENCE;
 	}
 	return { overrides, exclude };
 }
@@ -171,13 +171,13 @@ const INSERT_ATTACHED_FAMILY_VERSION_SEPARATOR_PATTERN =
 	/(^|[/:._-])((?:claude|gemini|gpt|grok|glm|qwen|minimax|kimi|deepseek|llama|gemma|nova|mistral|ministral|pixtral|codestral|devstral|magistral|ernie|doubao|seed|aion|olmo|molmo|nemotron|palmyra|command|codex|coder))(\d+(?:[.-]\d+)*)(?=$|[-_/.:a-z])/gi;
 const SERIES_MINOR_DOT_TO_DASH_PATTERN = /(^|[/:._-])([a-z])(\d)\.(\d)(?=$|[-_/.:a-z])/gi;
 const SERIES_MINOR_DASH_TO_DOT_PATTERN = /(^|[/:._-])([a-z])(\d)-(\d)(?=$|[-_/.:a-z])/gi;
-const EXPAND_CGJCACT_SERIES_MINOR_PATTERN = /(^|[/:._-])([a-z])(\d)(\d)(?=$|[-_/.:a-z])/gi;
+const EXPAND_COMPACT_SERIES_MINOR_PATTERN = /(^|[/:._-])([a-z])(\d)(\d)(?=$|[-_/.:a-z])/gi;
 const NAMESPACE_SUFFIX_BOUNDARY_PATTERN = /[/:.]/;
 const NAMESPACE_SUFFIX_ALPHA_PATTERN = /[a-z]/i;
 const NAMESPACE_SUFFIX_DIGIT_PATTERN = /\d/;
 const SHORT_VERSION_DOT_TO_DASH_PATTERN = /(^|[-_/])(\d{1,2})\.(\d{1,2})(?=$|[-_a-z])/gi;
 const SHORT_VERSION_DASH_TO_DOT_PATTERN = /(^|[-_/])(\d{1,2})-(\d{1,2})(?=$|[-_a-z])/gi;
-const EXPAND_CGJCACT_MINOR_PATTERN = /(^|[-_/])(\d)(\d)(?=$|[-_a-z])/g;
+const EXPAND_COMPACT_MINOR_PATTERN = /(^|[-_/])(\d)(\d)(?=$|[-_a-z])/g;
 
 function stripSyntheticPrefix(candidate: string): string | undefined {
 	const stripped = candidate.replace(STRIP_SYNTHETIC_PREFIX_PATTERN, "");
@@ -233,11 +233,11 @@ function toggleSeriesMinorVersionSeparators(candidate: string): string[] {
 
 function expandCompactSeriesMinorVersions(candidate: string): string[] {
 	const expanded = new Set<string>();
-	const compactToDash = candidate.replace(EXPAND_CGJCACT_SERIES_MINOR_PATTERN, "$1$2$3-$4");
+	const compactToDash = candidate.replace(EXPAND_COMPACT_SERIES_MINOR_PATTERN, "$1$2$3-$4");
 	if (compactToDash !== candidate) {
 		expanded.add(compactToDash);
 	}
-	const compactToDot = candidate.replace(EXPAND_CGJCACT_SERIES_MINOR_PATTERN, "$1$2$3.$4");
+	const compactToDot = candidate.replace(EXPAND_COMPACT_SERIES_MINOR_PATTERN, "$1$2$3.$4");
 	if (compactToDot !== candidate) {
 		expanded.add(compactToDot);
 	}
@@ -537,11 +537,11 @@ function toggleShortVersionSeparators(candidate: string): string[] {
 
 function expandCompactMinorVersions(candidate: string): string[] {
 	const expanded = new Set<string>();
-	const compactToDash = candidate.replace(EXPAND_CGJCACT_MINOR_PATTERN, "$1$2-$3");
+	const compactToDash = candidate.replace(EXPAND_COMPACT_MINOR_PATTERN, "$1$2-$3");
 	if (compactToDash !== candidate) {
 		expanded.add(compactToDash);
 	}
-	const compactToDot = candidate.replace(EXPAND_CGJCACT_MINOR_PATTERN, "$1$2.$3");
+	const compactToDot = candidate.replace(EXPAND_COMPACT_MINOR_PATTERN, "$1$2.$3");
 	if (compactToDot !== candidate) {
 		expanded.add(compactToDot);
 	}

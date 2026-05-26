@@ -44,7 +44,7 @@ Notes:
 
 After native auto-discovery, `discoverAndLoadExtensions()` appends extension entry points from enabled installed plugins via `getAllPluginExtensionPaths(cwd)`.
 
-Plugin extension entries come from package `omp.extensions` / `pi.extensions` manifests, including enabled feature entries.
+Plugin extension entries come from package `gjc.extensions` / `pi.extensions` manifests, including enabled feature entries.
 
 ### 3) Explicitly configured paths
 
@@ -130,13 +130,13 @@ It is used directly as a module entry candidate.
 
 Resolution order:
 
-1. `package.json` in that directory with `omp.extensions` (or legacy `pi.extensions`) -> use declared entries
+1. `package.json` in that directory with `gjc.extensions` (or legacy `pi.extensions`) -> use declared entries
 2. `index.ts`
 3. `index.js`
 4. Otherwise scan one level for extension entries:
    - direct `*.ts` / `*.js`
    - subdir `index.ts` / `index.js`
-   - subdir `package.json` with `omp.extensions` / `pi.extensions`
+   - subdir `package.json` with `gjc.extensions` / `pi.extensions`
 
 Rules and constraints:
 
@@ -243,7 +243,7 @@ When events run through `ExtensionRunner`, handler exceptions are caught and emi
 
 ```json
 {
-  "omp": {
+  "gjc": {
     "extensions": ["./src/check-a.ts", "./src/check-b.js"]
   }
 }

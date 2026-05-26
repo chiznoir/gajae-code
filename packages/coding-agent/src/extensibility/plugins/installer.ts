@@ -41,7 +41,7 @@ export async function installPlugin(packageName: string): Promise<InstalledPlugi
 	const pkgJsonPath = path.join(PLUGINS_DIR, "package.json");
 	const pkgJson = Bun.file(pkgJsonPath);
 	if (!(await pkgJson.exists())) {
-		await pkgJson.write(JSON.stringify({ name: "omp-plugins", private: true, dependencies: {} }, null, 2));
+		await pkgJson.write(JSON.stringify({ name: "gjc-plugins", private: true, dependencies: {} }, null, 2));
 	}
 
 	// Run npm install in plugins directory
@@ -75,7 +75,7 @@ export async function installPlugin(packageName: string): Promise<InstalledPlugi
 		name: pkg.name,
 		version: pkg.version,
 		path: path.join(PLUGINS_DIR, "node_modules", actualName),
-		manifest: pkg.omp || pkg.pi || { version: pkg.version },
+		manifest: pkg.gjc || pkg.pi || { version: pkg.version },
 		enabledFeatures: null,
 		enabled: true,
 	};
@@ -120,7 +120,7 @@ export async function listPlugins(): Promise<InstalledPlugin[]> {
 				name,
 				version: pkg.version,
 				path: pluginPath,
-				manifest: pkg.omp || pkg.pi || { version: pkg.version },
+				manifest: pkg.gjc || pkg.pi || { version: pkg.version },
 				enabledFeatures: null,
 				enabled: true,
 			});

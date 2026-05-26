@@ -70,7 +70,7 @@ Runner → host:
 {"type": "done",     "id": "<reqId>", "status": "ok"|"error", "executionCount": N, "cancelled": false}
 ```
 
-Status events the prelude emits (e.g. `_emit_status("find", count=…)`) ship inside display bundles under `application/x-omp-status` so the existing TUI status renderer keeps working.
+Status events the prelude emits (e.g. `_emit_status("find", count=…)`) ship inside display bundles under `application/x-gjc-status` so the existing TUI status renderer keeps working.
 
 ## Magics
 
@@ -190,7 +190,7 @@ From runner frames:
 - `stdout` / `stderr` → plain text chunks
 - `display` / `result` → rich display handling (MIME bundle)
 - `error` → traceback text
-- `application/x-omp-status` MIME inside `display` → structured status events
+- `application/x-gjc-status` MIME inside `display` → structured status events
 
 Display MIME precedence:
 
@@ -202,7 +202,7 @@ Additionally captured as structured outputs:
 
 - `application/json` → JSON tree data
 - `image/png` / `image/jpeg` → image payloads
-- `application/x-omp-status` → status events
+- `application/x-gjc-status` → status events
 
 ### Matplotlib
 

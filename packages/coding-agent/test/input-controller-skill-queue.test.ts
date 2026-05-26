@@ -30,7 +30,7 @@ import type { InteractiveModeContext } from "@gajae-code/coding-agent/modes/type
 import { UiHelpers } from "@gajae-code/coding-agent/modes/utils/ui-helpers";
 import { AgentSession, type AgentSessionEvent } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
-import { SKILL_PRGJCT_MESSAGE_TYPE, type SkillPromptDetails } from "@gajae-code/coding-agent/session/messages";
+import { SKILL_PROMPT_MESSAGE_TYPE, type SkillPromptDetails } from "@gajae-code/coding-agent/session/messages";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { Container } from "@gajae-code/tui";
 import { TempDir } from "@gajae-code/utils";
@@ -233,7 +233,7 @@ function emitCustomMessageStart(session: AgentSession, content: string, tag?: st
 		type: "message_start",
 		message: {
 			role: "custom",
-			customType: SKILL_PRGJCT_MESSAGE_TYPE,
+			customType: SKILL_PROMPT_MESSAGE_TYPE,
 			content,
 			display: true,
 			details,
@@ -492,7 +492,7 @@ describe("EventController custom-role dequeue refresh (E10)", () => {
 			type: "message_start",
 			message: {
 				role: "custom",
-				customType: SKILL_PRGJCT_MESSAGE_TYPE,
+				customType: SKILL_PROMPT_MESSAGE_TYPE,
 				content: "first",
 				display: true,
 				details: {
@@ -520,7 +520,7 @@ describe("EventController custom-role dequeue refresh (E10)", () => {
 			type: "message_start",
 			message: {
 				role: "custom",
-				customType: SKILL_PRGJCT_MESSAGE_TYPE,
+				customType: SKILL_PROMPT_MESSAGE_TYPE,
 				content: "second",
 				display: true,
 				details: undefined,

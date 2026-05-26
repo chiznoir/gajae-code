@@ -10,7 +10,7 @@
  * which can be cheaper/faster than the main conversation model.
  *
  * Usage:
- *   omp --hook examples/hooks/custom-compaction.ts
+ *   gjc --hook examples/hooks/custom-compaction.ts
  */
 import { complete, getModel } from "@gajae-code/ai";
 import type { HookAPI } from "@gajae-code/coding-agent";

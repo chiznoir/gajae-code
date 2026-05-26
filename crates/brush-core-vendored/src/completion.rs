@@ -245,7 +245,7 @@ pub enum CompletionTrigger {
 }
 
 impl CompletionTrigger {
-	/// Returns the `CGJC_TYPE` value for this trigger.
+	/// Returns the `COMP_TYPE` value for this trigger.
 	pub const fn comp_type(self) -> i32 {
 		match self {
 			Self::InteractiveComplete => 9, // TAB = normal completion
@@ -253,7 +253,7 @@ impl CompletionTrigger {
 		}
 	}
 
-	/// Returns the `CGJC_KEY` value for this trigger.
+	/// Returns the `COMP_KEY` value for this trigger.
 	pub const fn comp_key(self) -> i32 {
 		match self {
 			Self::InteractiveComplete => 9, // TAB key
@@ -425,7 +425,7 @@ impl Spec {
 			// TODO(completions): it's not clear what default "bash" completions means. From
 			// basic testing, this doesn't seem to include basic file and directory name
 			// completion.
-			tracing::debug!(target: trace_categories::CGJCLETION, "unimplemented: complete -o bashdefault");
+			tracing::debug!(target: trace_categories::COMPLETION, "unimplemented: complete -o bashdefault");
 		}
 
 		// If we still have no candidates, and default completions were requested, then
@@ -597,7 +597,7 @@ impl Spec {
 					}
 				},
 				CompleteAction::Service => {
-					tracing::debug!(target: trace_categories::CGJCLETION, "unimplemented: complete -A service");
+					tracing::debug!(target: trace_categories::COMPLETION, "unimplemented: complete -A service");
 				},
 				CompleteAction::SetOpt => {
 					for option in namedoptions::options(namedoptions::ShellOptionKind::SetO).iter() {
@@ -660,10 +660,10 @@ impl Spec {
 		let mut shell = shell.clone();
 
 		let vars_and_values: Vec<(&str, ShellValueLiteral)> = vec![
-			("CGJC_LINE", context.input_line.into()),
-			("CGJC_POINT", context.cursor_index.to_string().into()),
-			("CGJC_KEY", context.trigger.comp_key().to_string().into()),
-			("CGJC_TYPE", context.trigger.comp_type().to_string().into()),
+			("COMP_LINE", context.input_line.into()),
+			("COMP_POINT", context.cursor_index.to_string().into()),
+			("COMP_KEY", context.trigger.comp_key().to_string().into()),
+			("COMP_TYPE", context.trigger.comp_type().to_string().into()),
 		];
 
 		// Fill out variables.
@@ -718,12 +718,12 @@ impl Spec {
 	) -> Result<Answer, error::Error> {
 		// TODO(completions): Don't pollute the persistent environment with these?
 		let vars_and_values: Vec<(&str, ShellValueLiteral)> = vec![
-			("CGJC_LINE", context.input_line.into()),
-			("CGJC_POINT", context.cursor_index.to_string().into()),
-			("CGJC_KEY", context.trigger.comp_key().to_string().into()),
-			("CGJC_TYPE", context.trigger.comp_type().to_string().into()),
+			("COMP_LINE", context.input_line.into()),
+			("COMP_POINT", context.cursor_index.to_string().into()),
+			("COMP_KEY", context.trigger.comp_key().to_string().into()),
+			("COMP_TYPE", context.trigger.comp_type().to_string().into()),
 			(
-				"CGJC_WORDS",
+				"COMP_WORDS",
 				context
 					.tokens
 					.iter()
@@ -731,10 +731,10 @@ impl Spec {
 					.collect::<Vec<_>>()
 					.into(),
 			),
-			("CGJC_CWORD", context.token_index.to_string().into()),
+			("COMP_CWORD", context.token_index.to_string().into()),
 		];
 
-		tracing::debug!(target: trace_categories::CGJCLETION, "[calling completion func '{function_name}']: {}",
+		tracing::debug!(target: trace_categories::COMPLETION, "[calling completion func '{function_name}']: {}",
             vars_and_values.iter().map(|(k, v)| std::format!("{k}={v}")).collect::<Vec<String>>().join(" "));
 
 		let mut vars_to_remove = Vec::with_capacity(vars_and_values.len());
@@ -768,7 +768,7 @@ impl Spec {
 			.invoke_function(function_name, args.iter(), &params)
 			.await;
 
-		tracing::debug!(target: trace_categories::CGJCLETION, "[completion function '{function_name}' returned: {invoke_result:?}]");
+		tracing::debug!(target: trace_categories::COMPLETION, "[completion function '{function_name}' returned: {invoke_result:?}]");
 
 		shell.release_trap_delivery_block();
 
@@ -778,7 +778,7 @@ impl Spec {
 		}
 
 		let result = invoke_result.unwrap_or_else(|e| {
-            tracing::warn!(target: trace_categories::CGJCLETION, "error while running completion function '{function_name}': {e}");
+            tracing::warn!(target: trace_categories::COMPLETION, "error while running completion function '{function_name}': {e}");
             1 // Report back a non-zero exit code.
         });
 
@@ -787,8 +787,8 @@ impl Spec {
 		if result == 124 {
 			Ok(Answer::RestartCompletionProcess)
 		} else {
-			if let Some(reply) = shell.env_mut().unset("CGJCREPLY")? {
-				tracing::debug!(target: trace_categories::CGJCLETION, "[completion function yielded: {reply:?}]");
+			if let Some(reply) = shell.env_mut().unset("COMPREPLY")? {
+				tracing::debug!(target: trace_categories::COMPLETION, "[completion function yielded: {reply:?}]");
 
 				match reply.value() {
 					variables::ShellValue::IndexedArray(values) => {
@@ -1124,7 +1124,7 @@ impl Config {
 		const FALLBACK: &str = " \t\n\"\'@><=;|&(:";
 
 		let delimiter_str = shell
-			.env_str("CGJC_WORDBREAKS")
+			.env_str("COMP_WORDBREAKS")
 			.unwrap_or_else(|| FALLBACK.into());
 
 		let delimiters: Vec<_> = delimiter_str.chars().collect();

@@ -5,7 +5,7 @@ import * as skillsModule from "../../src/extensibility/skills";
 import type { CreateAgentSessionResult } from "../../src/sdk";
 import * as sdkModule from "../../src/sdk";
 import type { AgentSession, AgentSessionEvent, PromptOptions } from "../../src/session/agent-session";
-import { SKILL_PRGJCT_MESSAGE_TYPE } from "../../src/session/messages";
+import { SKILL_PROMPT_MESSAGE_TYPE } from "../../src/session/messages";
 import { runSubprocess } from "../../src/task/executor";
 import type { AgentDefinition } from "../../src/task/types";
 import { EventBus } from "../../src/utils/event-bus";
@@ -149,7 +149,7 @@ describe("autoloadSkills in executor", () => {
 		expect(sendCustomMessage).toHaveBeenNthCalledWith(
 			1,
 			{
-				customType: SKILL_PRGJCT_MESSAGE_TYPE,
+				customType: SKILL_PROMPT_MESSAGE_TYPE,
 				content: expect.stringContaining("Content of user-created-skill-a"),
 				display: false,
 				details: { name: "user-created-skill-a", path: "/skills/user-created-skill-a/SKILL.md" },
@@ -161,7 +161,7 @@ describe("autoloadSkills in executor", () => {
 		expect(sendCustomMessage).toHaveBeenNthCalledWith(
 			2,
 			{
-				customType: SKILL_PRGJCT_MESSAGE_TYPE,
+				customType: SKILL_PROMPT_MESSAGE_TYPE,
 				content: expect.stringContaining("Content of user-created-skill-b"),
 				display: false,
 				details: { name: "user-created-skill-b", path: "/skills/user-created-skill-b/SKILL.md" },

@@ -124,8 +124,8 @@ Implemented in `packages/coding-agent/src/eval/js/context-manager.ts` and `packa
 - Persistent `vm.Context` instances keyed by `js:${sessionId}` in `vmContexts`
 - `reset: true` calls `resetVmContext(sessionKey)` before the cell executes
 - Top-level `await` and bare `return` are supported by wrapping code in an async IIFE when `wrapCode()` sees `await` or `return`
-- Top-level static `import ... from ...` and dynamic `import(...)` calls are routed through `rewriteImports()`, which sends them via `__omp_import__` so the specifier resolves against the session cwd
-- Module cache is busted for **local** imports between cells so edits to source files are picked up without restarting the runtime. `__omp_import__` deletes `require.cache[absPath]` before re-importing whenever the original specifier is a filesystem path: relative (`./x`, `../x`, `.`, `..`), POSIX-absolute (`/...`), home-prefixed (`~/...`), or Windows drive-letter (`C:\...` / `C:/...`). Bare specifiers (`react`, `lodash/x`) and URL/scheme specifiers (`node:fs`, `file://...`, `https://...`) are left in cache so package identity stays stable across cells. The cache-bust only fires when the resolved target is an absolute path — unresolved bare-package fallbacks (`resolveImportSpecifier()` returning the original specifier) skip it.
+- Top-level static `import ... from ...` and dynamic `import(...)` calls are routed through `rewriteImports()`, which sends them via `__gjc_import__` so the specifier resolves against the session cwd
+- Module cache is busted for **local** imports between cells so edits to source files are picked up without restarting the runtime. `__gjc_import__` deletes `require.cache[absPath]` before re-importing whenever the original specifier is a filesystem path: relative (`./x`, `../x`, `.`, `..`), POSIX-absolute (`/...`), home-prefixed (`~/...`), or Windows drive-letter (`C:\...` / `C:/...`). Bare specifiers (`react`, `lodash/x`) and URL/scheme specifiers (`node:fs`, `file://...`, `https://...`) are left in cache so package identity stays stable across cells. The cache-bust only fires when the resolved target is an absolute path — unresolved bare-package fallbacks (`resolveImportSpecifier()` returning the original specifier) skip it.
 - The prelude installs globals:
   - `display`, `print`
   - `read`, `write`, `append`, `sort`, `uniq`, `counter`, `diff`, `tree`, `env`, `output`
@@ -154,7 +154,7 @@ Implemented in `packages/coding-agent/src/eval/py/executor.ts`, `packages/coding
 - The Python prelude defines synchronous helpers with the same surface as JS (except `tool.<name>` exists only in JS)
 - `display(value)` wraps dict/list/tuple values in `IPython.display.JSON`; rich display MIME bundles are preserved
 - Kernel `display_data` / `execute_result` messages map to:
-  - `application/x-omp-status` → status event
+  - `application/x-gjc-status` → status event
   - `image/png` → image output
   - `application/json` → JSON output
   - `text/markdown` → markdown output

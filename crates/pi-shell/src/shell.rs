@@ -1108,7 +1108,7 @@ fn should_skip_env_var(key: &str) -> bool {
 			| "SHELLOPTS"
 			| "SHLVL"
 			| "SHELL"
-			| "CGJC_WORDBREAKS"
+			| "COMP_WORDBREAKS"
 			| "DIRSTACK"
 			| "EPOCHREALTIME"
 			| "EPOCHSECONDS"

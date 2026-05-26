@@ -15,7 +15,7 @@ import { complete, type Message } from "@gajae-code/ai";
 import type { HookAPI, SessionEntry } from "@gajae-code/coding-agent";
 import { BorderedLoader, convertToLlm, serializeConversation } from "@gajae-code/coding-agent";
 
-const SYSTEM_PRGJCT = `You are a context transfer assistant. Given a conversation history and the user's goal for a new thread, generate a focused prompt that:
+const SYSTEM_PROMPT = `You are a context transfer assistant. Given a conversation history and the user's goal for a new thread, generate a focused prompt that:
 
 1. Summarizes relevant context from the conversation (decisions made, approaches taken, key findings)
 2. Lists any relevant files that were discussed or modified
@@ -94,7 +94,7 @@ export default function (pi: HookAPI) {
 
 					const response = await complete(
 						ctx.model!,
-						{ systemPrompt: [SYSTEM_PRGJCT], messages: [userMessage] },
+						{ systemPrompt: [SYSTEM_PROMPT], messages: [userMessage] },
 						{ apiKey, signal: loader.signal },
 					);
 

@@ -2,8 +2,8 @@
  * Print mode (single-shot): Send prompts, output result, exit.
  *
  * Used for:
- * - `omp -p "prompt"` - text output
- * - `omp --mode json "prompt"` - JSON event stream
+ * - `gjc -p "prompt"` - text output
+ * - `gjc --mode json "prompt"` - JSON event stream
  */
 import type { AssistantMessage, ImageContent } from "@gajae-code/ai";
 import { logger, sanitizeText } from "@gajae-code/utils";

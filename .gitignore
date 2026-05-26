@@ -39,8 +39,22 @@ coverage/
 packages/ai/test/.temp-images/
 
 # Project specific
-!.omp/
-.omp/plugins/
+!.gjc/
+!.gjc/agents/
+!.gjc/agents/**
+!.gjc/skills/
+!.gjc/skills/**
+.gjc/plugins/
+.gjc/context/
+.gjc/interviews/
+.gjc/plans/
+.gjc/ralplan/
+.gjc/specs/
+.gjc/ultragoal/
+.gjc/verification/
+.gjc/logs/
+.gjc/state/
+.gjc/metrics.json
 .pi_config/
 .opencode/
 .worktrees/
@@ -57,20 +71,15 @@ pi-*.html
 # Generated files
 packages/coding-agent/src/internal-urls/docs-index.generated.ts
 /runs/
-python/omp-rpc/src/omp_rpc.egg-info/
+python/gjc-rpc/src/gjc_rpc.egg-info/
 # parallel-agent worktrees
 .wt/
 CPU*.md
 packages/coding-agent/binaries/
 
-# robomp runtime state
-python/robomp/data/
-python/robomp/.cache/
-python/robomp/src/robomp/static/
-python/robomp/web/dist/
-python/robomp/.env
-
-# gajae-code local OMX runtime noise
-.omx/logs/
-.omx/state/
-.omx/metrics.json
+# robogjc runtime state
+python/robogjc/data/
+python/robogjc/.cache/
+python/robogjc/src/robogjc/static/
+python/robogjc/web/dist/
+python/robogjc/.env

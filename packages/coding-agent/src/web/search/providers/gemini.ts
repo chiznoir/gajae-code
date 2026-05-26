@@ -390,7 +390,7 @@ export async function searchGemini(params: GeminiSearchParams): Promise<SearchRe
 	const auth = await findGeminiAuth(params.authStorage, params.sessionId, params.signal);
 	if (!auth) {
 		throw new Error(
-			"No Gemini OAuth credentials found. Login with 'omp /login google-gemini-cli' or 'omp /login google-antigravity' to enable Gemini web search.",
+			"No Gemini OAuth credentials found. Login with 'gjc /login google-gemini-cli' or 'gjc /login google-antigravity' to enable Gemini web search.",
 		);
 	}
 

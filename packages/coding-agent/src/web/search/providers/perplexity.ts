@@ -413,7 +413,7 @@ async function callPerplexityOAuth(
 
 		if (mergedEvent.display_model) model = mergedEvent.display_model;
 		if (mergedEvent.uuid) finalRequestId = mergedEvent.uuid;
-		if (mergedEvent.final || mergedEvent.status === "CGJCLETED") {
+		if (mergedEvent.final || mergedEvent.status === "COMPLETED") {
 			break;
 		}
 	}

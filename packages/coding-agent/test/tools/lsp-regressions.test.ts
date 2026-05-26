@@ -50,7 +50,7 @@ describe("lsp regressions", () => {
 	});
 
 	it("limits glob collection to avoid large diagnostic stalls", async () => {
-		const tempDir = TempDir.createSync("@omp-lsp-glob-");
+		const tempDir = TempDir.createSync("@gjc-lsp-glob-");
 		try {
 			await Promise.all([
 				Bun.write(`${tempDir.path()}/a.ts`, "export const a = 1;\n"),
@@ -66,7 +66,7 @@ describe("lsp regressions", () => {
 	});
 
 	it("treats existing bracket paths as literal diagnostic targets", async () => {
-		const tempDir = TempDir.createSync("@omp-lsp-bracket-path-");
+		const tempDir = TempDir.createSync("@gjc-lsp-bracket-path-");
 		try {
 			const filePath = `${tempDir.path()}/apps/frontend/src/app/runs/[runId]/public/opengraph-image.tsx`;
 			await Bun.write(filePath, "export default function OpenGraphImage() {}\n");
@@ -87,7 +87,7 @@ describe("lsp regressions", () => {
 	});
 
 	it("resolves the requested symbol occurrence on a line", async () => {
-		const tempDir = TempDir.createSync("@omp-lsp-regression-");
+		const tempDir = TempDir.createSync("@gjc-lsp-regression-");
 		try {
 			const filePath = `${tempDir.path()}/symbol.ts`;
 			await Bun.write(filePath, "foo(bar(foo));\n");
@@ -100,7 +100,7 @@ describe("lsp regressions", () => {
 	});
 
 	it("throws when symbol does not exist on the target line", async () => {
-		const tempDir = TempDir.createSync("@omp-lsp-missing-symbol-");
+		const tempDir = TempDir.createSync("@gjc-lsp-missing-symbol-");
 		try {
 			const filePath = `${tempDir.path()}/symbol.ts`;
 			await Bun.write(filePath, "winston.info('x');\n");
@@ -114,7 +114,7 @@ describe("lsp regressions", () => {
 	});
 
 	it("throws when occurrence is out of bounds", async () => {
-		const tempDir = TempDir.createSync("@omp-lsp-occurrence-");
+		const tempDir = TempDir.createSync("@gjc-lsp-occurrence-");
 		try {
 			const filePath = `${tempDir.path()}/symbol.ts`;
 			await Bun.write(filePath, "foo();\n");
@@ -290,7 +290,7 @@ describe("lsp regressions", () => {
 	});
 
 	it("does not reuse stale file diagnostics after another URI publishes", async () => {
-		const tempDir = TempDir.createSync("@omp-lsp-stale-diags-");
+		const tempDir = TempDir.createSync("@gjc-lsp-stale-diags-");
 		try {
 			const targetFile = path.join(tempDir.path(), "target.ts");
 			const otherFile = path.join(tempDir.path(), "other.ts");
@@ -379,7 +379,7 @@ describe("lsp regressions", () => {
 			return;
 		}
 
-		const tempDir = TempDir.createSync("@omp-lsp-win32-bin-");
+		const tempDir = TempDir.createSync("@gjc-lsp-win32-bin-");
 		const whichSpy = vi.spyOn(Bun, "which").mockReturnValue(null);
 
 		try {
@@ -399,7 +399,7 @@ describe("lsp regressions", () => {
 	});
 
 	it("detects tlaplus files for LSP startup and language ids", async () => {
-		const tempDir = TempDir.createSync("@omp-lsp-tlaplus-");
+		const tempDir = TempDir.createSync("@gjc-lsp-tlaplus-");
 		const specPath = path.join(tempDir.path(), "Spec.tla");
 		const aliasPath = path.join(tempDir.path(), "Spec.tlaplus");
 
@@ -425,7 +425,7 @@ describe("lsp regressions", () => {
 	});
 
 	it("loads config-only marketplace LSP servers from Claude plugin cache", async () => {
-		const tempDir = TempDir.createSync("@omp-lsp-marketplace-config-");
+		const tempDir = TempDir.createSync("@gjc-lsp-marketplace-config-");
 		const home = path.join(tempDir.path(), "home");
 		const cwd = path.join(tempDir.path(), "repo");
 		const pluginRoot = path.join(
@@ -509,7 +509,7 @@ describe("lsp regressions", () => {
 		}
 	});
 	it("rename_file applies LSP willRenameFiles edits and renames the file", async () => {
-		const tempDir = TempDir.createSync("@omp-lsp-rename-file-");
+		const tempDir = TempDir.createSync("@gjc-lsp-rename-file-");
 		try {
 			const sourceFile = path.join(tempDir.path(), "src", "old.ts");
 			const destFile = path.join(tempDir.path(), "src", "new.ts");
@@ -616,7 +616,7 @@ describe("lsp regressions", () => {
 	});
 
 	it("rename_file with apply:false previews edits without filesystem changes", async () => {
-		const tempDir = TempDir.createSync("@omp-lsp-rename-file-preview-");
+		const tempDir = TempDir.createSync("@gjc-lsp-rename-file-preview-");
 		try {
 			const sourceFile = path.join(tempDir.path(), "old.ts");
 			const destFile = path.join(tempDir.path(), "new.ts");
@@ -673,7 +673,7 @@ describe("lsp regressions", () => {
 	});
 
 	it("rename_file enumerates every file inside a directory rename", async () => {
-		const tempDir = TempDir.createSync("@omp-lsp-rename-dir-");
+		const tempDir = TempDir.createSync("@gjc-lsp-rename-dir-");
 		try {
 			const srcDir = path.join(tempDir.path(), "old");
 			const dstDir = path.join(tempDir.path(), "new");
@@ -746,7 +746,7 @@ describe("lsp regressions", () => {
 	});
 
 	it("request action sends raw LSP method with auto-built textDocument/position params", async () => {
-		const tempDir = TempDir.createSync("@omp-lsp-request-");
+		const tempDir = TempDir.createSync("@gjc-lsp-request-");
 		try {
 			const filePath = path.join(tempDir.path(), "src", "lib.rs");
 			await Bun.write(filePath, 'fn main() {\n    println!("hi");\n}\n');
@@ -818,7 +818,7 @@ describe("lsp regressions", () => {
 	});
 
 	it("request action forwards explicit JSON payload verbatim", async () => {
-		const tempDir = TempDir.createSync("@omp-lsp-request-payload-");
+		const tempDir = TempDir.createSync("@gjc-lsp-request-payload-");
 		try {
 			const server: ServerConfig = { command: "test-lsp", fileTypes: ["ts"], rootMarkers: [] };
 			const client: LspClient = {
@@ -875,7 +875,7 @@ describe("lsp regressions", () => {
 	});
 
 	it("capabilities action dumps server capabilities", async () => {
-		const tempDir = TempDir.createSync("@omp-lsp-caps-");
+		const tempDir = TempDir.createSync("@gjc-lsp-caps-");
 		try {
 			const server: ServerConfig = { command: "test-lsp", fileTypes: ["ts"], rootMarkers: [] };
 			const client: LspClient = {

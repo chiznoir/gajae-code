@@ -12,8 +12,8 @@ import {
 	SessionManager,
 } from "@gajae-code/coding-agent";
 
-// Default: discoverAuthStorage() uses ~/.omp/agent/agent.db
-// discoverModels() loads built-in + custom models from ~/.omp/agent/models.json
+// Default: discoverAuthStorage() uses ~/.gjc/agent/agent.db
+// discoverModels() loads built-in + custom models from ~/.gjc/agent/models.json
 const authStorage = await discoverAuthStorage();
 const modelRegistry = await discoverModels(authStorage);
 

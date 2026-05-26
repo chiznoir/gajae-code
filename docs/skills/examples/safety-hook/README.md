@@ -11,10 +11,10 @@ An `gajae-code` extension that demonstrates `tool_call` blocking. It intercepts 
 ## Install
 
 ```
-cp -r . ~/.omp/agent/extensions/safety-hook
+cp -r . ~/.gjc/agent/extensions/safety-hook
 ```
 
-Restart `omp`. The hook is active for all sessions.
+Restart `gjc`. The hook is active for all sessions.
 
 Or load once:
 

@@ -4,7 +4,7 @@ import { renderKernelDisplay } from "@gajae-code/coding-agent/eval/py/display";
 describe("renderKernelDisplay (raw bundle shape)", () => {
 	it("renders status events without text output", async () => {
 		const { text, outputs } = await renderKernelDisplay({
-			"application/x-omp-status": { op: "find", count: 12, pattern: "foo" },
+			"application/x-gjc-status": { op: "find", count: 12, pattern: "foo" },
 		});
 		expect(text).toBe("");
 		expect(outputs).toEqual([{ type: "status", event: { op: "find", count: 12, pattern: "foo" } }]);

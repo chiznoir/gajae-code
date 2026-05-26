@@ -24,7 +24,7 @@ const INTERNAL_SCHEMES_WITH_SELECTORS: Record<string, true> = {
 	issue: true,
 	local: true,
 	memory: true,
-	omp: true,
+	gjc: true,
 	pr: true,
 	rule: true,
 	skill: true,

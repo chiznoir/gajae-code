@@ -1,11 +1,11 @@
 /**
- * Resolve auth-broker connection configuration for the local omp client.
+ * Resolve auth-broker connection configuration for the local gjc client.
  *
  * Precedence (highest first):
  *   1. `GJC_AUTH_BROKER_URL` / `GJC_AUTH_BROKER_TOKEN` env vars.
- *   2. `auth.broker.url` / `auth.broker.token` in `~/.omp/agent/config.yml`
+ *   2. `auth.broker.url` / `auth.broker.token` in `~/.gjc/agent/config.yml`
  *      (hidden from the settings UI; `!command` resolution supported).
- *   3. Token file `~/.omp/auth-broker.token` (paired with URL from env or config).
+ *   3. Token file `~/.gjc/auth-broker.token` (paired with URL from env or config).
  *
  * Returns null when no broker URL is configured — caller falls back to the
  * local SQLite store.
@@ -25,7 +25,7 @@ export interface AuthBrokerClientConfig {
 	token: string;
 }
 
-/** Path to the local bearer token file. Created on the broker host by `omp auth-broker token`. */
+/** Path to the local bearer token file. Created on the broker host by `gjc auth-broker token`. */
 export function getAuthBrokerTokenFilePath(): string {
 	return path.join(getConfigRootDir(), "auth-broker.token");
 }

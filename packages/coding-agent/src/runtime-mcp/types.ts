@@ -404,7 +404,7 @@ export const MCPNotificationMethods = {
 	TOOLS_LIST_CHANGED: "notifications/tools/list_changed",
 	RESOURCES_LIST_CHANGED: "notifications/resources/list_changed",
 	RESOURCES_UPDATED: "notifications/resources/updated",
-	PRGJCTS_LIST_CHANGED: "notifications/prompts/list_changed",
+	PROMPTS_LIST_CHANGED: "notifications/prompts/list_changed",
 } as const;
 
 /** Extract a JsonRpcError from a thrown value. Preserves `.code` and `.message` from Error instances or plain objects. */

@@ -34,13 +34,13 @@ interface CostBackfillRow {
 
 let db: Database | null = null;
 
-const BACKFILL_CGJCLETE = "complete";
+const BACKFILL_COMPLETE = "complete";
 const BACKFILL_PENDING = "pending";
 const USER_MESSAGES_BACKFILL_KEY = "user_messages_v5";
 const USER_MESSAGE_LINKS_REPAIR_KEY = "user_message_links_v1";
 const PRIORITY_PREMIUM_REQUESTS_BACKFILL_KEY = "premium_requests_priority_v1";
 function shouldResetBackfill(value: string | undefined): boolean {
-	return value !== BACKFILL_CGJCLETE && value !== BACKFILL_PENDING;
+	return value !== BACKFILL_COMPLETE && value !== BACKFILL_PENDING;
 }
 /**
  * Initialize the database and create tables.
@@ -833,7 +833,7 @@ export function markPriorityPremiumRequestsBackfillComplete(): void {
 	if (!db) return;
 	db.prepare("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)").run(
 		PRIORITY_PREMIUM_REQUESTS_BACKFILL_KEY,
-		BACKFILL_CGJCLETE,
+		BACKFILL_COMPLETE,
 	);
 }
 
@@ -841,7 +841,7 @@ export function markUserMessagesBackfillComplete(): void {
 	if (!db) return;
 	db.prepare("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)").run(
 		USER_MESSAGES_BACKFILL_KEY,
-		BACKFILL_CGJCLETE,
+		BACKFILL_COMPLETE,
 	);
 }
 
@@ -849,7 +849,7 @@ export function markUserMessageLinksRepairComplete(): void {
 	if (!db) return;
 	db.prepare("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)").run(
 		USER_MESSAGE_LINKS_REPAIR_KEY,
-		BACKFILL_CGJCLETE,
+		BACKFILL_COMPLETE,
 	);
 }
 

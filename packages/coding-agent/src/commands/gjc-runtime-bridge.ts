@@ -1,9 +1,9 @@
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 
-const BRIDGE_ENV = "GJC_OMX_RUNTIME_BINARY";
-const LEGACY_BRIDGE_ENV = "OMX_RUNTIME_BINARY";
-const GUARD_ENV = "GJC_OMX_RUNTIME_BRIDGE_ACTIVE";
+const BRIDGE_ENV = "GJC_RUNTIME_BINARY";
+const LEGACY_BRIDGE_ENV = "GJC_LEGACY_RUNTIME_BINARY";
+const GUARD_ENV = "GJC_RUNTIME_BRIDGE_ACTIVE";
 
 export interface GjcRuntimeBridgeResult {
 	status: number;
@@ -11,7 +11,7 @@ export interface GjcRuntimeBridgeResult {
 }
 
 function candidateBinaries(env: NodeJS.ProcessEnv): string[] {
-	return [env[BRIDGE_ENV], env[LEGACY_BRIDGE_ENV], "omx"].filter(
+	return [env[BRIDGE_ENV], env[LEGACY_BRIDGE_ENV]].filter(
 		(value): value is string => typeof value === "string" && value.trim().length > 0,
 	);
 }
@@ -62,11 +62,11 @@ export function runGjcRuntimeBridge(
 	return {
 		status: 1,
 		error: [
-			`gjc ${endpoint} requires the private OMX runtime endpoint implementation.`,
-			`Install oh-my-codex/omx or set ${BRIDGE_ENV} to an omx-compatible runtime binary.`,
+			`gjc ${endpoint} requires the private GJC runtime endpoint implementation.`,
+			`Set ${BRIDGE_ENV} to a GJC-compatible runtime binary.`,
 			configured
 				? `Configured runtime candidates failed: ${configured}.`
-				: "No omx runtime binary was found on PATH.",
+				: "No gjc runtime binary was found on PATH.",
 			attempted.length > 0 ? `Attempted: ${attempted.join(", ")}.` : undefined,
 		]
 			.filter(Boolean)

@@ -166,11 +166,11 @@ def transform_cell(source: str) -> str:
 
     Rules
     -----
-    * ``%name args``              -> ``__omp_magic("name", "args")``
-    * ``var = %name args``        -> ``var = __omp_magic("name", "args")``
-    * ``!cmd``                    -> ``__omp_shell("cmd")``
-    * ``var = !cmd``              -> ``var = __omp_shell("cmd")``
-    * ``%%name args\\n<body>``    -> ``__omp_magic_cell("name", "args", "<body>")``
+    * ``%name args``              -> ``__gjc_magic("name", "args")``
+    * ``var = %name args``        -> ``var = __gjc_magic("name", "args")``
+    * ``!cmd``                    -> ``__gjc_shell("cmd")``
+    * ``var = !cmd``              -> ``var = __gjc_shell("cmd")``
+    * ``%%name args\\n<body>``    -> ``__gjc_magic_cell("name", "args", "<body>")``
       (cell magic must be the first non-whitespace token of a top-level line and
       consumes the remainder of the cell)
 
@@ -198,7 +198,7 @@ def transform_cell(source: str) -> str:
             body_lines = lines[i + 1 :]
             body = "\n".join(body_lines)
             out.append(
-                f"{indent}__omp_magic_cell({_quote_arg(name)}, {_quote_arg(args)}, {_quote_arg(body)})"
+                f"{indent}__gjc_magic_cell({_quote_arg(name)}, {_quote_arg(args)}, {_quote_arg(body)})"
             )
             return "\n".join(out)
 
@@ -209,7 +209,7 @@ def transform_cell(source: str) -> str:
             indent = folded[: len(folded) - len(stripped_folded)]
             head, _ = _split_magic_head(stripped_folded[1:])
             name, args = head
-            out.append(f"{indent}__omp_magic({_quote_arg(name)}, {_quote_arg(args)})")
+            out.append(f"{indent}__gjc_magic({_quote_arg(name)}, {_quote_arg(args)})")
             i += consumed
             continue
 
@@ -218,7 +218,7 @@ def transform_cell(source: str) -> str:
             stripped_folded = folded.lstrip()
             indent = folded[: len(folded) - len(stripped_folded)]
             cmd = stripped_folded[1:].strip()
-            out.append(f"{indent}__omp_shell({_quote_arg(cmd)})")
+            out.append(f"{indent}__gjc_shell({_quote_arg(cmd)})")
             i += consumed
             continue
 
@@ -228,14 +228,14 @@ def transform_cell(source: str) -> str:
             rhs = m.group("rhs").strip()
             if rhs.startswith("!"):
                 cmd = rhs[1:].strip()
-                out.append(f"{m.group('indent')}{m.group('lhs').rstrip()} = __omp_shell({_quote_arg(cmd)})")
+                out.append(f"{m.group('indent')}{m.group('lhs').rstrip()} = __gjc_shell({_quote_arg(cmd)})")
                 i += 1
                 continue
             if rhs.startswith("%") and not rhs.startswith("%%"):
                 head, _ = _split_magic_head(rhs[1:])
                 name, args = head
                 out.append(
-                    f"{m.group('indent')}{m.group('lhs').rstrip()} = __omp_magic({_quote_arg(name)}, {_quote_arg(args)})"
+                    f"{m.group('indent')}{m.group('lhs').rstrip()} = __gjc_magic({_quote_arg(name)}, {_quote_arg(args)})"
                 )
                 i += 1
                 continue
@@ -283,7 +283,7 @@ def cell_magic(name: str) -> Callable[[Callable[[str, str], Any]], Callable[[str
 
 
 def _emit_status(op: str, **data: Any) -> None:
-    bundle = {"application/x-omp-status": {"op": op, **data}}
+    bundle = {"application/x-gjc-status": {"op": op, **data}}
     rid = _STATE.current_id
     if rid is None:
         return
@@ -508,14 +508,14 @@ def _run_shell_body(body: str, *, shell_arg: str) -> int:
     return proc.returncode
 
 
-def __omp_magic(name: str, args: str) -> Any:
+def __gjc_magic(name: str, args: str) -> Any:
     fn = _LINE_MAGICS.get(name)
     if fn is None:
         raise NameError(f"UsageError: Line magic function '%{name}' not found.")
     return fn(args)
 
 
-def __omp_magic_cell(name: str, args: str, body: str) -> Any:
+def __gjc_magic_cell(name: str, args: str, body: str) -> Any:
     fn = _CELL_MAGICS.get(name)
     if fn is None:
         raise NameError(f"UsageError: Cell magic function '%%{name}' not found.")
@@ -538,7 +538,7 @@ class _ShellResult(list):
         return " ".join(self)
 
 
-def __omp_shell(cmd: str) -> _ShellResult:
+def __gjc_shell(cmd: str) -> _ShellResult:
     proc = subprocess.run(
         cmd,
         shell=True,
@@ -628,7 +628,7 @@ def _emit_display(bundle: dict, *, kind: str = "display") -> None:
     _emit({"type": kind, "id": rid, "bundle": bundle})
 
 
-def __omp_display(value: Any, *, raw: bool = False, kind: str = "display") -> None:
+def __gjc_display(value: Any, *, raw: bool = False, kind: str = "display") -> None:
     if raw:
         if not isinstance(value, dict):
             raise TypeError("display(..., raw=True) requires a MIME bundle dict")
@@ -676,11 +676,11 @@ os.environ.setdefault("MPLBACKEND", "Agg")
 
 
 def _install_builtins(ns: dict) -> None:
-    ns["display"] = __omp_display
-    ns["__omp_display"] = __omp_display
-    ns["__omp_magic"] = __omp_magic
-    ns["__omp_magic_cell"] = __omp_magic_cell
-    ns["__omp_shell"] = __omp_shell
+    ns["display"] = __gjc_display
+    ns["__gjc_display"] = __gjc_display
+    ns["__gjc_magic"] = __gjc_magic
+    ns["__gjc_magic_cell"] = __gjc_magic_cell
+    ns["__gjc_shell"] = __gjc_shell
 
 
 _install_builtins(_STATE.user_ns)
@@ -722,7 +722,7 @@ def _run_compiled(code, ns: dict, *, want_value: bool) -> Any:
 
 def _exec_source(source: str, ns: dict) -> None:
     """Compile + execute ``source``; if the last node is an expression, route
-    its value through ``__omp_display`` so dataframes/figures render rich.
+    its value through ``__gjc_display`` so dataframes/figures render rich.
     Top-level ``await`` / ``async for`` / ``async with`` is permitted; the
     cell is driven through the runner's persistent event loop."""
     module = ast.parse(source, mode="exec")
@@ -740,7 +740,7 @@ def _exec_source(source: str, ns: dict) -> None:
         _run_compiled(body_code, ns, want_value=False)
         value = _run_compiled(expr_code, ns, want_value=True)
         if value is not None:
-            __omp_display(value, kind="result")
+            __gjc_display(value, kind="result")
         return
 
     code = compile(module, "<cell>", "exec", flags=_TLA_FLAG)
@@ -793,7 +793,7 @@ def _start_parent_watchdog() -> None:
                 return
             time.sleep(10)
 
-    thread = threading.Thread(target=watch, name="omp-parent-watchdog", daemon=True)
+    thread = threading.Thread(target=watch, name="gjc-parent-watchdog", daemon=True)
     thread.start()
 
 

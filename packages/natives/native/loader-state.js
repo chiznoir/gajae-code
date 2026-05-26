@@ -21,8 +21,8 @@ import { embeddedAddon } from "./embedded-addon.js";
  * `scripts/gen-enums.ts`); everything else lives here so the pure helpers stay
  * unit-testable without triggering the side-effectful module-load path.
  *
- * Background (issue #823): `bun build --compile --define PI_CGJCILED=true`
- * substitutes the bare identifier `PI_CGJCILED`, NOT `process.env.PI_CGJCILED`,
+ * Background (issue #823): `bun build --compile --define PI_COMPILED=true`
+ * substitutes the bare identifier `PI_COMPILED`, NOT `process.env.PI_COMPILED`,
  * so a runtime read of the env var returns `undefined`. Older CommonJS loader
  * code also saw the original build-host absolute path in `__filename`; ESM
  * `import.meta.url` is rewritten to the bunfs URL. The embedded-addon
@@ -34,10 +34,10 @@ const SUPPORTED_PLATFORMS = ["linux-x64", "linux-arm64", "darwin-x64", "darwin-a
 
 function getNativesDir() {
 	const xdgDataHome = process.env.XDG_DATA_HOME;
-	if (xdgDataHome && fs.existsSync(path.join(xdgDataHome, "omp"))) {
-		return path.join(xdgDataHome, "omp", "natives");
+	if (xdgDataHome && fs.existsSync(path.join(xdgDataHome, "gjc"))) {
+		return path.join(xdgDataHome, "gjc", "natives");
 	}
-	return path.join(os.homedir(), ".omp", "natives");
+	return path.join(os.homedir(), ".gjc", "natives");
 }
 
 // =========================================================================
@@ -54,7 +54,7 @@ function getNativesDir() {
  */
 export function detectCompiledBinary({ embeddedAddon, env, importMetaUrl }) {
 	if (embeddedAddon) return true;
-	if (env && env.PI_CGJCILED) return true;
+	if (env && env.PI_COMPILED) return true;
 	if (typeof importMetaUrl === "string") {
 		if (importMetaUrl.includes("$bunfs")) return true;
 		if (importMetaUrl.includes("~BUN")) return true;
@@ -80,14 +80,14 @@ export function getAddonFilenames({ tag, arch, variant }) {
 
 /**
  * Decide whether the loader should mirror the package's `native/<filename>.node`
- * into the per-version cache directory (`~/.omp/natives/<version>/`) before loading.
+ * into the per-version cache directory (`~/.gjc/natives/<version>/`) before loading.
  *
- * Windows-only safety net for `bun install -g` updates: when a previous `omp`
+ * Windows-only safety net for `bun install -g` updates: when a previous `gjc`
  * process is running, bun cannot overwrite the locked `.node` inside
  * `node_modules/@gajae-code/natives/native/`, leaving an old binary next to a
  * newer `index.js` and producing `<sym> is not a function` crashes on the next
  * launch. Staging into the version-pinned cache:
- *   1. Gives every package version its own filesystem path, so concurrent omp
+ *   1. Gives every package version its own filesystem path, so concurrent gjc
  *      processes never collide on the same file.
  *   2. Makes the running process keep its handle on the cache copy, freeing bun
  *      to overwrite the `node_modules` copy on subsequent updates.
@@ -352,7 +352,7 @@ function initLoaderContext() {
 	const versionedDir = path.join(getNativesDir(), packageVersion);
 	const userDataDir =
 		process.platform === "win32"
-			? path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local"), "omp")
+			? path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local"), "gjc")
 			: path.join(os.homedir(), ".local", "bin");
 
 	const isCompiledBinary = detectCompiledBinary({

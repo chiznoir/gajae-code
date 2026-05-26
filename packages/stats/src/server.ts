@@ -24,13 +24,13 @@ const getEmbeddedClientArchive = (() => {
 
 const CLIENT_DIR = path.join(import.meta.dir, "client");
 const STATIC_DIR = path.join(import.meta.dir, "..", "dist", "client");
-const IS_BUN_CGJCILED =
-	Bun.env.PI_CGJCILED ||
+const IS_BUN_COMPILED =
+	Bun.env.PI_COMPILED ||
 	import.meta.url.includes("$bunfs") ||
 	import.meta.url.includes("~BUN") ||
 	import.meta.url.includes("%7EBUN");
 
-const CGJCILED_CLIENT_DIR_ROOT = path.join(os.tmpdir(), "gjc-stats-client");
+const COMPILED_CLIENT_DIR_ROOT = path.join(os.tmpdir(), "gjc-stats-client");
 let compiledClientDirPromise: Promise<string> | null = null;
 
 function sanitizeArchivePath(archivePath: string): string | null {
@@ -57,7 +57,7 @@ async function extractEmbeddedClientArchive(archiveBytes: Buffer, outputDir: str
 }
 
 async function getCompiledClientDir(): Promise<string> {
-	if (!IS_BUN_CGJCILED) return STATIC_DIR;
+	if (!IS_BUN_COMPILED) return STATIC_DIR;
 	if (compiledClientDirPromise) return compiledClientDirPromise;
 
 	const archiveBytes = getEmbeddedClientArchive?.();
@@ -67,7 +67,7 @@ async function getCompiledClientDir(): Promise<string> {
 
 	compiledClientDirPromise = (async () => {
 		const bundleHash = Bun.hash(archiveBytes).toString(16);
-		const outputDir = path.join(CGJCILED_CLIENT_DIR_ROOT, bundleHash);
+		const outputDir = path.join(COMPILED_CLIENT_DIR_ROOT, bundleHash);
 		const markerPath = path.join(outputDir, "index.html");
 		try {
 			const marker = await fs.stat(markerPath);
@@ -108,7 +108,7 @@ async function getLatestMtime(dir: string): Promise<number> {
 }
 
 const ensureClientBuild = async () => {
-	if (IS_BUN_CGJCILED) return;
+	if (IS_BUN_COMPILED) return;
 	const indexPath = path.join(STATIC_DIR, "index.html");
 	const cssPath = path.join(STATIC_DIR, "styles.css");
 	const clientSourceMtime = await getLatestMtime(CLIENT_DIR);
@@ -247,7 +247,7 @@ async function handleApi(req: Request): Promise<Response> {
  * Handle static file requests.
  */
 async function handleStatic(requestPath: string): Promise<Response> {
-	const staticDir = IS_BUN_CGJCILED ? await getCompiledClientDir() : STATIC_DIR;
+	const staticDir = IS_BUN_COMPILED ? await getCompiledClientDir() : STATIC_DIR;
 	const filePath = requestPath === "/" ? "/index.html" : requestPath;
 	const fullPath = path.join(staticDir, filePath);
 
@@ -272,6 +272,7 @@ export async function startServer(port = 3847): Promise<{ port: number; stop: ()
 	await ensureClientBuild();
 
 	const server = Bun.serve({
+		hostname: "127.0.0.1",
 		port,
 		async fetch(req) {
 			const url = new URL(req.url);

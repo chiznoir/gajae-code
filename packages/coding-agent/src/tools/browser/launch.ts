@@ -81,7 +81,7 @@ export async function loadPuppeteerInWorker(safeDir: string): Promise<typeof Pup
 /**
  * Lazily download Chromium on first browser launch via @puppeteer/browsers.
  * Skipped when a system Chromium (NixOS) or PUPPETEER_EXECUTABLE_PATH is set.
- * The browser is cached under ~/.omp/puppeteer (getPuppeteerDir).
+ * The browser is cached under ~/.gjc/puppeteer (getPuppeteerDir).
  */
 let chromiumExecutablePromise: Promise<string | undefined> | undefined;
 async function ensureChromiumExecutable(): Promise<string | undefined> {

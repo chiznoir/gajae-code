@@ -1,0 +1,126 @@
+import * as path from "node:path";
+import { getAgentDir, isEnoent } from "@gajae-code/utils";
+import deepInterviewAgent from "./gjc/agents/deep-interview.md" with { type: "text" };
+import ralplanAgent from "./gjc/agents/ralplan.md" with { type: "text" };
+import teamAgent from "./gjc/agents/team.md" with { type: "text" };
+import ultragoalAgent from "./gjc/agents/ultragoal.md" with { type: "text" };
+import deepInterviewSkill from "./gjc/skills/deep-interview/SKILL.md" with { type: "text" };
+import ralplanSkill from "./gjc/skills/ralplan/SKILL.md" with { type: "text" };
+import teamSkill from "./gjc/skills/team/SKILL.md" with { type: "text" };
+import ultragoalSkill from "./gjc/skills/ultragoal/SKILL.md" with { type: "text" };
+
+export const DEFAULT_GJC_DEFINITION_NAMES = ["deep-interview", "ralplan", "team", "ultragoal"] as const;
+export type DefaultGjcDefinitionName = (typeof DEFAULT_GJC_DEFINITION_NAMES)[number];
+export type DefaultGjcDefinitionKind = "agent" | "skill";
+export type DefaultGjcInstallStatus = "different" | "matching" | "missing" | "skipped" | "written";
+
+export interface DefaultGjcDefinition {
+	kind: DefaultGjcDefinitionKind;
+	name: DefaultGjcDefinitionName;
+	relativePath: string;
+	content: string;
+}
+
+export interface InstallDefaultGjcDefinitionsOptions {
+	check?: boolean;
+	force?: boolean;
+	targetRoot?: string;
+}
+
+export interface DefaultGjcDefinitionInstallFile {
+	kind: DefaultGjcDefinitionKind;
+	name: DefaultGjcDefinitionName;
+	path: string;
+	status: DefaultGjcInstallStatus;
+}
+
+export interface DefaultGjcDefinitionInstallResult {
+	targetRoot: string;
+	total: number;
+	written: number;
+	skipped: number;
+	matching: number;
+	missing: number;
+	different: number;
+	files: DefaultGjcDefinitionInstallFile[];
+}
+
+const DEFAULT_GJC_DEFINITIONS: readonly DefaultGjcDefinition[] = [
+	{ kind: "agent", name: "deep-interview", relativePath: "agents/deep-interview.md", content: deepInterviewAgent },
+	{ kind: "agent", name: "ralplan", relativePath: "agents/ralplan.md", content: ralplanAgent },
+	{ kind: "agent", name: "team", relativePath: "agents/team.md", content: teamAgent },
+	{ kind: "agent", name: "ultragoal", relativePath: "agents/ultragoal.md", content: ultragoalAgent },
+	{
+		kind: "skill",
+		name: "deep-interview",
+		relativePath: "skills/deep-interview/SKILL.md",
+		content: deepInterviewSkill,
+	},
+	{ kind: "skill", name: "ralplan", relativePath: "skills/ralplan/SKILL.md", content: ralplanSkill },
+	{ kind: "skill", name: "team", relativePath: "skills/team/SKILL.md", content: teamSkill },
+	{ kind: "skill", name: "ultragoal", relativePath: "skills/ultragoal/SKILL.md", content: ultragoalSkill },
+];
+
+export function getDefaultGjcDefinitions(): readonly DefaultGjcDefinition[] {
+	return DEFAULT_GJC_DEFINITIONS;
+}
+
+export async function installDefaultGjcDefinitions(
+	options: InstallDefaultGjcDefinitionsOptions = {},
+): Promise<DefaultGjcDefinitionInstallResult> {
+	const targetRoot = options.targetRoot ?? getAgentDir();
+	const files: DefaultGjcDefinitionInstallFile[] = [];
+
+	for (const definition of DEFAULT_GJC_DEFINITIONS) {
+		const destination = path.join(targetRoot, definition.relativePath);
+		const existing = await readExistingText(destination);
+		let status: DefaultGjcInstallStatus;
+
+		if (options.check) {
+			status = existing === undefined ? "missing" : existing === definition.content ? "matching" : "different";
+		} else if (existing !== undefined && !options.force) {
+			status = "skipped";
+		} else {
+			await Bun.write(destination, definition.content);
+			status = "written";
+		}
+
+		files.push({
+			kind: definition.kind,
+			name: definition.name,
+			path: destination,
+			status,
+		});
+	}
+
+	return summarizeInstallResult(targetRoot, files);
+}
+
+async function readExistingText(filePath: string): Promise<string | undefined> {
+	try {
+		return await Bun.file(filePath).text();
+	} catch (error) {
+		if (isEnoent(error)) return undefined;
+		throw error;
+	}
+}
+
+function summarizeInstallResult(
+	targetRoot: string,
+	files: DefaultGjcDefinitionInstallFile[],
+): DefaultGjcDefinitionInstallResult {
+	return {
+		targetRoot,
+		total: files.length,
+		written: countStatus(files, "written"),
+		skipped: countStatus(files, "skipped"),
+		matching: countStatus(files, "matching"),
+		missing: countStatus(files, "missing"),
+		different: countStatus(files, "different"),
+		files,
+	};
+}
+
+function countStatus(files: readonly DefaultGjcDefinitionInstallFile[], status: DefaultGjcInstallStatus): number {
+	return files.filter(file => file.status === status).length;
+}

@@ -1,5 +1,5 @@
 /**
- * Regression for the Windows `bun install -g` update path: when an `omp`
+ * Regression for the Windows `bun install -g` update path: when an `gjc`
  * process is running, bun cannot overwrite a locked
  * `node_modules/@gajae-code/natives/native/pi_natives.win32-x64.node` during
  * package update and silently keeps the old binary next to the new ESM
@@ -8,7 +8,7 @@
  *
  * The fix has two halves, both pinned by this test:
  *   1. The loader stages `nativeDir/<filename>.node` → `versionedDir/<filename>.node`
- *      (per-package-version cache under `~/.omp/natives/<version>/`) so the
+ *      (per-package-version cache under `~/.gjc/natives/<version>/`) so the
  *      running process holds its OS-level handle on a path bun is never asked
  *      to overwrite. Gated to Windows + node_modules installs + non-compiled
  *      mode by `shouldStageNodeModulesAddon`.
@@ -78,8 +78,8 @@ describe("windows native addon staging", () => {
 	});
 
 	it("prepends versionedDir candidates ahead of node_modules when staging on Windows", () => {
-		const versionedDir = "C:\\Users\\Admin\\.omp\\natives\\15.0.1";
-		const userDataDir = "C:\\Users\\Admin\\AppData\\Local\\omp";
+		const versionedDir = "C:\\Users\\Admin\\.gjc\\natives\\15.0.1";
+		const userDataDir = "C:\\Users\\Admin\\AppData\\Local\\gjc";
 		const candidates = resolveLoaderCandidates({
 			addonFilenames: getAddonFilenames({ tag: "win32-x64", arch: "x64", variant: "baseline" }),
 			isCompiledBinary: false,
@@ -110,7 +110,7 @@ describe("windows native addon staging", () => {
 	it("falls back to the node_modules-only candidate list when staging is off", () => {
 		// Mirrors the non-Windows / workspace-dev path: same behavior as before
 		// the staging feature was introduced.
-		const versionedDir = "/home/u/.omp/natives/15.0.1";
+		const versionedDir = "/home/u/.gjc/natives/15.0.1";
 		const candidates = resolveLoaderCandidates({
 			addonFilenames: getAddonFilenames({ tag: "linux-x64", arch: "x64", variant: "baseline" }),
 			isCompiledBinary: false,

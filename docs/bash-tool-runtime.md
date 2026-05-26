@@ -142,7 +142,7 @@ Environment hardening defaults are injected for unattended runs:
 
 - pagers disabled (`PAGER=cat`, `GIT_PAGER=cat`, etc.),
 - editor prompts disabled (`GIT_EDITOR=true`, `EDITOR=true`, ...),
-- terminal/auth prompts reduced (`GIT_TERMINAL_PRGJCT=0`, `SSH_ASKPASS=/usr/bin/false`, `CI=1`),
+- terminal/auth prompts reduced (`GIT_TERMINAL_PROMPT=0`, `SSH_ASKPASS=/usr/bin/false`, `CI=1`),
 - package-manager/tool automation flags for non-interactive behavior.
 
 PTY output is normalized (`CRLF`/`CR` to `LF`, `sanitizeText`) and written into `OutputSink`, including artifact spill support.

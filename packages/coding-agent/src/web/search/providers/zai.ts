@@ -280,7 +280,7 @@ function toSources(results: ZaiSearchResult[]): SearchSource[] {
 export async function searchZai(params: ZaiSearchParams): Promise<SearchResponse> {
 	const apiKey = await findApiKey(params.authStorage, params.sessionId, params.signal);
 	if (!apiKey) {
-		throw new Error("Z.AI credentials not found. Set ZAI_API_KEY or login with 'omp /login zai'.");
+		throw new Error("Z.AI credentials not found. Set ZAI_API_KEY or login with 'gjc /login zai'.");
 	}
 
 	const rawResult = await callZaiSearch(apiKey, params);

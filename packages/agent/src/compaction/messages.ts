@@ -12,7 +12,7 @@ import type { AgentMessage } from "../types";
 import branchSummaryContextPrompt from "./prompts/branch-summary-context.md" with { type: "text" };
 import compactionSummaryContextPrompt from "./prompts/compaction-summary-context.md" with { type: "text" };
 
-const CGJCACTION_SUMMARY_TEMPLATE = compactionSummaryContextPrompt;
+const COMPACTION_SUMMARY_TEMPLATE = compactionSummaryContextPrompt;
 const BRANCH_SUMMARY_TEMPLATE = branchSummaryContextPrompt;
 
 export interface CustomMessage<T = unknown> {
@@ -80,7 +80,7 @@ export function renderBranchSummaryContext(summary: string): string {
 }
 
 export function renderCompactionSummaryContext(summary: string): string {
-	return prompt.render(CGJCACTION_SUMMARY_TEMPLATE, { summary });
+	return prompt.render(COMPACTION_SUMMARY_TEMPLATE, { summary });
 }
 
 export function createBranchSummaryMessage(summary: string, fromId: string, timestamp: string): BranchSummaryMessage {

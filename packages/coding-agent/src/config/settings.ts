@@ -712,7 +712,7 @@ export class Settings {
 					!("bankId" in hindsightObj) &&
 					typeof agentName === "string" &&
 					agentName.trim().length > 0 &&
-					agentName !== "omp"
+					agentName !== "gjc"
 				) {
 					hindsightObj.bankId = agentName;
 				}

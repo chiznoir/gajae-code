@@ -8,7 +8,7 @@ describe("createLspWritethrough batching", () => {
 	let tempDir: TempDir;
 
 	beforeEach(() => {
-		tempDir = TempDir.createSync("@omp-lsp-batch-");
+		tempDir = TempDir.createSync("@gjc-lsp-batch-");
 	});
 
 	afterEach(() => {

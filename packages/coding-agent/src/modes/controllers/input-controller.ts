@@ -8,7 +8,7 @@ import { createPromptActionAutocompleteProvider } from "../../modes/prompt-actio
 import { theme } from "../../modes/theme/theme";
 import type { InteractiveModeContext } from "../../modes/types";
 import type { AgentSessionEvent } from "../../session/agent-session";
-import { SKILL_PRGJCT_MESSAGE_TYPE, type SkillPromptDetails } from "../../session/messages";
+import { SKILL_PROMPT_MESSAGE_TYPE, type SkillPromptDetails } from "../../session/messages";
 import { executeBuiltinSlashCommand } from "../../slash-commands/builtin-registry";
 import { copyToClipboard, readImageFromClipboard } from "../../utils/clipboard";
 import { getEditorCommand, openInEditor } from "../../utils/external-editor";
@@ -455,7 +455,7 @@ export class InputController {
 			}
 			await this.ctx.session.promptCustomMessage(
 				{
-					customType: SKILL_PRGJCT_MESSAGE_TYPE,
+					customType: SKILL_PROMPT_MESSAGE_TYPE,
 					content: message,
 					display: true,
 					details,
@@ -808,7 +808,7 @@ export class InputController {
 				? [ttyHandle.fd, ttyHandle.fd, ttyHandle.fd]
 				: ["inherit", "inherit", "inherit"];
 
-			const result = await openInEditor(editorCmd, currentText, { extension: ".omp.md", stdio });
+			const result = await openInEditor(editorCmd, currentText, { extension: ".gjc.md", stdio });
 			if (result !== null) {
 				this.ctx.editor.setText(result);
 			}

@@ -2,7 +2,7 @@
   "name": "hello-extension",
   "version": "1.0.0",
   "description": "Minimal gajae-code extension example",
-  "omp": {
+  "gjc": {
     "extensions": ["./index.ts"]
   }
 }

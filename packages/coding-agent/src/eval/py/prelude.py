@@ -1,13 +1,13 @@
 from __future__ import annotations
 # GJC prelude helpers (loaded once into the runner namespace)
-if "__omp_prelude_loaded__" not in globals():
-    __omp_prelude_loaded__ = True
+if "__gjc_prelude_loaded__" not in globals():
+    __gjc_prelude_loaded__ = True
     from pathlib import Path
     import os, json
 
-    # __omp_display is injected by runner.py before the prelude executes; it
+    # __gjc_display is injected by runner.py before the prelude executes; it
     # mirrors IPython's display() semantics with the same MIME bundle output.
-    _omp_display = __omp_display  # type: ignore[name-defined]
+    _gjc_display = __gjc_display  # type: ignore[name-defined]
 
     _PRESENTABLE_REPRS = (
         "_repr_mimebundle_",
@@ -23,20 +23,20 @@ if "__omp_prelude_loaded__" not in globals():
     def display(value):
         """Render a value. Falls back to a JSON+text/plain bundle for plain dict/list/tuple."""
         if any(hasattr(value, attr) for attr in _PRESENTABLE_REPRS):
-            _omp_display(value)
+            _gjc_display(value)
             return
         if isinstance(value, (dict, list, tuple)):
             try:
                 bundle = {"application/json": value, "text/plain": repr(value)}
-                _omp_display(bundle, raw=True)
+                _gjc_display(bundle, raw=True)
                 return
             except Exception:
                 pass
-        _omp_display(value)
+        _gjc_display(value)
 
     def _emit_status(op: str, **data):
         """Emit structured status event for TUI rendering."""
-        _omp_display({"application/x-omp-status": {"op": op, **data}}, raw=True)
+        _gjc_display({"application/x-gjc-status": {"op": op, **data}}, raw=True)
 
 
     def env(key: str | None = None, value: str | None = None):

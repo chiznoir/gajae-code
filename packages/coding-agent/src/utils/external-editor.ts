@@ -33,7 +33,7 @@ export async function openInEditor(
 	options?: OpenInEditorOptions,
 ): Promise<string | null> {
 	const ext = options?.extension ?? ".md";
-	const tmpFile = path.join(os.tmpdir(), `omp-editor-${Snowflake.next()}${ext}`);
+	const tmpFile = path.join(os.tmpdir(), `gjc-editor-${Snowflake.next()}${ext}`);
 
 	try {
 		await Bun.write(tmpFile, content);

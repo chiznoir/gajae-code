@@ -24,12 +24,12 @@ import * as z from "zod/v4";
 // Set these on `process.env` so they apply to both the local `runGit` helper
 // AND the impl's `git.ts::runCommand`, which spreads `process.env` into every
 // spawn. `/dev/null` is the documented way to tell git "use no config from
-// this scope". `GIT_TERMINAL_PRGJCT=0` + `GIT_ASKPASS=true` guarantee git
+// this scope". `GIT_TERMINAL_PROMPT=0` + `GIT_ASKPASS=true` guarantee git
 // never blocks on stdin waiting for credentials or a GPG passphrase.
 process.env.GIT_CONFIG_GLOBAL = "/dev/null";
 process.env.GIT_CONFIG_SYSTEM = "/dev/null";
 process.env.GIT_CONFIG_NOSYSTEM = "1";
-process.env.GIT_TERMINAL_PRGJCT = "0";
+process.env.GIT_TERMINAL_PROMPT = "0";
 process.env.GIT_ASKPASS = "true";
 // `XDG_CONFIG_HOME`, if set, lets git re-discover a global config under
 // `$XDG_CONFIG_HOME/git/config` even after we pin `GIT_CONFIG_GLOBAL`. Clear
@@ -131,7 +131,7 @@ async function createPrFixture(): Promise<{
 /**
  * Stub `os.homedir()` AND rebuild the cached `dirs` resolver in pi-utils so
  * `getWorktreesDir()` resolves under an isolated temp home instead of the
- * user's real `~/.omp/wt`. Returns the temp home and a cleanup hook.
+ * user's real `~/.gjc/wt`. Returns the temp home and a cleanup hook.
  */
 async function setupTempHome(): Promise<{ home: string; cleanup: () => Promise<void> }> {
 	const home = await fs.mkdtemp(path.join(os.tmpdir(), "gh-pr-tool-home-"));
@@ -140,7 +140,7 @@ async function setupTempHome(): Promise<{ home: string; cleanup: () => Promise<v
 	// we must rebuild the resolver after the spy is in place. `setAgentDir`
 	// recreates it; we point it at the temp home's default agent dir.
 	const originalAgentDir = getAgentDir();
-	setAgentDir(path.join(home, ".omp", "agent"));
+	setAgentDir(path.join(home, ".gjc", "agent"));
 	return {
 		home,
 		cleanup: async () => {
@@ -159,7 +159,7 @@ async function setupTempHome(): Promise<{ home: string; cleanup: () => Promise<v
 async function expectedWorktreePath(home: string, primaryRoot: string, localBranch: string): Promise<string> {
 	const prNumber = localBranch.replace(/^pr-/, "");
 	const segment = `${prNumber}-${hashPath(primaryRoot)}`;
-	return fs.realpath(path.join(home, ".omp", "wt", segment));
+	return fs.realpath(path.join(home, ".gjc", "wt", segment));
 }
 
 describe("parsePrUnifiedDiff", () => {
@@ -844,10 +844,10 @@ describe("github tool", () => {
 			expect(text).toContain(`Worktree: ${wt200}`);
 			expect(runGit(wt100, ["branch", "--show-current"])).toBe("pr-100");
 			expect(runGit(wt200, ["branch", "--show-current"])).toBe("pr-200");
-			expect(runGit(fixture.repoRoot, ["config", "--get", "branch.pr-100.ompPrUrl"])).toBe(
+			expect(runGit(fixture.repoRoot, ["config", "--get", "branch.pr-100.gjcPrUrl"])).toBe(
 				"https://github.com/owner/repo/pull/100",
 			);
-			expect(runGit(fixture.repoRoot, ["config", "--get", "branch.pr-200.ompPrUrl"])).toBe(
+			expect(runGit(fixture.repoRoot, ["config", "--get", "branch.pr-200.gjcPrUrl"])).toBe(
 				"https://github.com/owner/repo/pull/200",
 			);
 

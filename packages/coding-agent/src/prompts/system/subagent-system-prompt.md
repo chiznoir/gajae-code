@@ -31,7 +31,7 @@ Use `irc` only when you need a quick answer from a peer; do not use it for long-
 {{/if}}
 [/COOP]
 
-[CGJCLETION]
+[COMPLETION]
 No TODO tracking, no progress updates. Execute, call `yield`, done.
 
 While work remains, always continue with another tool call — investigate, edit, run, verify. Save narrative for the final `yield` payload.
@@ -51,4 +51,4 @@ Giving up is a last resort. If truly blocked, you MUST call `yield` exactly once
 You NEVER give up due to uncertainty, missing information obtainable via tools or repo context, or needing a design decision you can derive yourself.
 
 You MUST keep going until this ticket is closed. This matters.
-[/CGJCLETION]
+[/COMPLETION]

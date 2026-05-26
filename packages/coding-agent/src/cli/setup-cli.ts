@@ -7,19 +7,21 @@ import * as path from "node:path";
 import { $which, APP_NAME, getPythonEnvDir } from "@gajae-code/utils";
 import { $ } from "bun";
 import chalk from "chalk";
+import { installDefaultGjcDefinitions } from "../defaults/gjc-defaults";
 import { theme } from "../modes/theme/theme";
 
-export type SetupComponent = "python" | "stt";
+export type SetupComponent = "defaults" | "python" | "stt";
 
 export interface SetupCommandArgs {
 	component: SetupComponent;
 	flags: {
 		json?: boolean;
 		check?: boolean;
+		force?: boolean;
 	};
 }
 
-const VALID_CGJCONENTS: SetupComponent[] = ["python", "stt"];
+const VALID_COMPONENTS: SetupComponent[] = ["defaults", "python", "stt"];
 
 const MANAGED_PYTHON_ENV = getPythonEnvDir();
 
@@ -34,14 +36,14 @@ export function parseSetupArgs(args: string[]): SetupCommandArgs | undefined {
 
 	if (args.length < 2) {
 		console.error(chalk.red(`Usage: ${APP_NAME} setup <component>`));
-		console.error(`Valid components: ${VALID_CGJCONENTS.join(", ")}`);
+		console.error(`Valid components: ${VALID_COMPONENTS.join(", ")}`);
 		process.exit(1);
 	}
 
 	const component = args[1];
-	if (!VALID_CGJCONENTS.includes(component as SetupComponent)) {
+	if (!VALID_COMPONENTS.includes(component as SetupComponent)) {
 		console.error(chalk.red(`Unknown component: ${component}`));
-		console.error(`Valid components: ${VALID_CGJCONENTS.join(", ")}`);
+		console.error(`Valid components: ${VALID_COMPONENTS.join(", ")}`);
 		process.exit(1);
 	}
 
@@ -52,6 +54,8 @@ export function parseSetupArgs(args: string[]): SetupCommandArgs | undefined {
 			flags.json = true;
 		} else if (arg === "--check" || arg === "-c") {
 			flags.check = true;
+		} else if (arg === "--force" || arg === "-f") {
+			flags.force = true;
 		}
 	}
 
@@ -111,12 +115,47 @@ async function checkPythonSetup(): Promise<PythonCheckResult> {
  */
 export async function runSetupCommand(cmd: SetupCommandArgs): Promise<void> {
 	switch (cmd.component) {
+		case "defaults":
+			await handleDefaultsSetup(cmd.flags);
+			break;
 		case "python":
 			await handlePythonSetup(cmd.flags);
 			break;
 		case "stt":
 			await handleSttSetup(cmd.flags);
 			break;
+	}
+}
+
+async function handleDefaultsSetup(flags: { json?: boolean; check?: boolean; force?: boolean }): Promise<void> {
+	const result = await installDefaultGjcDefinitions({ check: flags.check, force: flags.force });
+	const hasCheckFailure = result.missing > 0 || result.different > 0;
+
+	if (flags.json) {
+		console.log(JSON.stringify(result, null, 2));
+		if (flags.check && hasCheckFailure) process.exit(1);
+		return;
+	}
+
+	if (flags.check) {
+		if (hasCheckFailure) {
+			console.error(chalk.red(`${theme.status.error} Default GJC definitions are not fully installed`));
+			console.error(chalk.dim(`Target: ${result.targetRoot}`));
+			console.error(
+				chalk.dim(`Missing: ${result.missing}; different: ${result.different}; matching: ${result.matching}`),
+			);
+			process.exit(1);
+		}
+		console.log(chalk.green(`${theme.status.success} Default GJC definitions are installed`));
+		console.log(chalk.dim(`Target: ${result.targetRoot}`));
+		return;
+	}
+
+	console.log(chalk.green(`${theme.status.success} Default GJC definitions installed`));
+	console.log(chalk.dim(`Target: ${result.targetRoot}`));
+	console.log(chalk.dim(`Written: ${result.written}; skipped: ${result.skipped}`));
+	if (result.skipped > 0 && !flags.force) {
+		console.log(chalk.dim("Use --force to overwrite existing default definition files."));
 	}
 }
 
@@ -213,14 +252,18 @@ ${chalk.bold("Usage:")}
   ${APP_NAME} setup <component> [options]
 
 ${chalk.bold("Components:")}
+  defaults  Install bundled GJC default skills and agents
   python    Verify a Python 3 interpreter is reachable for code execution
   stt       Install speech-to-text dependencies (openai-whisper, recording tools)
 
 ${chalk.bold("Options:")}
   -c, --check   Check if dependencies are installed without installing
+  -f, --force   Overwrite existing default definition files
   --json        Output status as JSON
 
 ${chalk.bold("Examples:")}
+  ${APP_NAME} setup defaults         Install bundled GJC defaults
+  ${APP_NAME} setup defaults --check Check bundled GJC defaults are installed
   ${APP_NAME} setup python           Install Python execution dependencies
   ${APP_NAME} setup stt              Install speech-to-text dependencies
   ${APP_NAME} setup stt --check      Check if STT dependencies are available

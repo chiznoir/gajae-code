@@ -29,7 +29,7 @@ const DEFAULT_LOCAL_TOKEN = "lm-studio-local";
 
 import { registerOAuthProvider, unregisterOAuthProviders } from "@gajae-code/ai/utils/oauth";
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@gajae-code/ai/utils/oauth/types";
-import { isRecord, logger } from "@gajae-code/utils";
+import { $pickenv, isRecord, logger } from "@gajae-code/utils";
 import { parseModelString, resolveProviderModelReference } from "../config/model-resolver";
 import { isValidThemeColor, type ThemeColor } from "../modes/theme/theme";
 import type { AuthStorage, OAuthCredential } from "../session/auth-storage";
@@ -250,6 +250,32 @@ interface ProviderOverride {
 	authHeader?: boolean;
 	compat?: Model<Api>["compat"];
 	transport?: Model<Api>["transport"];
+}
+
+const PROVIDER_BASE_URL_ENV_ALIASES: Record<string, readonly string[]> = {
+	anthropic: ["ANTHROPIC_BASE_URL"],
+	google: ["GOOGLE_BASE_URL", "GEMINI_BASE_URL"],
+	"google-antigravity": ["GOOGLE_ANTIGRAVITY_BASE_URL", "GOOGLE_BASE_URL", "GEMINI_BASE_URL"],
+	"google-gemini-cli": ["GOOGLE_GEMINI_CLI_BASE_URL", "GOOGLE_BASE_URL", "GEMINI_BASE_URL"],
+	"google-vertex": ["GOOGLE_VERTEX_BASE_URL", "GOOGLE_BASE_URL", "GEMINI_BASE_URL"],
+	openai: ["OPENAI_BASE_URL"],
+};
+
+function getProviderBaseUrlEnvKeys(provider: string): string[] {
+	const normalized = provider
+		.replace(/[^A-Za-z0-9]+/g, "_")
+		.replace(/^_+|_+$/g, "")
+		.toUpperCase();
+	const providerKey = normalized ? `${normalized}_BASE_URL` : undefined;
+	const keys = [...(PROVIDER_BASE_URL_ENV_ALIASES[provider] ?? [])];
+	if (providerKey && !keys.includes(providerKey)) {
+		keys.push(providerKey);
+	}
+	return keys;
+}
+
+function resolveProviderBaseUrlFromEnv(provider: string): string | undefined {
+	return $pickenv(...getProviderBaseUrlEnvKeys(provider));
 }
 
 /**
@@ -898,7 +924,7 @@ export class ModelRegistry {
 	#loadBuiltInModels(overrides: Map<string, ProviderOverride>): Model<Api>[] {
 		return getBundledProviders().flatMap(provider => {
 			const models = getBundledModels(provider as Parameters<typeof getBundledModels>[0]) as Model<Api>[];
-			const providerOverride = overrides.get(provider);
+			const providerOverride = this.#resolveProviderOverride(provider, overrides);
 
 			return models.map(m => {
 				if (!providerOverride) return m;
@@ -996,7 +1022,7 @@ export class ModelRegistry {
 			const models = cache.models.map(model =>
 				model.provider === descriptor.providerId ? model : { ...model, provider: descriptor.providerId },
 			);
-			const providerOverride = this.#providerOverrides.get(descriptor.providerId);
+			const providerOverride = this.#resolveProviderOverride(descriptor.providerId);
 			const withTransport = providerOverride
 				? models.map(model => this.#applyProviderTransportOverride(model, providerOverride))
 				: models;
@@ -1156,7 +1182,7 @@ export class ModelRegistry {
 				discoverableProviders.push({
 					provider: providerName,
 					api: providerConfig.api as Api,
-					baseUrl: providerConfig.baseUrl,
+					baseUrl: providerConfig.baseUrl ?? resolveProviderBaseUrlFromEnv(providerName),
 					headers: providerConfig.headers,
 					compat: providerConfig.compat,
 					discovery: providerConfig.discovery,
@@ -1225,7 +1251,7 @@ export class ModelRegistry {
 				mergeDiscoveredModel(
 					model,
 					this.find(model.provider, model.id),
-					this.#providerOverrides.get(model.provider),
+					this.#resolveProviderOverride(model.provider),
 				),
 			),
 		);
@@ -1418,7 +1444,7 @@ export class ModelRegistry {
 				options.push(
 					descriptor.createModelManagerOptions({
 						apiKey: isAuthenticated(apiKey) ? apiKey : undefined,
-						baseUrl: this.getProviderBaseUrl(descriptor.providerId),
+						baseUrl: this.#getProviderBaseUrlForDiscovery(descriptor.providerId),
 					}),
 				);
 			}
@@ -1726,6 +1752,32 @@ export class ModelRegistry {
 		});
 	}
 
+	#resolveProviderOverride(
+		provider: string,
+		overrides: Map<string, ProviderOverride> = this.#providerOverrides,
+	): ProviderOverride | undefined {
+		const explicitOverride = overrides.get(provider);
+		if (explicitOverride?.baseUrl) {
+			return explicitOverride;
+		}
+		const envBaseUrl = resolveProviderBaseUrlFromEnv(provider);
+		if (!envBaseUrl) {
+			return explicitOverride;
+		}
+		return {
+			...explicitOverride,
+			baseUrl: envBaseUrl,
+		};
+	}
+
+	#getProviderBaseUrlForDiscovery(provider: string): string | undefined {
+		return (
+			this.#providerOverrides.get(provider)?.baseUrl ??
+			resolveProviderBaseUrlFromEnv(provider) ??
+			this.getProviderBaseUrl(provider)
+		);
+	}
+
 	#mergeProviderOverride(baseOverride: ProviderOverride | undefined, override: ProviderOverride): ProviderOverride {
 		return {
 			baseUrl: override.baseUrl ?? baseOverride?.baseUrl,
@@ -2022,7 +2074,10 @@ export class ModelRegistry {
 	 * Get the base URL associated with a provider, if any model defines one.
 	 */
 	getProviderBaseUrl(provider: string): string | undefined {
-		return this.#models.find(m => m.provider === provider && m.baseUrl)?.baseUrl;
+		return (
+			this.#models.find(m => m.provider === provider && m.baseUrl)?.baseUrl ??
+			resolveProviderBaseUrlFromEnv(provider)
+		);
 	}
 
 	/**

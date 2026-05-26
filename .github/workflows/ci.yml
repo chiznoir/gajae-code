@@ -2,10 +2,10 @@ name: CI
 
 on:
    push:
-      branches: [main]
+      branches: [main, dev]
       tags: ["v*"]
    pull_request:
-      branches: [main]
+      branches: [main, dev]
    workflow_dispatch:
       inputs:
          skip_npm:
@@ -112,7 +112,7 @@ jobs:
               arch: x64
               variant: ${{ matrix.variant }}
               rust_checks: ${{ matrix.rust_checks && 'true' || 'false' }}
-              save_cache: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) }}
+              save_cache: ${{ github.event_name == 'push' && ((github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev') || startsWith(github.ref, 'refs/tags/v')) }}
 
    # Remaining platforms only ship in release tags; PRs and main never build them.
    native_release:
@@ -136,7 +136,7 @@ jobs:
               arch: ${{ matrix.arch }}
               variant: ${{ matrix.variant }}
               target: ${{ matrix.target }}
-              save_cache: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) }}
+              save_cache: ${{ github.event_name == 'push' && ((github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev') || startsWith(github.ref, 'refs/tags/v')) }}
 
    test:
       runs-on: ubuntu-22.04
@@ -203,7 +203,7 @@ jobs:
            with:
               shared-key: install-methods-linux-x64
               cache-on-failure: true
-              save-if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' ||
+              save-if: ${{ github.event_name == 'push' && ((github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev') ||
                  startsWith(github.ref, 'refs/tags/v')) }}
               cache-workspace-crates: true
          - name: Cache bun dependencies
@@ -236,35 +236,35 @@ jobs:
                     platform: linux,
                     arch: x64,
                     target_id: linux-x64,
-                    binary_path: packages/coding-agent/binaries/omp-linux-x64,
+                    binary_path: packages/coding-agent/binaries/gjc-linux-x64,
                  }
                - {
                     os: ubuntu-24.04-arm,
                     platform: linux,
                     arch: arm64,
                     target_id: linux-arm64,
-                    binary_path: packages/coding-agent/binaries/omp-linux-arm64,
+                    binary_path: packages/coding-agent/binaries/gjc-linux-arm64,
                  }
                - {
                     os: macos-15-intel,
                     platform: darwin,
                     arch: x64,
                     target_id: darwin-x64,
-                    binary_path: packages/coding-agent/binaries/omp-darwin-x64,
+                    binary_path: packages/coding-agent/binaries/gjc-darwin-x64,
                  }
                - {
                     os: macos-14,
                     platform: darwin,
                     arch: arm64,
                     target_id: darwin-arm64,
-                    binary_path: packages/coding-agent/binaries/omp-darwin-arm64,
+                    binary_path: packages/coding-agent/binaries/gjc-darwin-arm64,
                  }
                - {
                     os: windows-latest,
                     platform: win32,
                     arch: x64,
                     target_id: win32-x64,
-                    binary_path: packages/coding-agent/binaries/omp-windows-x64.exe,
+                    binary_path: packages/coding-agent/binaries/gjc-windows-x64.exe,
                  }
       runs-on: ${{ matrix.os }}
       permissions:
@@ -300,7 +300,7 @@ jobs:
            if: runner.os == 'Windows'
            shell: pwsh
            run: |
-              $runtimeDir = Join-Path $env:TEMP ("omp-runtime-" + [System.Guid]::NewGuid().ToString("N"))
+              $runtimeDir = Join-Path $env:TEMP ("gjc-runtime-" + [System.Guid]::NewGuid().ToString("N"))
               New-Item -ItemType Directory -Force -Path $runtimeDir | Out-Null
               $env:HOME = Join-Path $runtimeDir "home"
               $env:XDG_DATA_HOME = Join-Path $runtimeDir "xdg"
@@ -309,7 +309,7 @@ jobs:
          - name: Upload release binary artifact
            uses: actions/upload-artifact@v4
            with:
-              name: omp-binary-${{ matrix.target_id }}
+              name: gjc-binary-${{ matrix.target_id }}
               path: ${{ matrix.binary_path }}
 
    release-github:
@@ -324,14 +324,14 @@ jobs:
          - name: Download release binaries
            uses: actions/download-artifact@v4
            with:
-              pattern: omp-binary-*
+              pattern: gjc-binary-*
               path: packages/coding-agent/binaries
               merge-multiple: true
          - name: Create GitHub Release
            uses: softprops/action-gh-release@v2
            with:
               files: |
-                 packages/coding-agent/binaries/omp-*
+                 packages/coding-agent/binaries/gjc-*
               generate_release_notes: true
 
 
@@ -345,13 +345,13 @@ jobs:
       steps:
          - name: Download published macOS arm64 binary
            run: |
-              curl -fsSL -o omp-darwin-arm64 "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/omp-darwin-arm64"
-              chmod +x omp-darwin-arm64
+              curl -fsSL -o gjc-darwin-arm64 "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/gjc-darwin-arm64"
+              chmod +x gjc-darwin-arm64
          - name: Verify published macOS arm64 binary
            run: |
-              codesign -dv ./omp-darwin-arm64
+              codesign -dv ./gjc-darwin-arm64
               runtime_dir="$(mktemp -d)"
-              HOME="$runtime_dir/home" XDG_DATA_HOME="$runtime_dir/xdg" ./omp-darwin-arm64 --version
+              HOME="$runtime_dir/home" XDG_DATA_HOME="$runtime_dir/xdg" ./gjc-darwin-arm64 --version
 
    release-npm:
       if: ${{ startsWith(github.ref, 'refs/tags/v') && !cancelled() &&
