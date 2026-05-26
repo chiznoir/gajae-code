@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 90" width="120" height="90" role="img" aria-labelledby="title desc">
-  <title id="title">gjc red claw mark</title>
-  <desc id="desc">A red crustacean claw and shell icon for the gjc coding agent.</desc>
+  <title id="title">Red Claw coding-agent mark</title>
+  <desc id="desc">A red crustacean claw and shell icon for the Red Claw coding agent theme.</desc>
   <defs>
     <linearGradient id="shell" x1="18" y1="12" x2="100" y2="82" gradientUnits="userSpaceOnUse">
       <stop offset="0" stop-color="#ff8a65"/>

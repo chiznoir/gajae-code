@@ -284,7 +284,7 @@ ${chalk.bold("Useful Commands:")}
 
 export function printHelp(): void {
 	process.stdout.write(
-		`${chalk.bold(APP_NAME)} - AI coding assistant\n\n` +
+		`${chalk.bold(APP_NAME)} - red-claw AI coding assistant\n\n` +
 			`Run ${APP_NAME} --help for full command and option details.\n` +
 			`Run ${APP_NAME} <command> --help for command-specific help.\n\n` +
 			`${getExtraHelpText()}\n`,
