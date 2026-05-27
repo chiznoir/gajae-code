@@ -218,6 +218,7 @@ describe("system Handlebars prompt templates", () => {
 		expect(rendered).toContain("Normal `task` launches return immediately as detached background subagents");
 		expect(rendered).toContain("Use `subagent` to list, inspect, await with `timeout_ms`, or cancel");
 		expect(rendered).toContain("If an await timeout elapses, the subagent is still running; this is not a failure.");
+		expect(rendered).toContain("never cancel just because an await timed out");
 		expect(rendered).toContain("`job` remains the generic background-job tool");
 	});
 

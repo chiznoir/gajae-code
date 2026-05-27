@@ -139,7 +139,8 @@ describe("SubagentTool", () => {
 		expect(result.details?.subagents[0]?.status).toBe("running");
 		expect(guidance).toContain("Still running");
 		expect(guidance).toContain("not a failure");
-		expect(guidance).toContain("cancel only if no longer needed");
+		expect(guidance).toContain("never cancel just because an await timed out");
+		expect(guidance).toContain("cancel only if the subagent has actually failed");
 		expect(guidance).not.toContain("steer");
 		expect(guidance).not.toContain("shutdown");
 		await manager.dispose({ timeoutMs: 100 });

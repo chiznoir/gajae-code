@@ -177,6 +177,7 @@ Artifacts and side channels:
 - Background work / cancellation
   - Parent abort stops scheduling new work, aborts active child sessions, and marks unscheduled tasks as skipped.
   - Async jobs keep their own cancellation via `AsyncJobManager`.
+  - Await timeouts are observation windows only: they do not stop, fail, or make a subagent stale. Inspect/list and continue work; cancel only when the subagent has actually failed, gone off-track, or become unrecoverably wrong.
 
 ## Limits & Caps
 - Per-subagent output truncation: `MAX_OUTPUT_BYTES = 500_000` and `MAX_OUTPUT_LINES = 5000` in `packages/coding-agent/src/task/types.ts`. Full raw output is still written to `<id>.md` before truncation is returned to the caller.

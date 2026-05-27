@@ -550,8 +550,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			})
 			.join("\n");
 		const coordinationHint = ircEnabled
-			? ` DM these ids via \`irc\` to coordinate while they run. Use \`subagent\` to list, inspect, await with a timeout, or cancel only when no longer needed or unrecoverably stuck; \`job\` remains available for generic background jobs.`
-			: ` Use \`subagent\` to list, inspect, await with a timeout, or cancel only when no longer needed or unrecoverably stuck; \`job\` remains available for generic background jobs.`;
+			? ` DM these ids via \`irc\` to coordinate while they run. Use \`subagent\` to list, inspect, or await with a timeout; a timeout only bounds your wait and is never a cancellation reason. Cancel only when the subagent has actually failed, gone off-track, or become unrecoverably wrong; \`job\` remains available for generic background jobs.`
+			: ` Use \`subagent\` to list, inspect, or await with a timeout; a timeout only bounds your wait and is never a cancellation reason. Cancel only when the subagent has actually failed, gone off-track, or become unrecoverably wrong; \`job\` remains available for generic background jobs.`;
 
 		return {
 			content: [

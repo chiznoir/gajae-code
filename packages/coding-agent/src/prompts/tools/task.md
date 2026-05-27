@@ -3,11 +3,11 @@ Launches subagents to parallelize workflows.
 - Results are delivered automatically when complete.
 - The tool result lists the assigned task ids (e.g. `0-AuthLoader`) — those are the live agent ids.
 {{#if ircEnabled}}
-- Coordinate with running tasks via `irc` using those ids. `subagent` cancel terminates a task and **cannot carry a message** — only use it for stalled/abandoned work.
-- If genuinely blocked on completion, wait with `subagent` action `await` and a timeout; otherwise keep working.
+- Coordinate with running tasks via `irc` using those ids. `subagent` cancel terminates a task and **cannot carry a message** — never cancel because an await timed out; cancel only when the task has actually failed, gone off-track, or become unrecoverably wrong.
+- If genuinely blocked on completion, wait with `subagent` action `await` and a timeout; timeout only bounds your wait and does not stop or fail the subagent.
 {{else}}
-- If genuinely blocked on completion, wait with `subagent` action `await` and a timeout; otherwise keep working.
-- Use `subagent` action `inspect` or `list` to snapshot manager state; `cancel` only when a task is no longer needed or unrecoverably stuck.
+- If genuinely blocked on completion, wait with `subagent` action `await` and a timeout; timeout only bounds your wait and does not stop or fail the subagent.
+- Use `subagent` action `inspect` or `list` to snapshot manager state; `cancel` only when a task has actually failed, gone off-track, or become unrecoverably wrong.
 {{/if}}
 
 {{#if ircEnabled}}

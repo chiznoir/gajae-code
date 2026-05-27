@@ -271,7 +271,7 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 		const subagent = job.metadata?.subagent;
 		const runningTimeoutGuidance =
 			timedOut && job.status === "running"
-				? "Still running after the await timeout; this is not a failure. Inspect progress, continue independent work, and cancel only if no longer needed or unrecoverably wrong."
+				? "Still running after the await timeout; timeout only bounded this wait and is not a failure. Inspect progress, continue independent work, and never cancel just because an await timed out; cancel only if the subagent has actually failed, gone off-track, or become unrecoverably wrong."
 				: undefined;
 		return {
 			id: subagent?.id ?? job.id,

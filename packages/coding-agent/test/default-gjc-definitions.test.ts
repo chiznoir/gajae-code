@@ -162,6 +162,8 @@ Project executor override body.
 		expect(systemPrompt).toContain("committed repo-visible `.gjc` defaults are not the source of truth");
 		expect(ultragoal).toContain("run `ralplan` first");
 		expect(ultragoal).toContain("Role agents return implementation/review evidence");
+		expect(ultragoal).toContain("await timeout only limits the leader's wait");
+		expect(ultragoal).toContain("must not be used as a cancellation reason");
 	});
 
 	it("installs bundled workflow skill definitions without overwriting local edits unless forced", async () => {

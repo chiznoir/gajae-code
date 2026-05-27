@@ -11,6 +11,7 @@
 <p align="center">
   <img src="assets/icon.svg" alt="Gaebal Gajae avatar" width="96" height="96">
 </p>
+I created an earlier OpenAI code harness and `an earlier Anthropic-code harness`. After living with those harnesses, I felt the same thing kept happening: the harness got bloated, but the work still collapsed into one useful loop.
 
 ## Usage
 

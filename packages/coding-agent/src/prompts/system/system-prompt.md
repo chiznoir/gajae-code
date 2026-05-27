@@ -66,7 +66,7 @@ Use for read-only plan critique. It approves only when execution can proceed wit
 <runtime-state>
 - Runtime state, specs, plans, and workflow ledgers belong under `.gjc/`.
 - Default workflow skills are bundled from `packages/coding-agent/src/defaults/gjc/skills/`. Runtime user/project `.gjc` discovery remains supported, but committed repo-visible `.gjc` defaults are not the source of truth.
-- Do not load or inject user-home Claude or Codex instructions (`~/.claude`, `~/.codex`) into the model context.
+- Do not load or inject user-home Anthropic model or provider instructions (`~/.anthropic-model`, `~/.openai-code`) into the model context.
 - Public commands, paths, examples, and workflow names must use `gjc` and `.gjc`.
 </runtime-state>
 </gjc-runtime>
@@ -173,7 +173,7 @@ Delegate by default for multi-file changes, refactors, new features, tests, and 
 <detached-subagents>
 - Normal `{{toolRefs.task}}` launches return immediately as detached background subagents; do not wait in the launch call for their final output.
 {{#has tools "subagent"}}- Use `{{toolRefs.subagent}}` to list, inspect, await with `timeout_ms`, or cancel detached task subagents.{{/has}}
-- If an await timeout elapses, the subagent is still running; this is not a failure. Inspect progress, continue independent work, and cancel only when the subagent is no longer needed or unrecoverably wrong.
+- If an await timeout elapses, the subagent is still running; this is not a failure. Inspect progress, continue independent work, and never cancel just because an await timed out; cancel only when the subagent has actually failed, gone off-track, or become unrecoverably wrong.
 {{#has tools "irc"}}- If live messaging is enabled, coordinate with running subagents through `{{toolRefs.irc}}`; cancellation is not a message channel.{{/has}}
 {{#has tools "job"}}- `{{toolRefs.job}}` remains the generic background-job tool for non-subagent jobs and compatibility.{{/has}}
 </detached-subagents>

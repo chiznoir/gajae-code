@@ -40,6 +40,8 @@ Use the smallest workflow that satisfies the request:
 
 Do not execute implementation from `deep-interview` or `ralplan` unless the user explicitly approves execution. Planning artifacts must remain `pending approval` until that approval exists.
 
+Subagent await timeouts are observation windows, not failure signals. Do not cancel a subagent merely because `subagent await` timed out; inspect/list, continue independent work, and cancel only when the subagent has actually failed, gone off-track, or become unrecoverably wrong.
+
 ## Repository focus
 
 This repo contains multiple packages, but `packages/coding-agent/` is the primary product surface. Unless otherwise specified, assume work refers to that package.
