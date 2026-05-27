@@ -261,12 +261,26 @@ describe("createTools", () => {
 		const requestedTools = await createTools(session, ["read"]);
 		expect(requestedTools.map(t => t.name)).toEqual(["read", "resolve"]);
 	});
-	it("auto-includes goal when goal mode is active", async () => {
+	it("auto-includes goal tools when goal mode is enabled", async () => {
 		const session = createTestSession({
 			settings: createSettingsWithOverrides({
 				"goal.enabled": true,
 			}),
 			getGoalModeState: () => createActiveGoalState(),
+			getGoalRuntime: () =>
+				({}) as NonNullable<ToolSession["getGoalRuntime"]> extends () => infer Runtime ? Runtime : never,
+		});
+		const tools = await createTools(session, ["read"]);
+		const names = tools.map(t => t.name);
+
+		expect(names).toEqual(["read", "goal", "get_goal", "create_goal", "update_goal", "resolve"]);
+	});
+
+	it("exposes legacy goal even when no goal is active", async () => {
+		const session = createTestSession({
+			settings: createSettingsWithOverrides({
+				"goal.enabled": true,
+			}),
 			getGoalRuntime: () =>
 				({}) as NonNullable<ToolSession["getGoalRuntime"]> extends () => infer Runtime ? Runtime : never,
 		});
@@ -289,8 +303,10 @@ describe("createTools", () => {
 		expect(names).toContain("search_tool_bm25");
 	});
 
-	it("exposes named goal tools as builtins and keeps legacy goal hidden", () => {
-		expect(Object.keys(HIDDEN_TOOLS).sort()).toEqual(["goal", "report_finding", "resolve", "yield"]);
-		expect(Object.keys(BUILTIN_TOOLS)).toEqual(expect.arrayContaining(["get_goal", "create_goal", "update_goal"]));
+	it("exposes all goal tools as builtins", () => {
+		expect(Object.keys(HIDDEN_TOOLS).sort()).toEqual(["report_finding", "resolve", "yield"]);
+		expect(Object.keys(BUILTIN_TOOLS)).toEqual(
+			expect.arrayContaining(["goal", "get_goal", "create_goal", "update_goal"]),
+		);
 	});
 });
