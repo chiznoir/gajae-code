@@ -23,12 +23,10 @@ export default class Ultragoal extends Command {
 
 		const cwd = process.cwd();
 		const { objective, goalsPath } = await readUltragoalGjcObjective(cwd);
-		const sessionWrite = await writeCurrentSessionGoalModeState({
+		await writeCurrentSessionGoalModeState({
 			sessionFile: process.env[GJC_SESSION_FILE_ENV],
 			objective,
 		});
-		if (sessionWrite.status !== "existing_goal") {
-			await writePendingGoalModeRequest({ cwd, objective, goalsPath });
-		}
+		await writePendingGoalModeRequest({ cwd, objective, goalsPath });
 	}
 }

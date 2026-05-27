@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import {
 	consumePendingGoalModeRequest,
+	GJC_SESSION_FILE_ENV,
 	isUltragoalCreateGoalsInvocation,
 	readUltragoalGjcObjective,
 	writeCurrentSessionGoalModeState,
@@ -134,6 +135,53 @@ describe("GJC ultragoal goal mode request", () => {
 
 		expect(result).toEqual({ status: "existing_goal", goal: existingGoal });
 		expect(after).toBe(before);
+	});
+
+	it("queues a pending activation request even when the session file already has an active goal", async () => {
+		const root = await tempDir();
+		const sessionFile = path.join(root, "session.jsonl");
+		const timestamp = new Date().toISOString();
+		const existingGoal = {
+			id: "goal-1",
+			objective: "Existing goal",
+			status: "active",
+			tokensUsed: 0,
+			timeUsedSeconds: 0,
+			createdAt: 1,
+			updatedAt: 1,
+		};
+		await Bun.write(
+			sessionFile,
+			[
+				JSON.stringify({ type: "session", version: 3, id: "session-1", timestamp, cwd: root }),
+				JSON.stringify({
+					type: "mode_change",
+					id: "mode-1",
+					parentId: null,
+					timestamp,
+					mode: "goal",
+					data: { goal: existingGoal },
+				}),
+				"",
+			].join("\n"),
+		);
+
+		const cliPath = path.resolve(import.meta.dir, "..", "..", "src", "cli.ts");
+		const result = Bun.spawnSync(["bun", cliPath, "ultragoal", "create-goals", "--brief", "Ship native goal"], {
+			cwd: root,
+			env: { ...process.env, [GJC_SESSION_FILE_ENV]: sessionFile },
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+
+		expect(result.exitCode, result.stderr.toString()).toBe(0);
+		const pending = await consumePendingGoalModeRequest(root);
+		expect(pending?.objective).toContain(".gjc/ultragoal/goals.json");
+		const entries = (await loadEntriesFromFile(sessionFile)).filter(
+			(entry): entry is SessionEntry => entry.type !== "session",
+		);
+		const context = buildSessionContext(entries);
+		expect(context.modeData?.goal).toMatchObject(existingGoal);
 	});
 
 	it("surfaces corrupt pending request json", async () => {

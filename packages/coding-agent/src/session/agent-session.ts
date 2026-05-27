@@ -3816,12 +3816,12 @@ export class AgentSession {
 
 	async #activatePendingGjcGoalModeRequest(): Promise<boolean> {
 		if (!this.settings.get("goal.enabled")) return false;
+		const pendingGoal = await consumePendingGoalModeRequest(this.sessionManager.getCwd());
+		if (!pendingGoal) return false;
 		const currentState = this.getGoalModeState();
 		if (currentState?.goal && currentState.goal.status !== "complete" && currentState.goal.status !== "dropped") {
 			return false;
 		}
-		const pendingGoal = await consumePendingGoalModeRequest(this.sessionManager.getCwd());
-		if (!pendingGoal) return false;
 
 		const previousTools = this.getActiveToolNames().filter(name => name !== "goal");
 		const goalTools = [...new Set([...previousTools, "goal"])];
