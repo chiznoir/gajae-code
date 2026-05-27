@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import { type SettingPath, Settings } from "@gajae-code/coding-agent/config/settings";
-import { createTools, HIDDEN_TOOLS, type ToolSession } from "@gajae-code/coding-agent/tools";
+import { BUILTIN_TOOLS, createTools, HIDDEN_TOOLS, type ToolSession } from "@gajae-code/coding-agent/tools";
 
 Bun.env.PI_PYTHON_SKIP_CHECK = "1";
 
@@ -267,11 +267,13 @@ describe("createTools", () => {
 				"goal.enabled": true,
 			}),
 			getGoalModeState: () => createActiveGoalState(),
+			getGoalRuntime: () =>
+				({}) as NonNullable<ToolSession["getGoalRuntime"]> extends () => infer Runtime ? Runtime : never,
 		});
 		const tools = await createTools(session, ["read"]);
 		const names = tools.map(t => t.name);
 
-		expect(names).toEqual(["read", "goal", "resolve"]);
+		expect(names).toEqual(["read", "goal", "get_goal", "create_goal", "update_goal", "resolve"]);
 	});
 
 	it("includes search_tool_bm25 when MCP tool discovery is enabled and executable", async () => {
@@ -287,7 +289,8 @@ describe("createTools", () => {
 		expect(names).toContain("search_tool_bm25");
 	});
 
-	it("HIDDEN_TOOLS contains review tools and goal", () => {
+	it("exposes named goal tools as builtins and keeps legacy goal hidden", () => {
 		expect(Object.keys(HIDDEN_TOOLS).sort()).toEqual(["goal", "report_finding", "resolve", "yield"]);
+		expect(Object.keys(BUILTIN_TOOLS)).toEqual(expect.arrayContaining(["get_goal", "create_goal", "update_goal"]));
 	});
 });

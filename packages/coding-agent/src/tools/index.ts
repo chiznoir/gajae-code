@@ -308,6 +308,9 @@ export const BUILTIN_TOOLS: Record<string, ToolFactory> = {
 	retain: HindsightRetainTool.createIf,
 	recall: HindsightRecallTool.createIf,
 	reflect: HindsightReflectTool.createIf,
+	get_goal: GetGoalTool.createIf,
+	create_goal: CreateGoalTool.createIf,
+	update_goal: UpdateGoalTool.createIf,
 };
 
 const GOAL_MODE_TOOL_NAMES = ["get_goal", "create_goal", "update_goal"] as const;
@@ -317,9 +320,6 @@ export const HIDDEN_TOOLS: Record<string, ToolFactory> = {
 	report_finding: () => reportFindingTool,
 	resolve: s => new ResolveTool(s),
 	goal: s => new GoalTool(s),
-	get_goal: GetGoalTool.createIf,
-	create_goal: CreateGoalTool.createIf,
-	update_goal: UpdateGoalTool.createIf,
 };
 
 export type ToolName = keyof typeof BUILTIN_TOOLS;
@@ -500,7 +500,6 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 						.filter(([name]) => isToolAllowed(name))
 						.map(([name, factory]) => [name, factory] as const),
 					...(includeYield ? ([["yield", HIDDEN_TOOLS.yield]] as const) : []),
-					...(goalEnabled ? goalStateToolNames.map(name => [name, HIDDEN_TOOLS[name]] as const) : []),
 					...(goalModeActive ? ([["goal", HIDDEN_TOOLS.goal]] as const) : []),
 				];
 

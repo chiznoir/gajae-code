@@ -1418,7 +1418,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		if (settings.get("goal.enabled")) {
 			for (const name of goalStateToolNames) {
 				if (toolRegistry.has(name)) continue;
-				const goalStateTool = await logger.time(`createTools:${name}:session`, HIDDEN_TOOLS[name], toolSession);
+				const goalStateTool = await logger.time(`createTools:${name}:session`, BUILTIN_TOOLS[name], toolSession);
 				if (goalStateTool) {
 					toolRegistry.set(goalStateTool.name, wrapToolWithMetaNotice(goalStateTool));
 				}
