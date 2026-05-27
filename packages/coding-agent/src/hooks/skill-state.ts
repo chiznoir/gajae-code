@@ -1,5 +1,6 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import type { SkillDiscoverySettings } from "../config/skill-settings-defaults";
 import {
 	compareSkillKeywordMatches,
 	GJC_SKILL_KEYWORD_DEFINITIONS,
@@ -9,6 +10,59 @@ import {
 
 export const GJC_STATE_DIR = ".gjc/state";
 export const SKILL_ACTIVE_STATE_FILE = "skill-active-state.json";
+
+export interface EffectiveSkillConfigInput {
+	skillsSettings?: SkillDiscoverySettings;
+	disabledExtensions?: string[];
+	unavailableReason?: string;
+}
+
+const SANITIZED_CONFIG_VALUE_LIMIT = 80;
+
+function sanitizeConfigValue(value: string): string {
+	const compact = value.replace(/[\r\n\t]+/g, " ").trim();
+	return compact.length > SANITIZED_CONFIG_VALUE_LIMIT
+		? `${compact.slice(0, SANITIZED_CONFIG_VALUE_LIMIT - 1)}…`
+		: compact;
+}
+
+function countNonEmptyStrings(values: readonly string[] | undefined): number {
+	return values?.filter(value => typeof value === "string" && value.trim().length > 0).length ?? 0;
+}
+
+function formatBoolean(name: string, value: boolean | undefined): string {
+	return `${name}=${value === true ? "true" : value === false ? "false" : "unset"}`;
+}
+
+export function buildSanitizedEffectiveSkillConfigContext(input: EffectiveSkillConfigInput | undefined): string {
+	if (!input || input.unavailableReason) {
+		const reason = input?.unavailableReason ? sanitizeConfigValue(input.unavailableReason) : "not available";
+		return `Sanitized effective skill config unavailable (${reason}); bundled GJC workflow activation remains available for deep-interview, ralplan, ultragoal, team.`;
+	}
+
+	const settings = input.skillsSettings ?? {};
+	const includeSkillCount = countNonEmptyStrings(settings.includeSkills);
+	const ignoredSkillCount = countNonEmptyStrings(settings.ignoredSkills);
+	const disabledSkillExtensionCount = countNonEmptyStrings(
+		(input.disabledExtensions ?? []).filter(extension => extension.startsWith("skill:")),
+	);
+	const customDirectoryCount = countNonEmptyStrings(settings.customDirectories);
+
+	return [
+		"Sanitized effective skill config for filesystem/custom skill discovery; bundled GJC workflow activation remains available for exactly deep-interview, ralplan, ultragoal, team.",
+		`Skill discovery booleans: ${[
+			formatBoolean("enabled", settings.enabled),
+			formatBoolean("enableSkillCommands", settings.enableSkillCommands),
+			formatBoolean("enablePiUser", settings.enablePiUser),
+			formatBoolean("enablePiProject", settings.enablePiProject),
+			formatBoolean("enableCodexUser", settings.enableCodexUser),
+			formatBoolean("enableClaudeUser", settings.enableClaudeUser),
+			formatBoolean("enableClaudeProject", settings.enableClaudeProject),
+		].join(", ")}.`,
+		`Skill discovery filters: includeSkills.count=${includeSkillCount}; ignoredSkills.count=${ignoredSkillCount}; disabledSkillExtensions.count=${disabledSkillExtensionCount}.`,
+		`Custom skill directories: count=${customDirectoryCount}.`,
+	].join(" ");
+}
 
 export interface SkillKeywordMatch {
 	keyword: string;
@@ -342,7 +396,10 @@ export async function buildSkillStopOutput(input: StopHookInput): Promise<Record
 	return null;
 }
 
-export function buildSkillActivationAdditionalContext(state: SkillActiveState): string {
+export function buildSkillActivationAdditionalContext(
+	state: SkillActiveState,
+	effectiveSkillConfig?: EffectiveSkillConfigInput,
+): string {
 	return [
 		`GJC native UserPromptSubmit detected workflow keyword "${state.keyword}" -> ${state.skill}.`,
 		state.initialized_mode && state.initialized_state_path
@@ -351,6 +408,7 @@ export function buildSkillActivationAdditionalContext(state: SkillActiveState): 
 		state.skill === "ultragoal"
 			? "Ultragoal is active. If the user prompt is a steering request, use `gjc ultragoal steer` to add or steer subgoals."
 			: null,
+		buildSanitizedEffectiveSkillConfigContext(effectiveSkillConfig),
 		"Follow AGENTS.md routing and preserve GJC workflow transition and planning-safety rules.",
 	]
 		.filter((value): value is string => Boolean(value))

@@ -2,6 +2,11 @@ import { THINKING_EFFORTS } from "@gajae-code/ai";
 import { TASK_SIMPLE_MODES } from "../task/simple-mode";
 import { getThinkingLevelMetadata } from "../thinking";
 import { EDIT_MODES } from "../utils/edit-mode";
+import {
+	DEFAULT_DISABLED_EXTENSIONS,
+	DEFAULT_SKILL_DISCOVERY_SETTINGS,
+	type SkillDiscoverySettings,
+} from "./skill-settings-defaults";
 
 /** Unified settings schema - single source of truth for all settings.
  * Unified settings schema - single source of truth for all settings.
@@ -304,7 +309,7 @@ export const SETTINGS_SCHEMA = {
 
 	disabledProviders: { type: "array", default: EMPTY_STRING_ARRAY },
 
-	disabledExtensions: { type: "array", default: EMPTY_STRING_ARRAY },
+	disabledExtensions: { type: "array", default: DEFAULT_DISABLED_EXTENSIONS },
 
 	modelRoles: { type: "record", default: EMPTY_STRING_RECORD },
 
@@ -2428,28 +2433,28 @@ export const SETTINGS_SCHEMA = {
 	},
 
 	// Skills
-	"skills.enabled": { type: "boolean", default: false },
+	"skills.enabled": { type: "boolean", default: DEFAULT_SKILL_DISCOVERY_SETTINGS.enabled },
 
 	"skills.enableSkillCommands": {
 		type: "boolean",
-		default: true,
+		default: DEFAULT_SKILL_DISCOVERY_SETTINGS.enableSkillCommands,
 	},
 
-	"skills.enableCodexUser": { type: "boolean", default: false },
+	"skills.enableCodexUser": { type: "boolean", default: DEFAULT_SKILL_DISCOVERY_SETTINGS.enableCodexUser },
 
-	"skills.enableClaudeUser": { type: "boolean", default: false },
+	"skills.enableClaudeUser": { type: "boolean", default: DEFAULT_SKILL_DISCOVERY_SETTINGS.enableClaudeUser },
 
-	"skills.enableClaudeProject": { type: "boolean", default: false },
+	"skills.enableClaudeProject": { type: "boolean", default: DEFAULT_SKILL_DISCOVERY_SETTINGS.enableClaudeProject },
 
-	"skills.enablePiUser": { type: "boolean", default: false },
+	"skills.enablePiUser": { type: "boolean", default: DEFAULT_SKILL_DISCOVERY_SETTINGS.enablePiUser },
 
-	"skills.enablePiProject": { type: "boolean", default: false },
+	"skills.enablePiProject": { type: "boolean", default: DEFAULT_SKILL_DISCOVERY_SETTINGS.enablePiProject },
 
-	"skills.customDirectories": { type: "array", default: [] as string[] },
+	"skills.customDirectories": { type: "array", default: DEFAULT_SKILL_DISCOVERY_SETTINGS.customDirectories },
 
-	"skills.ignoredSkills": { type: "array", default: [] as string[] },
+	"skills.ignoredSkills": { type: "array", default: DEFAULT_SKILL_DISCOVERY_SETTINGS.ignoredSkills },
 
-	"skills.includeSkills": { type: "array", default: [] as string[] },
+	"skills.includeSkills": { type: "array", default: DEFAULT_SKILL_DISCOVERY_SETTINGS.includeSkills },
 
 	// Commands
 	"commands.enableClaudeUser": {
@@ -2841,17 +2846,7 @@ export interface BranchSummarySettings {
 	reserveTokens: number;
 }
 
-export interface SkillsSettings {
-	enabled?: boolean;
-	enableSkillCommands?: boolean;
-	enableCodexUser?: boolean;
-	enableClaudeUser?: boolean;
-	enableClaudeProject?: boolean;
-	enablePiUser?: boolean;
-	enablePiProject?: boolean;
-	customDirectories?: string[];
-	ignoredSkills?: string[];
-	includeSkills?: string[];
+export interface SkillsSettings extends SkillDiscoverySettings {
 	disabledExtensions?: string[];
 }
 

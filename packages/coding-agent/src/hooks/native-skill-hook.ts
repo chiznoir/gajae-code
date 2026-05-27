@@ -1,9 +1,14 @@
 import { appendFile, mkdir } from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
+import { YAML } from "bun";
+import type { SkillDiscoverySettings } from "../config/skill-settings-defaults";
+import { DEFAULT_DISABLED_EXTENSIONS, DEFAULT_SKILL_DISCOVERY_SETTINGS } from "../config/skill-settings-defaults";
 import {
 	buildActiveUltragoalPromptContext,
 	buildSkillActivationAdditionalContext,
 	buildSkillStopOutput,
+	type EffectiveSkillConfigInput,
 	recordSkillActivation,
 } from "./skill-state";
 
@@ -15,6 +20,112 @@ export interface GjcNativeHookDispatchResult {
 }
 
 type HookPayload = Record<string, unknown>;
+
+interface GjcNativeHookDispatchOptions {
+	cwd?: string;
+	stateDir?: string;
+	effectiveSkillConfig?: EffectiveSkillConfigInput;
+	configPaths?: string[];
+}
+
+function readNestedRecord(value: Record<string, unknown>, key: string): Record<string, unknown> {
+	const nested = value[key];
+	return nested && typeof nested === "object" && !Array.isArray(nested) ? (nested as Record<string, unknown>) : {};
+}
+
+function readStringArray(value: unknown): string[] | undefined {
+	if (!Array.isArray(value)) return undefined;
+	return value.filter((item): item is string => typeof item === "string");
+}
+
+function readBoolean(value: unknown): boolean | undefined {
+	return typeof value === "boolean" ? value : undefined;
+}
+
+function buildDefaultEffectiveSkillConfig(): EffectiveSkillConfigInput {
+	return {
+		skillsSettings: {
+			...DEFAULT_SKILL_DISCOVERY_SETTINGS,
+			customDirectories: [...(DEFAULT_SKILL_DISCOVERY_SETTINGS.customDirectories ?? [])],
+			ignoredSkills: [...(DEFAULT_SKILL_DISCOVERY_SETTINGS.ignoredSkills ?? [])],
+			includeSkills: [...(DEFAULT_SKILL_DISCOVERY_SETTINGS.includeSkills ?? [])],
+		},
+		disabledExtensions: [...DEFAULT_DISABLED_EXTENSIONS],
+	};
+}
+
+function mergeRawSkillConfig(
+	current: EffectiveSkillConfigInput,
+	raw: Record<string, unknown>,
+): EffectiveSkillConfigInput {
+	const rawSkills = readNestedRecord(raw, "skills");
+	const enabled = readBoolean(rawSkills.enabled);
+	const enableSkillCommands = readBoolean(rawSkills.enableSkillCommands);
+	const enablePiUser = readBoolean(rawSkills.enablePiUser);
+	const enablePiProject = readBoolean(rawSkills.enablePiProject);
+	const enableCodexUser = readBoolean(rawSkills.enableCodexUser);
+	const enableClaudeUser = readBoolean(rawSkills.enableClaudeUser);
+	const enableClaudeProject = readBoolean(rawSkills.enableClaudeProject);
+	const customDirectories = readStringArray(rawSkills.customDirectories);
+	const ignoredSkills = readStringArray(rawSkills.ignoredSkills);
+	const includeSkills = readStringArray(rawSkills.includeSkills);
+	const disabledExtensions = readStringArray(raw.disabledExtensions);
+	const currentSkills = current.skillsSettings ?? {};
+	const skillsSettings: SkillDiscoverySettings = {
+		...currentSkills,
+		...(enabled !== undefined ? { enabled } : {}),
+		...(enableSkillCommands !== undefined ? { enableSkillCommands } : {}),
+		...(enablePiUser !== undefined ? { enablePiUser } : {}),
+		...(enablePiProject !== undefined ? { enablePiProject } : {}),
+		...(enableCodexUser !== undefined ? { enableCodexUser } : {}),
+		...(enableClaudeUser !== undefined ? { enableClaudeUser } : {}),
+		...(enableClaudeProject !== undefined ? { enableClaudeProject } : {}),
+		...(customDirectories ? { customDirectories } : {}),
+		...(ignoredSkills ? { ignoredSkills } : {}),
+		...(includeSkills ? { includeSkills } : {}),
+	};
+	return {
+		skillsSettings,
+		disabledExtensions: disabledExtensions ?? current.disabledExtensions,
+	};
+}
+
+async function readRawConfig(filePath: string): Promise<Record<string, unknown> | null> {
+	try {
+		const parsed = YAML.parse(await Bun.file(filePath).text());
+		return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : {};
+	} catch (error) {
+		if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") return null;
+		throw error;
+	}
+}
+
+function resolveConfigPaths(cwd: string, override?: string[]): string[] {
+	if (override) return override;
+	const configDirName = process.env.GJC_CONFIG_DIR ?? process.env.PI_CONFIG_DIR ?? ".gjc";
+	const userAgentDir = process.env.GJC_CODING_AGENT_DIR ?? path.join(os.homedir(), configDirName, "agent");
+	return [path.join(userAgentDir, "config.yml"), path.join(cwd, configDirName, "config.yml")];
+}
+
+async function resolveEffectiveSkillConfig(
+	cwd: string,
+	override?: EffectiveSkillConfigInput,
+	configPaths?: string[],
+): Promise<EffectiveSkillConfigInput> {
+	if (override) return override;
+	try {
+		let config = buildDefaultEffectiveSkillConfig();
+		for (const configPath of resolveConfigPaths(cwd, configPaths)) {
+			const raw = await readRawConfig(configPath);
+			if (raw) config = mergeRawSkillConfig(config, raw);
+		}
+		return config;
+	} catch {
+		return {
+			unavailableReason: "config unavailable",
+		};
+	}
+}
 
 function safeString(value: unknown): string {
 	return typeof value === "string" ? value : "";
@@ -43,7 +154,7 @@ function readTurnId(payload: HookPayload): string | undefined {
 
 export async function dispatchGjcNativeSkillHook(
 	payload: HookPayload,
-	options: { cwd?: string; stateDir?: string } = {},
+	options: GjcNativeHookDispatchOptions = {},
 ): Promise<GjcNativeHookDispatchResult> {
 	const hookEventName = readHookEventName(payload);
 	const cwd = (options.cwd ?? safeString(payload.cwd).trim()) || process.cwd();
@@ -59,6 +170,9 @@ export async function dispatchGjcNativeSkillHook(
 					stateDir: options.stateDir,
 				})
 			: null;
+		const effectiveSkillConfig = skillState
+			? await resolveEffectiveSkillConfig(cwd, options.effectiveSkillConfig, options.configPaths)
+			: undefined;
 		const activeUltragoalContext = skillState
 			? null
 			: await buildActiveUltragoalPromptContext({
@@ -75,7 +189,7 @@ export async function dispatchGjcNativeSkillHook(
 							hookSpecificOutput: {
 								hookEventName,
 								additionalContext: skillState
-									? buildSkillActivationAdditionalContext(skillState)
+									? buildSkillActivationAdditionalContext(skillState, effectiveSkillConfig)
 									: activeUltragoalContext,
 							},
 						}
