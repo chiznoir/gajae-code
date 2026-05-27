@@ -249,6 +249,35 @@ describe("system Handlebars prompt templates", () => {
 			expect(systemPrompt[1].indexOf("</workspace-tree>")).toBeLessThan(systemPrompt[1].indexOf("Today is "));
 		});
 	});
+	test("buildSystemPrompt includes SYSTEM.md customization without replacing default soul", async () => {
+		await withTempDir(async dir => {
+			const configDir = path.join(dir, ".agent");
+			await fs.mkdir(configDir, { recursive: true });
+			await fs.writeFile(path.join(configDir, "SYSTEM.md"), "Local system customization");
+
+			const { systemPrompt } = await buildSystemPrompt({
+				cwd: dir,
+				contextFiles: [],
+				skills: [],
+				rules: [],
+				toolNames: ["read"],
+				workspaceTree: {
+					rootPath: dir,
+					rendered: "",
+					truncated: false,
+					totalLines: 0,
+					agentsMdFiles: [],
+				},
+			});
+
+			expect(systemPrompt).toHaveLength(2);
+			expect(systemPrompt[0]).toContain("<gajae-code-system-prompt>");
+			expect(systemPrompt[0]).toContain("<soul>");
+			expect(systemPrompt[0]).toContain("The Boss’s Orders = Absolute Obedience");
+			expect(systemPrompt[0]).toContain("<system-prompt-customization>");
+			expect(systemPrompt[0]).toContain("Local system customization");
+		});
+	});
 	test("buildSystemPrompt renders workspace tree after directory context in project prompt", async () => {
 		await withTempDir(async dir => {
 			const { systemPrompt } = await buildSystemPrompt({
