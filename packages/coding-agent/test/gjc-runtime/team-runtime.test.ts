@@ -11,6 +11,7 @@ import {
 	monitorGjcTeam,
 	parseTeamLaunchArgs,
 	readGjcTeamSnapshot,
+	readGjcTeamTask,
 	requestGjcWorkerIntegrationAttempt,
 	resolveGjcTeamWorkerCli,
 	resolveGjcTeamWorkerCliPlan,
@@ -120,6 +121,53 @@ async function readEvents(stateDir: string): Promise<string> {
 
 async function readMailbox(stateDir: string, worker: string): Promise<string> {
 	return Bun.file(path.join(stateDir, "mailbox", `${worker}.json`)).text();
+}
+
+function commandCompletionEvidence(summary = "Completed with focused verification") {
+	return {
+		summary,
+		items: [
+			{
+				kind: "command",
+				status: "passed",
+				summary: "Focused TeamMode runtime test passed",
+				command:
+					"bun test packages/coding-agent/test/gjc-runtime/team-runtime.test.ts --test-name-pattern completion evidence",
+				output: "passed",
+			},
+		],
+		files: ["packages/coding-agent/src/gjc-runtime/team-runtime.ts"],
+		notes: "Focused completion evidence fixture",
+	};
+}
+
+function inspectionCompletionEvidence(summary = "Completed by inspection") {
+	return {
+		summary,
+		items: [
+			{
+				kind: "inspection",
+				status: "verified",
+				summary: "Leader-verifiable inspection evidence recorded",
+				location: "agent://team-evidence-inspection",
+			},
+		],
+		files: ["packages/coding-agent/test/gjc-runtime/team-runtime.test.ts"],
+	};
+}
+
+function artifactCompletionEvidence(summary = "Completed by artifact review") {
+	return {
+		summary,
+		items: [
+			{
+				kind: "artifact",
+				status: "verified",
+				summary: "Artifact was reviewed",
+				artifact: ".gjc/state/team/demo/report.md",
+			},
+		],
+	};
 }
 
 afterEach(async () => {
@@ -517,8 +565,11 @@ describe("native gjc team runtime", () => {
 			cleanupRoot,
 			{ PATH: "" },
 			claim.claim_token,
+			commandCompletionEvidence(),
 		);
 		expect(task.status).toBe("completed");
+		expect(task.completion_evidence?.items[0]?.kind).toBe("command");
+		expect(task.completion_evidence?.recorded_by).toBe("worker-1");
 		expect(task.claim).toBeUndefined();
 		expect(
 			await Bun.file(path.join(cleanupRoot, ".gjc", "state", "team", "life-team", "claims", "task-1.json")).exists(),
@@ -552,7 +603,7 @@ describe("native gjc team runtime", () => {
 		expect(stopped.workers[0]?.status).toBe("stopped");
 	});
 
-	it("keeps terminal evidence out of task listings and honors claim tokens without implicit worker defaults", async () => {
+	it("stores structured completion evidence in task listings and honors claim tokens without implicit worker defaults", async () => {
 		cleanupRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-team-runtime-"));
 		await startGjcTeam({
 			workerCount: 2,
@@ -574,13 +625,15 @@ describe("native gjc team runtime", () => {
 				task_id: "task-2",
 				to: "completed",
 				claim_token: workerTwoClaim.claim_token,
-				evidence: "worker-2 completed the task",
+				completion_evidence: inspectionCompletionEvidence("worker-2 completed by inspection"),
 			},
 			cleanupRoot,
 			{ PATH: "" },
 		);
 
-		expect(await Bun.file(path.join(stateDir, "evidence", "tasks", "task-2.json")).exists()).toBe(true);
+		const completedTask = await readGjcTeamTask("evidence-team", "task-2", cleanupRoot, { PATH: "" });
+		expect(completedTask.completion_evidence?.items[0]?.kind).toBe("inspection");
+		expect(await Bun.file(path.join(stateDir, "evidence", "tasks", "task-2.json")).exists()).toBe(false);
 		expect(await Bun.file(path.join(stateDir, "tasks", "task-2.evidence.json")).exists()).toBe(false);
 		await Bun.write(
 			path.join(stateDir, "tasks", "task-2.evidence.json"),
@@ -610,6 +663,156 @@ describe("native gjc team runtime", () => {
 		).rejects.toThrow("claim_owner_mismatch:task-1");
 	});
 
+	it("rejects completed transitions without valid evidence and leaves task state unchanged", async () => {
+		cleanupRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-team-runtime-"));
+		await startGjcTeam({
+			workerCount: 1,
+			agentType: "executor",
+			task: "Reject invalid completion evidence",
+			teamName: "invalid-evidence-team",
+			cwd: cleanupRoot,
+			dryRun: true,
+			env: { PATH: "" },
+		});
+		const stateDir = path.join(cleanupRoot, ".gjc", "state", "team", "invalid-evidence-team");
+		const claim = await claimGjcTeamTask("invalid-evidence-team", "worker-1", cleanupRoot, { PATH: "" });
+		expect(claim.ok).toBe(true);
+		const taskBefore = await readGjcTeamTask("invalid-evidence-team", "task-1", cleanupRoot, { PATH: "" });
+		const eventsBefore = await readEvents(stateDir);
+		const claimPath = path.join(stateDir, "claims", "task-1.json");
+
+		await expect(
+			transitionGjcTeamTask(
+				"invalid-evidence-team",
+				"task-1",
+				"completed",
+				cleanupRoot,
+				{ PATH: "" },
+				claim.claim_token,
+			),
+		).rejects.toThrow("completion_evidence_required:task-1");
+
+		for (const invalid of [
+			{
+				evidence: { summary: "", items: [commandCompletionEvidence().items[0]] },
+				error: "invalid_completion_evidence:task-1:summary",
+			},
+			{
+				evidence: { summary: "No items", items: [] },
+				error: "invalid_completion_evidence:task-1:items",
+			},
+			{
+				evidence: { summary: "Bad kind", items: [{ kind: "note", status: "verified", summary: "bad" }] },
+				error: "invalid_completion_evidence:task-1:items.kind",
+			},
+			{
+				evidence: {
+					summary: "No verified item",
+					items: [{ kind: "command", status: "failed", summary: "failed check", command: "bun test" }],
+				},
+				error: "completion_evidence_no_verified_item:task-1",
+			},
+		]) {
+			await expect(
+				transitionGjcTeamTask(
+					"invalid-evidence-team",
+					"task-1",
+					"completed",
+					cleanupRoot,
+					{ PATH: "" },
+					claim.claim_token,
+					invalid.evidence,
+				),
+			).rejects.toThrow(invalid.error);
+		}
+
+		const taskAfter = await readGjcTeamTask("invalid-evidence-team", "task-1", cleanupRoot, { PATH: "" });
+		expect(taskAfter.status).toBe(taskBefore.status);
+		expect(taskAfter.version).toBe(taskBefore.version);
+		expect(taskAfter.completed_at).toBeUndefined();
+		expect(taskAfter.completion_evidence).toBeUndefined();
+		expect(await Bun.file(claimPath).exists()).toBe(true);
+		expect(await readEvents(stateDir)).toBe(eventsBefore);
+	});
+
+	it("allows non-command completion evidence and requires evidence-backed shutdown completion", async () => {
+		cleanupRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-team-runtime-"));
+		await startGjcTeam({
+			workerCount: 2,
+			agentType: "executor",
+			task: "Complete with review evidence",
+			teamName: "review-evidence-team",
+			cwd: cleanupRoot,
+			dryRun: true,
+			env: { PATH: "" },
+		});
+
+		const firstClaim = await claimGjcTeamTask(
+			"review-evidence-team",
+			"worker-1",
+			cleanupRoot,
+			{ PATH: "" },
+			"task-1",
+		);
+		expect(firstClaim.ok).toBe(true);
+		const first = await transitionGjcTeamTask(
+			"review-evidence-team",
+			"task-1",
+			"completed",
+			cleanupRoot,
+			{ PATH: "" },
+			firstClaim.claim_token,
+			inspectionCompletionEvidence("inspection-only task completed"),
+		);
+		expect(first.completion_evidence?.items[0]?.kind).toBe("inspection");
+
+		const secondClaim = await claimGjcTeamTask(
+			"review-evidence-team",
+			"worker-2",
+			cleanupRoot,
+			{ PATH: "" },
+			"task-2",
+		);
+		expect(secondClaim.ok).toBe(true);
+		await executeGjcTeamApiOperation(
+			"transition-task-status",
+			{
+				team_name: "review-evidence-team",
+				task_id: "task-2",
+				to: "completed",
+				claim_token: secondClaim.claim_token,
+				completion_evidence: artifactCompletionEvidence("artifact-backed task completed"),
+			},
+			cleanupRoot,
+			{ PATH: "" },
+		);
+
+		const stopped = await shutdownGjcTeam("review-evidence-team", cleanupRoot, { PATH: "" });
+		expect(stopped.phase).toBe("complete");
+	});
+
+	it("treats legacy evidence-free completed tasks as failed on shutdown", async () => {
+		cleanupRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-team-runtime-"));
+		await startGjcTeam({
+			workerCount: 1,
+			agentType: "executor",
+			task: "Legacy completed task",
+			teamName: "legacy-completed-team",
+			cwd: cleanupRoot,
+			dryRun: true,
+			env: { PATH: "" },
+		});
+		const stateDir = path.join(cleanupRoot, ".gjc", "state", "team", "legacy-completed-team");
+		const task = await readGjcTeamTask("legacy-completed-team", "task-1", cleanupRoot, { PATH: "" });
+		await Bun.write(
+			path.join(stateDir, "tasks", "task-1.json"),
+			`${JSON.stringify({ ...task, status: "completed", completed_at: new Date().toISOString() }, null, 2)}\n`,
+		);
+
+		const stopped = await shutdownGjcTeam("legacy-completed-team", cleanupRoot, { PATH: "" });
+		expect(stopped.phase).toBe("failed");
+		expect(await readEvents(stateDir)).toContain("completion_evidence_required:task-1");
+	});
 	it("allows only one worker to claim a task under concurrent claim attempts", async () => {
 		cleanupRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-team-runtime-"));
 		await startGjcTeam({
@@ -685,7 +888,13 @@ describe("native gjc team runtime", () => {
 		)) as { claim_token: string };
 		await executeGjcTeamApiOperation(
 			"transition-task-status",
-			{ team_name: "api-team", task_id: created.task.id, to: "completed", claim_token: claimed.claim_token },
+			{
+				team_name: "api-team",
+				task_id: created.task.id,
+				to: "completed",
+				claim_token: claimed.claim_token,
+				completionEvidence: artifactCompletionEvidence("API parity task completed by artifact"),
+			},
 			cleanupRoot,
 			{ PATH: "" },
 		);
@@ -1079,12 +1288,18 @@ describe("native gjc team runtime", () => {
 				PATH: process.env.PATH ?? "",
 			},
 			claim.claim_token,
+			commandCompletionEvidence("integration request task completed"),
 		);
 
 		const status = await readGjcTeamSnapshot("awaiting-request-team", cleanupRoot, { PATH: process.env.PATH ?? "" });
 		expect(status.task_counts.completed).toBe(1);
 		expect(status.phase).toBe("awaiting_integration");
 		expect(status.phase).not.toBe("running");
+
+		const stopped = await shutdownGjcTeam("awaiting-request-team", cleanupRoot, { PATH: process.env.PATH ?? "" });
+		expect(stopped.task_counts.completed).toBe(1);
+		expect(stopped.phase).toBe("awaiting_integration");
+		expect(stopped.phase).not.toBe("complete");
 	});
 
 	it("monitor cherry-picks diverged worker commits and stays idempotent on repeated status checks", async () => {
@@ -1193,6 +1408,7 @@ describe("native gjc team runtime", () => {
 				PATH: process.env.PATH ?? "",
 			},
 			claim.claim_token,
+			commandCompletionEvidence("conflicting task completed before integration"),
 		);
 
 		const monitored = await monitorGjcTeam("awaiting-conflict-team", cleanupRoot, {
@@ -1204,6 +1420,11 @@ describe("native gjc team runtime", () => {
 		expect(monitored.integration_by_worker?.["worker-1"]?.status).toBe("merge_conflict");
 		expect(monitored.phase).toBe("awaiting_integration");
 		expect(monitored.phase).not.toBe("running");
+
+		const stopped = await shutdownGjcTeam("awaiting-conflict-team", cleanupRoot, { PATH: process.env.PATH ?? "" });
+		expect(stopped.task_counts.completed).toBe(1);
+		expect(stopped.phase).toBe("awaiting_integration");
+		expect(stopped.phase).not.toBe("complete");
 	});
 
 	it("monitor reports cherry-pick conflicts and aborts cleanly", async () => {

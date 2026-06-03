@@ -57,6 +57,27 @@ export interface GjcTeamTaskClaim {
 	token: string;
 	leased_until: string;
 }
+export type GjcTeamTaskCompletionEvidenceKind = "command" | "inspection" | "artifact";
+export type GjcTeamTaskCompletionEvidenceStatus = "passed" | "failed" | "not_run" | "verified" | "rejected";
+
+export interface GjcTeamTaskCompletionEvidenceItem {
+	kind: GjcTeamTaskCompletionEvidenceKind;
+	status: GjcTeamTaskCompletionEvidenceStatus;
+	summary: string;
+	command?: string;
+	artifact?: string;
+	location?: string;
+	output?: string;
+}
+
+export interface GjcTeamTaskCompletionEvidence {
+	summary: string;
+	items: GjcTeamTaskCompletionEvidenceItem[];
+	files?: string[];
+	notes?: string;
+	recorded_by: string;
+	recorded_at: string;
+}
 
 export interface GjcTeamTask {
 	id: string;
@@ -68,6 +89,7 @@ export interface GjcTeamTask {
 	assignee?: string;
 	owner?: string;
 	result?: string;
+	completion_evidence?: GjcTeamTaskCompletionEvidence;
 	error?: string;
 	blocked_by?: string[];
 	depends_on?: string[];
@@ -447,9 +469,6 @@ function safePathSegment(kind: string, value: string): string {
 function taskPath(dir: string, taskId: string): string {
 	return path.join(dir, "tasks", `${safePathSegment("task_id", taskId)}.json`);
 }
-function taskEvidencePath(dir: string, taskId: string): string {
-	return path.join(dir, "evidence", "tasks", `${safePathSegment("task_id", taskId)}.json`);
-}
 function mailboxPath(dir: string, worker: string): string {
 	return path.join(dir, "mailbox", `${safePathSegment("worker_id", worker)}.json`);
 }
@@ -662,12 +681,152 @@ async function resolveGjcTeamSnapshotPhase(
 	monitor: GjcTeamMonitorSnapshot | null,
 ): Promise<GjcTeamPhase> {
 	if (storedPhase !== "running") return storedPhase;
-	if (tasks.length === 0 || !tasks.every(task => task.status === "completed")) return storedPhase;
+	if (tasks.length === 0 || !tasks.every(isGjcTeamTaskCompletionVerified)) return storedPhase;
 	return (await hasPendingGjcTeamIntegration(dir, config, monitor)) ? "awaiting_integration" : storedPhase;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value != null;
+}
+const GJC_TEAM_COMPLETION_EVIDENCE_SUMMARY_MAX = 4_000;
+const GJC_TEAM_COMPLETION_EVIDENCE_OUTPUT_MAX = 8_000;
+const GJC_TEAM_COMMAND_EVIDENCE_STATUSES = new Set<GjcTeamTaskCompletionEvidenceStatus>([
+	"passed",
+	"failed",
+	"not_run",
+]);
+const GJC_TEAM_VERIFICATION_EVIDENCE_STATUSES = new Set<GjcTeamTaskCompletionEvidenceStatus>(["verified", "rejected"]);
+
+function completionEvidenceError(taskId: string, field: string): Error {
+	return new Error(`invalid_completion_evidence:${taskId}:${field}`);
+}
+
+function trimRequiredCompletionEvidenceString(
+	taskId: string,
+	field: string,
+	value: unknown,
+	maxLength = GJC_TEAM_COMPLETION_EVIDENCE_SUMMARY_MAX,
+): string {
+	if (typeof value !== "string") throw completionEvidenceError(taskId, field);
+	const trimmed = value.trim();
+	if (!trimmed || trimmed.length > maxLength) throw completionEvidenceError(taskId, field);
+	return trimmed;
+}
+
+function trimOptionalCompletionEvidenceString(
+	taskId: string,
+	field: string,
+	value: unknown,
+	maxLength = GJC_TEAM_COMPLETION_EVIDENCE_OUTPUT_MAX,
+): string | undefined {
+	if (value == null) return undefined;
+	if (typeof value !== "string") throw completionEvidenceError(taskId, field);
+	const trimmed = value.trim();
+	if (!trimmed) return undefined;
+	if (trimmed.length > maxLength) throw completionEvidenceError(taskId, field);
+	return trimmed;
+}
+
+function normalizeGjcTeamCompletionEvidenceStatus(
+	taskId: string,
+	kind: GjcTeamTaskCompletionEvidenceKind,
+	value: unknown,
+): GjcTeamTaskCompletionEvidenceStatus {
+	const status = trimRequiredCompletionEvidenceString(taskId, "items.status", value);
+	const allowed = kind === "command" ? GJC_TEAM_COMMAND_EVIDENCE_STATUSES : GJC_TEAM_VERIFICATION_EVIDENCE_STATUSES;
+	if (!allowed.has(status as GjcTeamTaskCompletionEvidenceStatus))
+		throw completionEvidenceError(taskId, "items.status");
+	return status as GjcTeamTaskCompletionEvidenceStatus;
+}
+
+function normalizeGjcTeamCompletionEvidenceItem(taskId: string, value: unknown): GjcTeamTaskCompletionEvidenceItem {
+	if (!isRecord(value) || Array.isArray(value)) throw completionEvidenceError(taskId, "items");
+	const kind = trimRequiredCompletionEvidenceString(taskId, "items.kind", value.kind);
+	if (kind !== "command" && kind !== "inspection" && kind !== "artifact")
+		throw completionEvidenceError(taskId, "items.kind");
+	const status = normalizeGjcTeamCompletionEvidenceStatus(taskId, kind, value.status);
+	const item: GjcTeamTaskCompletionEvidenceItem = {
+		kind,
+		status,
+		summary: trimRequiredCompletionEvidenceString(taskId, "items.summary", value.summary),
+	};
+	const command = trimOptionalCompletionEvidenceString(taskId, "items.command", value.command);
+	const artifact = trimOptionalCompletionEvidenceString(taskId, "items.artifact", value.artifact);
+	const location = trimOptionalCompletionEvidenceString(taskId, "items.location", value.location);
+	const output = trimOptionalCompletionEvidenceString(taskId, "items.output", value.output);
+	if (kind === "command" && !command) throw completionEvidenceError(taskId, "items.command");
+	if (command) item.command = command;
+	if (artifact) item.artifact = artifact;
+	if (location) item.location = location;
+	if (output) item.output = output;
+	return item;
+}
+
+function normalizeGjcTeamCompletionEvidenceFiles(taskId: string, value: unknown): string[] | undefined {
+	if (value == null) return undefined;
+	if (!Array.isArray(value)) throw completionEvidenceError(taskId, "files");
+	const files = new Set<string>();
+	for (const entry of value) {
+		if (typeof entry !== "string") throw completionEvidenceError(taskId, "files");
+		const filePath = entry.trim().replace(/\\/g, "/");
+		if (!filePath || filePath.includes("\0") || path.isAbsolute(filePath) || filePath.split("/").includes("..")) {
+			throw completionEvidenceError(taskId, "files");
+		}
+		files.add(filePath);
+	}
+	return files.size > 0 ? [...files].sort() : undefined;
+}
+
+function isGjcTeamCompletionEvidenceItemVerified(item: GjcTeamTaskCompletionEvidenceItem): boolean {
+	return (
+		(item.kind === "command" && item.status === "passed") ||
+		((item.kind === "inspection" || item.kind === "artifact") && item.status === "verified")
+	);
+}
+
+function normalizeGjcTeamTaskCompletionEvidence(
+	taskId: string,
+	owner: string,
+	input: unknown,
+	recordedAt = now(),
+): GjcTeamTaskCompletionEvidence {
+	if (!isRecord(input) || Array.isArray(input)) throw new Error(`completion_evidence_required:${taskId}`);
+	const itemsValue = input.items;
+	if (!Array.isArray(itemsValue) || itemsValue.length === 0) throw completionEvidenceError(taskId, "items");
+	const items = itemsValue.map(item => normalizeGjcTeamCompletionEvidenceItem(taskId, item));
+	if (!items.some(isGjcTeamCompletionEvidenceItemVerified))
+		throw new Error(`completion_evidence_no_verified_item:${taskId}`);
+	const evidence: GjcTeamTaskCompletionEvidence = {
+		summary: trimRequiredCompletionEvidenceString(taskId, "summary", input.summary),
+		items,
+		recorded_by: owner,
+		recorded_at: recordedAt,
+	};
+	const files = normalizeGjcTeamCompletionEvidenceFiles(taskId, input.files);
+	const notes = trimOptionalCompletionEvidenceString(taskId, "notes", input.notes);
+	if (files) evidence.files = files;
+	if (notes) evidence.notes = notes;
+	return evidence;
+}
+
+function getGjcTeamTaskCompletionEvidenceFailure(task: GjcTeamTask): string | null {
+	if (task.status !== "completed") return `task_not_completed:${task.id}`;
+	const evidence = task.completion_evidence;
+	if (!isRecord(evidence) || Array.isArray(evidence)) return `completion_evidence_required:${task.id}`;
+	if (typeof evidence.recorded_by !== "string" || evidence.recorded_by.trim().length === 0)
+		return `invalid_completion_evidence:${task.id}:recorded_by`;
+	if (typeof evidence.recorded_at !== "string" || evidence.recorded_at.trim().length === 0)
+		return `invalid_completion_evidence:${task.id}:recorded_at`;
+	try {
+		normalizeGjcTeamTaskCompletionEvidence(task.id, evidence.recorded_by.trim(), evidence, evidence.recorded_at);
+		return null;
+	} catch (error) {
+		return error instanceof Error ? error.message : `invalid_completion_evidence:${task.id}:unknown`;
+	}
+}
+
+function isGjcTeamTaskCompletionVerified(task: GjcTeamTask): boolean {
+	return getGjcTeamTaskCompletionEvidenceFailure(task) == null;
 }
 function isGjcTeamTaskRecord(value: unknown): value is GjcTeamTask {
 	return (
@@ -898,7 +1057,7 @@ function buildWorkerCommand(config: GjcTeamConfig, worker: GjcTeamWorker): strin
 		workspace,
 		`Task: ${config.task}`,
 		`Before claiming work, send startup ACK: gjc team api worker-startup-ack --input '{"team_name":"${config.team_name}","worker_id":"${worker.id}","protocol_version":"1"}' --json.`,
-		`Use gjc team api claim-task/transition-task-status with this worker id, record evidence, and do not mutate leader-owned goal state.`,
+		`Use gjc team api claim-task/transition-task-status with this worker id, record completion_evidence (summary plus a passed command or verified inspection/artifact item) before completed, and do not mutate leader-owned goal state.`,
 	].join("\n");
 	const env = [
 		`GJC_TEAM_WORKER=${shellQuote(`${config.team_name}/${worker.id}`)}`,
@@ -2081,12 +2240,22 @@ export async function shutdownGjcTeam(
 	const dir = await findTeamDir(teamName, cwd, env);
 	const config = await readConfig(dir);
 	const tasks = await readTasks(dir);
-	const shutdownPhase: GjcTeamPhase =
-		tasks.length === 0 || tasks.every(task => task.status === "completed")
-			? "complete"
-			: tasks.some(task => task.status === "failed" || task.status === "blocked")
-				? "failed"
-				: "cancelled";
+	const evidenceFailures = tasks
+		.map(task => {
+			const reason = task.status === "completed" ? getGjcTeamTaskCompletionEvidenceFailure(task) : null;
+			return reason ? { task_id: task.id, reason } : null;
+		})
+		.filter((failure): failure is { task_id: string; reason: string } => failure != null);
+	const monitor = await readJsonFile<GjcTeamMonitorSnapshot>(monitorSnapshotPath(dir));
+	const completionVerified = tasks.length === 0 || tasks.every(isGjcTeamTaskCompletionVerified);
+	const pendingIntegration = completionVerified ? await hasPendingGjcTeamIntegration(dir, config, monitor) : false;
+	const shutdownPhase: GjcTeamPhase = completionVerified
+		? pendingIntegration
+			? "awaiting_integration"
+			: "complete"
+		: evidenceFailures.length > 0 || tasks.some(task => task.status === "failed" || task.status === "blocked")
+			? "failed"
+			: "cancelled";
 	killWorkerPanes(config);
 	await removeCleanCreatedWorktrees(config.workers);
 	const stopped = {
@@ -2096,13 +2265,15 @@ export async function shutdownGjcTeam(
 	};
 	await writeJsonFile(path.join(dir, "config.json"), stopped);
 	await writePhase(dir, shutdownPhase);
+	const shutdownData: Record<string, unknown> = { phase: shutdownPhase };
+	if (evidenceFailures.length > 0) shutdownData.evidence_failures = evidenceFailures;
 	await appendEvent(dir, {
 		type: "team_shutdown",
 		message:
 			shutdownPhase === "complete"
 				? "Shut down native gjc team runtime after completed tasks"
 				: "Shut down native gjc team runtime with incomplete tasks",
-		data: { phase: shutdownPhase },
+		data: shutdownData,
 	});
 	await appendTelemetry(dir, {
 		type: "team_shutdown",
@@ -2244,7 +2415,7 @@ export async function transitionGjcTeamTaskStatus(
 	env: NodeJS.ProcessEnv = process.env,
 	claimToken?: string,
 	workerId?: string,
-	evidence?: string,
+	completionEvidenceInput?: unknown,
 ): Promise<GjcTeamTask> {
 	const dir = await findTeamDir(teamName, cwd, env);
 	const config = await readConfig(dir);
@@ -2257,33 +2428,39 @@ export async function transitionGjcTeamTaskStatus(
 	if (task.claim.token !== claimToken) throw new Error(`claim_token_mismatch:${taskId}`);
 	if (workerId && task.claim.owner !== workerId) throw new Error(`claim_owner_mismatch:${taskId}`);
 	const terminal = status === "completed" || status === "failed";
-	if (status === "completed" && evidence !== undefined && evidence.trim().length === 0)
-		throw new Error(`task_evidence_required:${taskId}`);
+	const transitionedAt = now();
+	const completionEvidence =
+		status === "completed"
+			? normalizeGjcTeamTaskCompletionEvidence(taskId, task.claim.owner, completionEvidenceInput, transitionedAt)
+			: undefined;
 	const updated: GjcTeamTask = {
 		...task,
 		status,
 		claim: terminal ? undefined : task.claim,
 		version: task.version + 1,
-		updated_at: now(),
-		...(terminal ? { completed_at: now() } : {}),
+		updated_at: transitionedAt,
+		...(terminal ? { completed_at: transitionedAt } : {}),
+		...(completionEvidence ? { completion_evidence: completionEvidence } : {}),
 	};
 	await writeTask(dir, updated);
-	if (terminal && evidence)
-		await writeJsonFile(taskEvidencePath(dir, taskId), {
-			task_id: taskId,
-			worker: workerId ?? task.claim.owner,
-			evidence,
-			recorded_at: now(),
-		});
 	if (terminal) {
 		const claimPath = path.join(dir, "claims", `${taskId}.json`);
 		await removeFileAudited(claimPath, stateWriterOptions(claimPath, "prune", "terminal"));
+	}
+	const eventData: Record<string, unknown> = { status };
+	if (completionEvidence) {
+		eventData.completion_evidence = {
+			recorded_by: completionEvidence.recorded_by,
+			item_count: completionEvidence.items.length,
+			verified_item_count: completionEvidence.items.filter(isGjcTeamCompletionEvidenceItemVerified).length,
+			files_count: completionEvidence.files?.length ?? 0,
+		};
 	}
 	await appendEvent(dir, {
 		type: "task_transitioned",
 		task_id: taskId,
 		message: "Task status changed",
-		data: { status },
+		data: eventData,
 	});
 	return updated;
 }
@@ -2294,8 +2471,18 @@ export async function transitionGjcTeamTask(
 	cwd = process.cwd(),
 	env: NodeJS.ProcessEnv = process.env,
 	claimToken?: string,
+	completionEvidenceInput?: unknown,
 ): Promise<GjcTeamTask> {
-	return transitionGjcTeamTaskStatus(teamName, taskId, parseGjcTeamTaskStatus(status, true), cwd, env, claimToken);
+	return transitionGjcTeamTaskStatus(
+		teamName,
+		taskId,
+		parseGjcTeamTaskStatus(status, true),
+		cwd,
+		env,
+		claimToken,
+		undefined,
+		completionEvidenceInput,
+	);
 }
 export async function releaseGjcTeamTaskClaim(
 	teamName: string,
@@ -2880,11 +3067,7 @@ export async function executeGjcTeamApiOperation(
 					env,
 					typeof input.claim_token === "string" ? input.claim_token : undefined,
 					explicitWorker,
-					typeof input.evidence === "string"
-						? input.evidence
-						: typeof input.result === "string"
-							? input.result
-							: undefined,
+					input.completion_evidence ?? input.completionEvidence,
 				),
 			};
 		case "release-task-claim":

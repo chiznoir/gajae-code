@@ -165,12 +165,13 @@ Follow this exact lifecycle when running `$team`:
 
 1. Start team and verify startup evidence (team line, tmux target, worker pane id, state dir).
 2. Monitor task progress with runtime/state tools first (`gjc team status <team>`, `gjc team resume <team>`, task files).
-3. Wait for terminal task state before shutdown:
+3. Wait for terminal task state and integration settlement before shutdown:
    - `pending=0`
    - `in_progress=0`
    - `failed=0` (or explicitly acknowledged failure path)
+   - no pending integration request/conflict (`status` / `resume` must not report `phase=awaiting_integration`)
 4. Only then run `gjc team shutdown <team>`.
-5. Verify shutdown evidence and preserved state (`phase=complete`, worker status `stopped`). If shutdown is forced before task completion, expect `phase=cancelled` or `phase=failed`, not `complete`.
+5. Verify shutdown evidence and preserved state (`phase=complete`, worker status `stopped`). If shutdown is forced before task completion, expect `phase=cancelled` or `phase=failed`; if tasks are complete but integration is still pending or conflicted, expect `phase=awaiting_integration`, not `complete`.
 
 Do not run `shutdown` while the worker is actively writing updates unless user explicitly requested abort/cancel. Do not treat ad-hoc pane typing as primary control flow when runtime/state evidence is available.
 
@@ -198,7 +199,7 @@ Semantics:
 - `resume`: mutating monitor path; performs the same integration-aware live snapshot for reconnect/inspection flows.
 - `list`: pure read path; lists known teams without integrating worker commits.
 - API/read-only snapshot operations are pure unless explicitly documented as a monitor/status path.
-- `shutdown`: kills the recorded worker pane when it still belongs to the stored tmux target, removes clean created worktrees, marks worker stopped, and sets phase from task state: `complete` only when all tasks completed, `failed` when tasks failed/blocked, and `cancelled` when work remains pending or in progress. It preserves `.gjc/state/team/<team>` as evidence.
+- `shutdown`: kills the recorded worker pane when it still belongs to the stored tmux target, removes clean created worktrees, marks worker stopped, and sets phase from task and integration state: `complete` only when all tasks have verified `completion_evidence` and no integration request/conflict is pending, `awaiting_integration` when tasks are complete but leader integration still requires action, `failed` when tasks failed/blocked or completed tasks lack valid evidence, and `cancelled` when work remains pending or in progress. It preserves `.gjc/state/team/<team>` as evidence.
 
 ## Data Plane and Control Plane
 
@@ -217,8 +218,7 @@ Semantics:
 - `.gjc/state/team/<team>/telemetry.jsonl`
 - `.gjc/state/team/<team>/monitor-snapshot.json`
 - `.gjc/state/team/<team>/integration-report.md`
-- `.gjc/state/team/<team>/tasks/task-1.json`
-- `.gjc/state/team/<team>/evidence/tasks/task-1.json`
+- `.gjc/state/team/<team>/tasks/task-1.json` (includes structured `completion_evidence` after completed transitions)
 - `.gjc/state/team/<team>/mailbox/worker-1/<message-id>.json`
 - `.gjc/state/team/<team>/mailbox/worker-1.json` (legacy compatibility view)
 - `.gjc/state/team/<team>/notifications/<notification-id>.json`
@@ -233,15 +233,17 @@ Use `gjc team api` for machine-readable task lifecycle operations.
 ```bash
 gjc team api worker-startup-ack --input '{"team_name":"my-team","worker_id":"worker-1","protocol_version":"1"}' --json
 gjc team api claim-task --input '{"team_name":"my-team","worker_id":"worker-1"}' --json
-gjc team api transition-task-status --input '{"team_name":"my-team","task_id":"task-1","to":"completed","worker_id":"worker-1","claim_token":"<claim-token>","evidence":"summary of completed work and validation"}' --json
+gjc team api transition-task-status --input '{"team_name":"my-team","task_id":"task-1","to":"completed","worker_id":"worker-1","claim_token":"<claim-token>","completion_evidence":{"summary":"Completed requested work and verified it locally.","items":[{"kind":"command","status":"passed","summary":"Focused test passed","command":"bun test packages/coding-agent/test/gjc-runtime/team-runtime.test.ts"}],"files":["packages/coding-agent/test/gjc-runtime/team-runtime.test.ts"],"notes":"Include at least one passed command or verified inspection/artifact item."}}' --json
 ```
 
 Canonical worker lifecycle operations:
 
 - `worker-startup-ack` before task work
 - `claim-task`
-- `transition-task-status` with the claim token, worker id, and completion evidence
+- `transition-task-status` with the claim token, worker id, and structured `completion_evidence` object
 - `release-task-claim`
+
+Completion evidence is stored inline on the task record as `completion_evidence`. It must include a non-empty `summary`, an `items` array, and at least one item with `status: "passed"` or `status: "verified"`. Valid item kinds are `command`, `inspection`, and `artifact`; command items require `command`. The camel-case alias `completionEvidence` is accepted by the API input, but legacy string `evidence` and separate evidence files are not part of the public completion contract.
 
 GJC-team interop operations are also available for mailbox, native notification, worker heartbeat/status, startup ACK, events, monitor snapshots, approvals, and shutdown request/ack flows; run `gjc team api --help` for the full operation list.
 
@@ -350,7 +352,7 @@ When operating this skill, provide concrete progress evidence:
 1. Team started line (`Team started: <name>`)
 2. tmux target and worker pane id
 3. task state from `gjc team status <team>` or `.gjc/state/team/<team>/tasks/task-1.json`
-4. shutdown outcome (`phase=complete`, worker status `stopped`) when the run is terminal; incomplete shutdowns must report `phase=cancelled`/`failed`
+4. shutdown outcome (`phase=complete`, worker status `stopped`) when the run is terminal; incomplete or integration-blocked shutdowns must report `phase=cancelled`/`failed`/`awaiting_integration`
 
 Do not claim success without file/pane evidence.
 Do not claim clean completion if shutdown occurred with `in_progress>0`.

@@ -135,6 +135,9 @@ export default class Team extends Command {
 					"create-task read-task list-tasks update-task claim-task transition-task-status release-task-claim",
 					"read-config read-manifest read-worker-status read-worker-heartbeat update-worker-heartbeat write-worker-inbox write-worker-identity",
 					"append-event read-events await-event write-shutdown-request read-shutdown-ack read-monitor-snapshot write-monitor-snapshot read-task-approval write-task-approval",
+					"Completion example:",
+					'transition-task-status --input \'{"team_name":"demo","task_id":"task-1","to":"completed","claim_token":"...","completion_evidence":{"summary":"done","items":[{"kind":"command","status":"passed","summary":"focused tests passed","command":"bun test packages/coding-agent/test/gjc-runtime/team-runtime.test.ts"}]}}\' --json',
+					'Review-only completion may use {"kind":"inspection","status":"verified","summary":"review passed","location":"agent://review"}.',
 				]);
 				return;
 			}
