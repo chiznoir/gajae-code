@@ -11,7 +11,7 @@ describe("Claude Opus 4.8 vision capability", () => {
 	it("advertises image input for every bundled claude-opus-4.8 variant", () => {
 		const offenders: string[] = [];
 		for (const provider of getBundledProviders()) {
-			for (const model of getBundledModels(provider)) {
+			for (const model of getBundledModels(provider as Parameters<typeof getBundledModels>[0])) {
 				const normalizedId = model.id.toLowerCase().replace(/\./g, "-");
 				if (!normalizedId.includes("claude-opus-4-8")) continue;
 				if (!model.input.includes("image")) {
