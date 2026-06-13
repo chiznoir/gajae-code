@@ -6,16 +6,13 @@
 
 - Added a generic tool-choice capability model: `toolChoiceSupport` compat enum (`none`/`auto`/`required`/`named`) available on every forced-choice-capable API, derived from the legacy `supportsToolChoice`/`supportsForcedToolChoice` booleans when absent, with a shared `resolveToolChoice` helper that clamps requested tool choices (`named` → `required` → omit) and returns structured degradation metadata.
 - Added a transparent one-shot fallback for forced `tool_choice` 400s ("tool_choice forces tool use is not compatible with this model" and equivalents): transports retry once without the forced field at a pre-content streaming boundary, record the discovery in an in-memory per-process incapability registry, and emit an internal non-rendered `toolChoiceIncapability` event. Applies to Anthropic, OpenAI Completions/Responses, Azure Responses, OpenAI code Responses, Bedrock (including event-stream `validationException`), Ollama, Google, and Gemini CLI transports.
-
-### Changed
-
-- Moved the Claude Fable/Mythos forced-tool-use incapability knowledge out of Anthropic request code into catalog compat defaults (`toolChoiceSupport: "auto"`), applied during catalog generation, dynamic discovery, and bundled-model loading via a shared predicate.
-- Google `toolConfig` mapping now sends `FunctionCallingConfig` mode `ANY` for both `required` and `any` requests instead of silently relaxing `required` to `AUTO`.
 - Added bundled catalog entries for `anthropic/claude-fable-5`, `kimi-code/kimi-k2.7-code`, `minimax-code/minimax-v3`, and `xai/grok-composer-2.5-fast`.
 - Added composer-harness anchor/edit discipline injection for Cursor Composer and Grok Composer models so provider-specific coding harness priors do not override GJC hashline/edit contracts.
 
 ### Changed
 
+- Moved the Claude Fable/Mythos forced-tool-use incapability knowledge out of Anthropic request code into catalog compat defaults (`toolChoiceSupport: "auto"`), applied during catalog generation, dynamic discovery, and bundled-model loading via a shared predicate.
+- Google `toolConfig` mapping now sends `FunctionCallingConfig` mode `ANY` for both `required` and `any` requests instead of silently relaxing `required` to `AUTO`.
 - Optimized `EventStream` queue draining with a head-indexed queue to avoid repeated array shifts in hot streaming paths.
 - Clarified lazy builtin provider registration as the main provider loading path.
 

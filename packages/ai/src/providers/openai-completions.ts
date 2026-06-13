@@ -61,12 +61,12 @@ import { adaptSchemaForStrict, NO_STRICT, toolWireSchema } from "../utils/schema
 import { wrapFetchForSseDebug } from "../utils/sse-debug";
 import { type HealedToolCall, modelMayLeakKimiToolCalls, ToolCallHealer } from "../utils/tool-call-healing";
 import { isForcedToolChoice, mapToOpenAICompletionsToolChoice } from "../utils/tool-choice";
-import { COMPOSER_EDIT_DISCIPLINE_PROMPT, isComposerHarnessModel } from "./composer-discipline";
 import {
 	isForcedToolChoiceUnsupportedError,
 	markToolChoiceIncapability,
 	resolveToolChoice,
 } from "../utils/tool-choice-capability";
+import { COMPOSER_EDIT_DISCIPLINE_PROMPT, isComposerHarnessModel } from "./composer-discipline";
 import {
 	buildCopilotDynamicHeaders,
 	hasCopilotVisionInput,
