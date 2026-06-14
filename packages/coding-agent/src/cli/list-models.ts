@@ -5,7 +5,12 @@ import { type Api, getSupportedEfforts, type Model } from "@gajae-code/ai";
 import { fuzzyFilter } from "@gajae-code/tui";
 import { formatNumber } from "@gajae-code/utils";
 import type { ModelRegistry } from "../config/model-registry";
-import { discoverAndLoadExtensions, loadExtensions } from "../extensibility/extensions";
+import {
+	discoverAndLoadExtensions,
+	loadExtensionFromFactory,
+	loadExtensions,
+	type ExtensionFactory,
+} from "../extensibility/extensions";
 import { EventBus } from "../utils/event-bus";
 
 interface ProviderRow {
@@ -137,6 +142,8 @@ export interface RunListModelsOptions {
 	cwd: string;
 	/** CLI-supplied extension paths (e.g. from `-e <path>`). */
 	additionalExtensionPaths?: string[];
+	/** In-process extension factories to load without filesystem discovery. */
+	extensionFactories?: Array<{ factory: ExtensionFactory; name: string }>;
 	/** Extension paths configured under `extensions:` in user settings. */
 	settingsExtensions?: string[];
 	/** Disabled extension ids from settings (`disabledExtensions`). */
@@ -159,6 +166,7 @@ export async function runListModelsCommand(options: RunListModelsOptions): Promi
 		modelRegistry,
 		cwd,
 		additionalExtensionPaths = [],
+		extensionFactories = [],
 		settingsExtensions = [],
 		disabledExtensionIds = [],
 		disableExtensionDiscovery = false,
@@ -174,6 +182,10 @@ export async function runListModelsCommand(options: RunListModelsOptions): Promi
 				eventBus,
 				disabledExtensionIds,
 			);
+	for (const { factory, name } of extensionFactories) {
+		const extension = await loadExtensionFromFactory(factory, cwd, eventBus, extensionsResult.runtime, name);
+		extensionsResult.extensions.push(extension);
+	}
 
 	for (const { path: extPath, error } of extensionsResult.errors) {
 		process.stderr.write(`Failed to load extension: ${extPath}: ${error}\n`);
