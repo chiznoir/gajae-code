@@ -239,10 +239,15 @@ describe("gc red-team invariants", () => {
 		const base = await makeTemp();
 		const registryDir = path.join(base, "reg");
 		const leaseFile = await seedHarnessLease(base, registryDir, "h-dry-run", await reapedPid());
-		const result = await runGjcGcCommand(["--json"], base, {
-			...process.env,
-			GJC_HARNESS_ROOT_REGISTRY_DIR: registryDir,
-		});
+		const result = await runGjcGcCommand(
+			["--json"],
+			base,
+			{
+				...process.env,
+				GJC_HARNESS_ROOT_REGISTRY_DIR: registryDir,
+			},
+			[harnessLeasesGcAdapter],
+		);
 		const report = JSON.parse(result.stdout);
 
 		expect(result.status).toBe(0);

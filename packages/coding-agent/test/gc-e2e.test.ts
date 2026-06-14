@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { runGjcGcCommand } from "@gajae-code/coding-agent/gjc-runtime/gc-runtime";
+import { harnessLeasesGcAdapter } from "@gajae-code/coding-agent/harness-control-plane/gc-adapter";
 
 const tempDirs: string[] = [];
 
@@ -53,7 +54,7 @@ async function seedDeadLease(base: string, registryDir: string, deadPid: number)
 	return leaseFile;
 }
 
-describe("gjc gc end-to-end (default adapters)", () => {
+describe("gjc gc end-to-end (harness lease adapter)", () => {
 	test("dry-run reports a dead lease as would_remove and deletes nothing", async () => {
 		const base = await makeTemp();
 		const registryDir = path.join(base, "reg");
@@ -61,7 +62,7 @@ describe("gjc gc end-to-end (default adapters)", () => {
 		const leaseFile = await seedDeadLease(base, registryDir, deadPid);
 		const env = { ...process.env, GJC_HARNESS_ROOT_REGISTRY_DIR: registryDir };
 
-		const result = await runGjcGcCommand(["--json"], base, env);
+		const result = await runGjcGcCommand(["--json"], base, env, [harnessLeasesGcAdapter]);
 		const report = JSON.parse(result.stdout);
 		expect(report.dry_run).toBe(true);
 		const rec = report.stores.harness_leases.find((r: { id: string }) => r.id === "h-e2e");
@@ -79,7 +80,7 @@ describe("gjc gc end-to-end (default adapters)", () => {
 		const leaseFile = await seedDeadLease(base, registryDir, deadPid);
 		const env = { ...process.env, GJC_HARNESS_ROOT_REGISTRY_DIR: registryDir };
 
-		const result = await runGjcGcCommand(["--prune", "--json"], base, env);
+		const result = await runGjcGcCommand(["--prune", "--json"], base, env, [harnessLeasesGcAdapter]);
 		const report = JSON.parse(result.stdout);
 		expect(report.dry_run).toBe(false);
 		const rec = report.stores.harness_leases.find((r: { id: string }) => r.id === "h-e2e");
@@ -91,7 +92,7 @@ describe("gjc gc end-to-end (default adapters)", () => {
 	test("text dry-run output names the harness store and dry-run mode", async () => {
 		const base = await makeTemp();
 		const env = { ...process.env, GJC_HARNESS_ROOT_REGISTRY_DIR: path.join(base, "reg-empty") };
-		const result = await runGjcGcCommand([], base, env);
+		const result = await runGjcGcCommand([], base, env, [harnessLeasesGcAdapter]);
 		expect(result.stdout).toContain("dry run");
 		expect(result.stdout).toContain("Harness owner leases");
 		expect(result.status).toBe(0);
