@@ -6482,6 +6482,7 @@ export class AgentSession {
 				model,
 				apiKey,
 				{
+					...this.#maintenanceProviderTransport(),
 					systemPrompt: this.#baseSystemPrompt,
 					tools: this.agent.state.tools,
 					customInstructions,
@@ -7413,6 +7414,25 @@ export class AgentSession {
 		);
 	}
 
+	/**
+	 * Transport-affinity fields forwarded into local maintenance one-shot LLM
+	 * calls (compaction, handoff, branch summary) so they reuse the live turn's
+	 * provider session state and configured WebSocket transport preference
+	 * instead of falling back to a fresh HTTP/SSE session. Mirrors the
+	 * `providerSessionId ?? sessionId` affinity the agent loop sends per turn.
+	 */
+	#maintenanceProviderTransport(): {
+		sessionId: string | undefined;
+		providerSessionState: Map<string, ProviderSessionState>;
+		preferWebsockets: boolean | undefined;
+	} {
+		return {
+			sessionId: this.agent.providerSessionId ?? this.agent.sessionId,
+			providerSessionState: this.#providerSessionState,
+			preferWebsockets: this.agent.preferWebsockets,
+		};
+	}
+
 	async #compactWithFallbackModel(
 		preparation: CompactionPreparation,
 		customInstructions: string | undefined,
@@ -7429,6 +7449,7 @@ export class AgentSession {
 			try {
 				return await compact(preparation, candidate, apiKey, customInstructions, signal, {
 					...options,
+					...this.#maintenanceProviderTransport(),
 					metadata: this.agent.metadataForProvider(candidate.provider),
 					convertToLlm,
 					telemetry,
@@ -7718,6 +7739,7 @@ export class AgentSession {
 					while (true) {
 						try {
 							compactResult = await compact(preparation, candidate, apiKey, undefined, autoCompactionSignal, {
+								...this.#maintenanceProviderTransport(),
 								promptOverride: compactionPrep.hookPrompt,
 								extraContext: compactionPrep.hookContext,
 								remoteInstructions: this.#baseSystemPrompt.join("\n\n"),
@@ -9565,6 +9587,7 @@ export class AgentSession {
 			}
 			const branchSummarySettings = this.settings.getGroup("branchSummary");
 			const result = await generateBranchSummary(entriesToSummarize, {
+				...this.#maintenanceProviderTransport(),
 				model,
 				apiKey,
 				signal: this.#branchSummaryAbortController.signal,
