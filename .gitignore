@@ -55,6 +55,7 @@ packages/ai/test/.temp-images/
 .gjc/ultragoal/
 .gjc/verification/
 .gjc/logs/
+.gjc/rlm/
 .gjc/state/
 .gjc/metrics.json
 .pi_config/
