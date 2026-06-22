@@ -497,10 +497,26 @@ export const createNotificationsExtension: ExtensionFactory = api => {
 		// stat) unless redaction is on. Best-effort + async; never blocks.
 		if (!rt.redact) {
 			const last = summaryFromMessages(event.messages, 600);
+			const usage = (
+				ctx as { getContextUsage?: () => { tokens: number | null; contextWindow: number } | undefined }
+			).getContextUsage?.();
+			const model = (ctx as { getModel?: () => { id?: string } | undefined }).getModel?.();
+			const tokenUsage =
+				usage && usage.tokens != null ? `${usage.tokens}/${usage.contextWindow}` : undefined;
+			const modelId = model?.id;
 			void readGitDiffStat(ctx.cwd).then(diff => {
-				if (!last && !diff) return;
+				if (!last && !diff && !tokenUsage && !modelId) return;
 				try {
-					rt.server.pushFrame(JSON.stringify({ type: "context_update", sessionId: id, lastMessage: last, diff }));
+					rt.server.pushFrame(
+						JSON.stringify({
+							type: "context_update",
+							sessionId: id,
+							lastMessage: last,
+							tokenUsage,
+							model: modelId,
+							diff,
+						}),
+					);
 				} catch (e) {
 					logger.warn(`notifications: context_update failed: ${String(e)}`);
 				}
