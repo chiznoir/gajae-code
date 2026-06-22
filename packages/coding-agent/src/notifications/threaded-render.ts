@@ -10,6 +10,15 @@
  */
 
 import { truncate } from "./helpers";
+import {
+	bold,
+	code,
+	escapeHtml,
+	finalizeTelegramHtml,
+	italic,
+	markdownToTelegramHtml,
+	pre,
+} from "./html-format";
 import type { RateLimitLane } from "./rate-limit-pool";
 
 /** A Telegram send derived from a threaded frame (topic id is applied by the daemon). */
@@ -72,28 +81,28 @@ export function formatIdentityHeader(frame: {
 }): string {
 	const title = str(frame.title) ?? "GJC session";
 	const bullets = [
-		`• repo: ${str(frame.repo) ?? "?"}`,
-		`• branch: ${str(frame.branch) ?? "?"}`,
-		`• machine: ${str(frame.machine) ?? "?"}`,
-		`• session: ${str(frame.sessionId) ?? "?"}`,
+		`• repo: ${code(str(frame.repo) ?? "?")}`,
+		`• branch: ${code(str(frame.branch) ?? "?")}`,
+		`• machine: ${code(str(frame.machine) ?? "?")}`,
+		`• session: ${code(str(frame.sessionId) ?? "?")}`,
 	];
-	return `${title}\n${bullets.join("\n")}`;
+	return `${bold(title)}\n${bullets.join("\n")}`;
 }
 
 /** Format a streamed context update into a compact block (omitting empty fields). */
 export function formatContextUpdate(frame: ThreadedFrame): string | undefined {
 	const lines: string[] = [];
 	const last = str(frame.lastMessage);
-	if (last) lines.push(truncate(last, 600));
+	if (last) lines.push(escapeHtml(truncate(last, 600)));
 	const task = str(frame.task);
-	if (task) lines.push(`task: ${task}`);
+	if (task) lines.push(`${italic("task:")} ${escapeHtml(task)}`);
 	const goal = str(frame.goal);
-	if (goal) lines.push(`goal: ${goal}`);
+	if (goal) lines.push(`${italic("goal:")} ${escapeHtml(goal)}`);
 	const usage = str(frame.tokenUsage);
 	const model = str(frame.model);
-	if (usage || model) lines.push(`ctx: ${[usage, model].filter(Boolean).join(" · ")}`);
+	if (usage || model) lines.push(`ctx: ${code([usage, model].filter(Boolean).join(" · "))}`);
 	const diff = str(frame.diff);
-	if (diff) lines.push(`diff:\n${truncate(diff, 1200)}`);
+	if (diff) lines.push(`diff:\n${pre(truncate(diff, 1200))}`);
 	return lines.length ? lines.join("\n") : undefined;
 }
 
@@ -104,16 +113,22 @@ export function formatContextUpdate(frame: ThreadedFrame): string | undefined {
 export function renderThreadedFrame(frame: ThreadedFrame): ThreadedSend | undefined {
 	switch (frame.type) {
 		case "identity_header":
-			return { method: "sendMessage", lane: "finalized", text: formatIdentityHeader(frame), identity: true };
+			return {
+				method: "sendMessage",
+				lane: "finalized",
+				text: finalizeTelegramHtml(formatIdentityHeader(frame)),
+				identity: true,
+			};
 		case "context_update": {
-			const text = formatContextUpdate(frame);
+			const text = finalizeTelegramHtml(formatContextUpdate(frame));
 			return text
 				? { method: "sendMessage", lane: "live", text, coalesceKey: `ctx:${str(frame.sessionId) ?? ""}` }
 				: undefined;
 		}
 		case "turn_stream": {
-			const text = str(frame.text);
-			if (!text) return undefined;
+			const raw = str(frame.text);
+			if (!raw) return undefined;
+			const text = finalizeTelegramHtml(markdownToTelegramHtml(raw));
 			const finalized = frame.phase === "finalized";
 			return {
 				method: "sendMessage",
@@ -125,19 +140,22 @@ export function renderThreadedFrame(frame: ThreadedFrame): ThreadedSend | undefi
 		case "image_attachment": {
 			const data = str(frame.data);
 			if (!data) return undefined;
+			const caption = str(frame.caption);
 			return {
 				method: "sendPhoto",
 				lane: "finalized",
 				photoBase64: data,
 				mime: str(frame.mime),
-				text: str(frame.caption),
+				text: finalizeTelegramHtml(caption === undefined ? undefined : escapeHtml(caption)),
 			};
 		}
 		case "config_update": {
 			const verbosity = str(frame.verbosity);
 			const redact = typeof frame.redact === "boolean" ? `redact ${frame.redact ? "on" : "off"}` : undefined;
 			const parts = [verbosity ? `verbosity ${verbosity}` : undefined, redact].filter(Boolean);
-			return parts.length ? { method: "sendMessage", lane: "idle", text: `⚙ ${parts.join(", ")}` } : undefined;
+			return parts.length
+				? { method: "sendMessage", lane: "idle", text: finalizeTelegramHtml(`⚙ ${escapeHtml(parts.join(", "))}`) }
+				: undefined;
 		}
 		default:
 			return undefined;

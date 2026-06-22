@@ -1,0 +1,267 @@
+/**
+ * Telegram HTML formatting helpers for the notifications SDK.
+ *
+ * All notifications-SDK Telegram output is sent with `parse_mode: "HTML"`. This
+ * module is the single source of truth for: escaping dynamic text, converting a
+ * bounded markdown subset into Telegram HTML, safely truncating a finished
+ * message to Telegram's 4096-char limit without breaking tags/entities, and
+ * laying out inline-keyboard buttons as a numbered grid.
+ *
+ * Discipline: escape first, tag second. Telegram only parses a small tag set
+ * (b, i, u, s, code, pre, a, blockquote, tg-spoiler); a stray `<` or unbalanced
+ * tag can make Telegram reject the whole message, so dynamic text is always
+ * escaped before any tag is emitted.
+ */
+
+export const TELEGRAM_PARSE_MODE = "HTML" as const;
+export const TELEGRAM_MESSAGE_LIMIT = 4096;
+
+/** Tags Telegram parses in HTML mode (used by the truncation guard). */
+const ALLOWED_TAGS = new Set(["b", "i", "u", "s", "code", "pre", "a", "blockquote", "tg-spoiler"]);
+
+/** Escape text for Telegram HTML body content (`& < >`). */
+export function escapeHtml(value: string): string {
+	return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+/** Escape a value for use inside a double-quoted HTML attribute. */
+function escapeAttr(value: string): string {
+	return escapeHtml(value).replace(/"/g, "&quot;");
+}
+
+/** Wrap already-escaped text in a Telegram tag. */
+function tag(name: string, escaped: string): string {
+	return `<${name}>${escaped}</${name}>`;
+}
+
+/** Bold the given raw text (escaped internally). */
+export function bold(raw: string): string {
+	return tag("b", escapeHtml(raw));
+}
+
+/** Italicize the given raw text (escaped internally). */
+export function italic(raw: string): string {
+	return tag("i", escapeHtml(raw));
+}
+
+/** Render the given raw text as inline code (escaped internally). */
+export function code(raw: string): string {
+	return tag("code", escapeHtml(raw));
+}
+
+/** Render the given raw text as a preformatted block (escaped internally). */
+export function pre(raw: string): string {
+	return tag("pre", escapeHtml(raw));
+}
+
+const PLACEHOLDER_PREFIX = "\u0000ph";
+const PLACEHOLDER_SUFFIX = "\u0000";
+
+/** Only http(s) and mailto links are emitted; anything else stays literal. */
+function isSafeUrl(url: string): boolean {
+	return /^(https?:\/\/|mailto:)/i.test(url);
+}
+
+/**
+ * Convert a bounded markdown subset into Telegram HTML. Supported: fenced code,
+ * inline code, `**bold**`, `*italic*`, `[text](url)` (safe schemes only),
+ * `#` headers, and `>` blockquotes. Unsupported or malformed markdown is left as
+ * escaped literal text — never emitted as unbalanced tags.
+ */
+export function markdownToTelegramHtml(markdown: string): string {
+	const placeholders: string[] = [];
+	const stash = (html: string): string => {
+		const token = `${PLACEHOLDER_PREFIX}${placeholders.length}${PLACEHOLDER_SUFFIX}`;
+		placeholders.push(html);
+		return token;
+	};
+
+	let text = markdown;
+
+	// 1. Fenced code blocks (protect literal content before any other transform).
+	text = text.replace(/```[^\n]*\n?([\s\S]*?)```/g, (_m, body: string) => stash(pre(body)));
+
+	// 2. Inline code.
+	text = text.replace(/`([^`\n]+)`/g, (_m, body: string) => stash(code(body)));
+
+	// 3. Links (capture raw URL before escaping). Unsafe/malformed links stay literal.
+	text = text.replace(/\[([^\]\n]+)\]\(([^)\s]+)\)/g, (whole, label: string, url: string) => {
+		if (!isSafeUrl(url)) return whole;
+		return stash(`<a href="${escapeAttr(url)}">${escapeHtml(label)}</a>`);
+	});
+
+	// 4. Escape everything that remains (placeholders contain no escapable chars).
+	text = escapeHtml(text);
+
+	// 5. Line-level transforms on escaped text: headers and merged blockquotes.
+	const lines = text.split("\n");
+	const out: string[] = [];
+	let quoteBuffer: string[] | null = null;
+	const flushQuote = () => {
+		if (quoteBuffer) {
+			out.push(tag("blockquote", quoteBuffer.join("\n")));
+			quoteBuffer = null;
+		}
+	};
+	for (const line of lines) {
+		const quote = /^&gt;\s?(.*)$/.exec(line);
+		if (quote) {
+			(quoteBuffer ??= []).push(quote[1] ?? "");
+			continue;
+		}
+		flushQuote();
+		const header = /^(#{1,6})\s+(.*)$/.exec(line);
+		out.push(header ? tag("b", header[2] ?? "") : line);
+	}
+	flushQuote();
+	text = out.join("\n");
+
+	// 6. Inline emphasis (bold before italic; unbalanced markers stay literal).
+	text = text.replace(/\*\*([^*\n]+)\*\*/g, (_m, body: string) => tag("b", body));
+	text = text.replace(/\*([^*\n]+)\*/g, (_m, body: string) => tag("i", body));
+
+	// 7. Restore protected placeholders.
+	text = text.replace(new RegExp(`${PLACEHOLDER_PREFIX}(\\d+)${PLACEHOLDER_SUFFIX}`, "g"), (_m, i: string) =>
+		placeholders[Number(i)] ?? "",
+	);
+
+	return text;
+}
+
+interface Token {
+	value: string;
+	/** Tag name if this token opens a tag, else undefined. */
+	open?: string;
+	/** Tag name if this token closes a tag, else undefined. */
+	close?: string;
+}
+
+/** Tokenize HTML into tags, entities, and single characters (never splits them). */
+function tokenize(html: string): Token[] {
+	const tokens: Token[] = [];
+	let i = 0;
+	while (i < html.length) {
+		const ch = html[i]!;
+		if (ch === "<") {
+			const end = html.indexOf(">", i);
+			if (end !== -1) {
+				const raw = html.slice(i, end + 1);
+				const close = /^<\/([a-z-]+)>$/i.exec(raw);
+				const openMatch = /^<([a-z-]+)(?:\s[^>]*)?>$/i.exec(raw);
+				const token: Token = { value: raw };
+				if (close && ALLOWED_TAGS.has(close[1]!.toLowerCase())) token.close = close[1]!.toLowerCase();
+				else if (openMatch && ALLOWED_TAGS.has(openMatch[1]!.toLowerCase())) token.open = openMatch[1]!.toLowerCase();
+				tokens.push(token);
+				i = end + 1;
+				continue;
+			}
+		}
+		if (ch === "&") {
+			const end = html.indexOf(";", i);
+			if (end !== -1 && end - i <= 10) {
+				tokens.push({ value: html.slice(i, end + 1) });
+				i = end + 1;
+				continue;
+			}
+		}
+		tokens.push({ value: ch });
+		i++;
+	}
+	return tokens;
+}
+
+/**
+ * Truncate a finished Telegram HTML message to at most `max` chars without
+ * splitting a tag or entity, closing any still-open allowed tags and appending
+ * `marker`. The final string is guaranteed to be <= `max`.
+ */
+export function truncateTelegramHtml(
+	message: string,
+	max = TELEGRAM_MESSAGE_LIMIT,
+	marker = "… [truncated]",
+): string {
+	if (message.length <= max) return message;
+
+	// When `max` is too small to even hold the marker, drop it so the hard
+	// length guarantee (output.length <= max) still holds.
+	const effectiveMarker = marker.length <= max ? marker : "";
+
+	const tokens = tokenize(message);
+	const stack: string[] = [];
+	let out = "";
+
+	const closersFor = (s: string[]): string => s.map(t => `</${t}>`).reverse().join("");
+
+	for (const token of tokens) {
+		// Simulate accepting this token, then ensure we can still close + mark.
+		const nextStack = [...stack];
+		if (token.open) nextStack.push(token.open);
+		else if (token.close) {
+			const idx = nextStack.lastIndexOf(token.close);
+			if (idx !== -1) nextStack.splice(idx, 1);
+		}
+		const projected = out.length + token.value.length + closersFor(nextStack).length + effectiveMarker.length;
+		if (projected > max) break;
+		out += token.value;
+		if (token.open) stack.push(token.open);
+		else if (token.close) {
+			const idx = stack.lastIndexOf(token.close);
+			if (idx !== -1) stack.splice(idx, 1);
+		}
+	}
+
+	return out + closersFor(stack) + effectiveMarker;
+}
+
+/** Finalize an optional message: undefined passthrough, else safe-truncate. */
+export function finalizeTelegramHtml(message?: string): string | undefined {
+	if (message === undefined) return undefined;
+	return truncateTelegramHtml(message);
+}
+
+/** One-based, plain-text button label (Telegram does not parse HTML in labels). */
+export function buttonLabel(label: string, index: number): string {
+	return `${index + 1}. ${label}`;
+}
+
+export interface InlineButton {
+	text: string;
+	callback_data: string;
+}
+
+/** A prefixed button label is "long" when it is wide or contains a newline. */
+function isLongLabel(label: string): boolean {
+	return label.length > 18 || /[\r\n]/.test(label);
+}
+
+/**
+ * Lay out option labels as a numbered button grid. Long buttons take a
+ * full-width row; runs of short buttons are packed into rows of up to 3. The
+ * callback value comes from `callbackForIndex(i)` using the original zero-based
+ * option index — layout never changes callback semantics.
+ */
+export function buildButtonGrid(
+	labels: string[],
+	callbackForIndex: (index: number) => string,
+): InlineButton[][] {
+	const rows: InlineButton[][] = [];
+	let run: InlineButton[] = [];
+	const flush = () => {
+		if (run.length) {
+			rows.push(run);
+			run = [];
+		}
+	};
+	labels.forEach((label, i) => {
+		const button: InlineButton = { text: buttonLabel(label, i), callback_data: callbackForIndex(i) };
+		if (isLongLabel(button.text)) {
+			flush();
+			rows.push([button]);
+			return;
+		}
+		run.push(button);
+		if (run.length === 3) flush();
+	});
+	flush();
+	return rows;
+}

@@ -14,11 +14,11 @@ describe("renderThreadedFrame", () => {
 		expect(send?.method).toBe("sendMessage");
 		expect(send?.identity).toBe(true);
 		expect(send?.lane).toBe("finalized");
-		expect(send?.text).toContain("Rebuild notifications");
-		expect(send?.text).toContain("• repo: gajae-code");
-		expect(send?.text).toContain("• branch: feat/notification-surface");
-		expect(send?.text).toContain("• machine: mac-studio");
-		expect(send?.text).toContain("• session: sess-1");
+		expect(send?.text).toContain("<b>Rebuild notifications</b>");
+		expect(send?.text).toContain("• repo: <code>gajae-code</code>");
+		expect(send?.text).toContain("• branch: <code>feat/notification-surface</code>");
+		expect(send?.text).toContain("• machine: <code>mac-studio</code>");
+		expect(send?.text).toContain("• session: <code>sess-1</code>");
 	});
 
 	test("finalized turn_stream is finalized lane with no coalesce key", () => {
@@ -49,7 +49,7 @@ describe("renderThreadedFrame", () => {
 		});
 		expect(send?.lane).toBe("live");
 		expect(send?.coalesceKey).toBe("ctx:s");
-		expect(send?.text).toContain("ctx: 12k/200k · opus");
+		expect(send?.text).toContain("ctx: <code>12k/200k · opus</code>");
 	});
 
 	test("image_attachment renders a sendPhoto with caption", () => {
@@ -87,6 +87,6 @@ describe("renderThreadedFrame", () => {
 	});
 
 	test("formatIdentityHeader tolerates missing fields", () => {
-		expect(formatIdentityHeader({ sessionId: "s" })).toContain("• repo: ?");
+		expect(formatIdentityHeader({ sessionId: "s" })).toContain("• repo: <code>?</code>");
 	});
 });

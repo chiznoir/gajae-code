@@ -6,6 +6,7 @@ import type { Settings } from "../config/settings";
 import { getNotificationConfig, isGloballyConfigured, tokenFingerprint } from "./config";
 import { parseInThreadConfigCommand } from "./config-commands";
 import { RateLimitPool } from "./rate-limit-pool";
+import { buildButtonGrid, TELEGRAM_PARSE_MODE } from "./html-format";
 import {
 	type AliasTable,
 	buildActionMessage,
@@ -411,11 +412,13 @@ export class TelegramNotificationDaemon {
 						photo: string;
 						mime?: string;
 						caption?: string;
+						parse_mode?: string;
 					};
 					const form = new FormData();
 					form.set("chat_id", String(b.chat_id));
 					if (b.message_thread_id !== undefined) form.set("message_thread_id", String(b.message_thread_id));
 					if (b.caption) form.set("caption", b.caption);
+					if (b.parse_mode) form.set("parse_mode", String(b.parse_mode));
 					form.set("photo", new Blob([Buffer.from(b.photo, "base64")], { type: b.mime ?? "image/png" }), "image");
 					const res = await fetchImpl(url, { method: "POST", body: form });
 					return res.json();
@@ -555,12 +558,14 @@ export class TelegramNotificationDaemon {
 						photo: send.photoBase64,
 						mime: send.mime,
 						caption: send.text,
+						parse_mode: TELEGRAM_PARSE_MODE,
 					});
 				} else if (send.text) {
 					await this.botApi.call("sendMessage", {
 						chat_id: this.opts.chatId,
 						message_thread_id: thread,
 						text: send.text,
+						parse_mode: TELEGRAM_PARSE_MODE,
 					});
 				}
 			} catch {
@@ -642,16 +647,16 @@ export class TelegramNotificationDaemon {
 				summary: msg.summary,
 			});
 			const options = Array.isArray(msg.options) ? msg.options : [];
-			const inline_keyboard = options.map((label: string, i: number) => [
-				{
-					text: label,
-					callback_data: this.aliasTable.put({ sessionId: session.sessionId, actionId: msg.id, answer: i }),
-				},
-			]);
+			// Daemon keyboards MUST use alias callback data (not reference encodeCallbackData).
+			// Labels show one-based numbers; the stored alias answer stays zero-based.
+			const inline_keyboard = buildButtonGrid(options, (i: number) =>
+				this.aliasTable.put({ sessionId: session.sessionId, actionId: msg.id, answer: i }),
+			);
 			const result = (await this.botApi.call("sendMessage", {
 				chat_id: this.opts.chatId,
 				message_thread_id: Number(topicId),
 				text: rendered.text,
+				parse_mode: TELEGRAM_PARSE_MODE,
 				...(inline_keyboard.length ? { reply_markup: { inline_keyboard } } : {}),
 			})) as { result?: { message_id?: number } };
 			const messageId = result.result?.message_id;
@@ -683,6 +688,7 @@ export class TelegramNotificationDaemon {
 		await this.botApi.call("sendMessage", {
 			chat_id: this.opts.chatId,
 			text: "This button is stale after notification daemon restart. Please answer locally in the GJC session or wait for a fresh notification.",
+			parse_mode: TELEGRAM_PARSE_MODE,
 		});
 	}
 

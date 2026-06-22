@@ -15,6 +15,13 @@
  */
 
 import * as fs from "node:fs";
+import {
+	bold,
+	buildButtonGrid,
+	escapeHtml,
+	TELEGRAM_PARSE_MODE,
+	truncateTelegramHtml,
+} from "./html-format";
 import { renderThreadedFrame } from "./threaded-render";
 
 /** One inline-keyboard button. */
@@ -122,15 +129,14 @@ export function buildActionMessage(action: {
 	summary?: string;
 }): RenderedMessage {
 	if (action.kind === "idle") {
-		return { text: action.summary ? `🟢 Agent idle\n${action.summary}` : "🟢 Agent idle" };
+		const text = action.summary ? `🟢 Agent idle\n${escapeHtml(action.summary)}` : "🟢 Agent idle";
+		return { text: truncateTelegramHtml(text) };
 	}
-	const text = `❓ ${action.question ?? "Question"}`;
+	const text = `❓ ${bold(action.question ?? "Question")}`;
 	const options = action.options ?? [];
-	if (options.length === 0) return { text: `${text}\n\n(reply with text)` };
-	const inline_keyboard = options.map((label, i) => [
-		{ text: label, callback_data: encodeCallbackData(action.id, i) },
-	]);
-	return { text, inline_keyboard };
+	if (options.length === 0) return { text: truncateTelegramHtml(`${text}\n\n(reply with text)`) };
+	const inline_keyboard = buildButtonGrid(options, i => encodeCallbackData(action.id, i));
+	return { text: truncateTelegramHtml(text), inline_keyboard };
 }
 
 /** A protocol `reply` frame the client should send to the server. */
@@ -296,6 +302,7 @@ export async function runTelegramReferenceClient(opts: TelegramReferenceOptions)
 			void send("sendMessage", {
 				chat_id: opts.chatId,
 				text: rendered.text,
+				parse_mode: TELEGRAM_PARSE_MODE,
 				...(rendered.inline_keyboard ? { reply_markup: { inline_keyboard: rendered.inline_keyboard } } : {}),
 			});
 		} else if (msg.type === "action_resolved" && msg.id === latestPendingAskId) {
@@ -306,7 +313,7 @@ export async function runTelegramReferenceClient(opts: TelegramReferenceOptions)
 			// session's forum topic; this reference shows the minimal handling.
 			const threaded = renderThreadedFrame(msg as never);
 			if (threaded?.text) {
-				void send("sendMessage", { chat_id: opts.chatId, text: threaded.text });
+				void send("sendMessage", { chat_id: opts.chatId, text: threaded.text, parse_mode: TELEGRAM_PARSE_MODE });
 			}
 		}
 	});
