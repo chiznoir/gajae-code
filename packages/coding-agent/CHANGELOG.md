@@ -4,9 +4,12 @@
 ### Added
 
 - Added a keyless `insane` web search provider that safely ports upstream insane-search public-route fallbacks without TLS impersonation, browser/cookie bypasses, credential storage, or auto-installed dependencies (#1011).
+
+## [0.7.1] - 2026-06-23
 ### Fixed
 
 - Fixed packaged source installs (`gajae-code` wrapper) failing `gjc --smoke-test` because native smoke/fallback imports used monorepo-relative paths instead of the `@gajae-code/natives` package export.
+- Fixed Telegram/notification turn ordering around pending asks: the assistant's lead-in text is now emitted before the ask prompt, and only the assistant `message_end` is captured as the pre-ask turn text, so remote prompts show the correct context instead of stale or duplicated output (#1006, #1007).
 
 ## [0.7.0] - 2026-06-22
 
