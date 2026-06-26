@@ -1269,6 +1269,12 @@ export class TelegramNotificationDaemon {
 					);
 				} catch {}
 			}
+			// Eagerly create the session's Telegram topic as soon as it connects, so
+			// a thread exists the moment a notifications-enabled session is live —
+			// not lazily on the first delivered frame (which only arrives once the
+			// user sends a prompt). A provisional "GJC <id>" name is used; the
+			// identity_header frame renames it to "{repo}/{branch} - {title}" later.
+			void this.ensureTopic(sessionId, this.topicNameFor(sessionId, {})).catch(() => undefined);
 		});
 		ws.addEventListener("message", ev => {
 			// Identity guard: a delayed frame from a superseded socket must not act
@@ -1434,8 +1440,12 @@ export class TelegramNotificationDaemon {
 					return String(tid);
 				},
 				this.opts.now,
+				// The create winner records the name it actually used; callers that
+				// merely JOIN an in-flight create must not overwrite it locally, or a
+				// later identity rename would be wrongly skipped (topic stuck at the
+				// provisional name on Telegram).
+				name,
 			);
-			this.topics.applyName(sessionId, name);
 			await this.persistTopics();
 			return rec.topicId;
 		} catch {
