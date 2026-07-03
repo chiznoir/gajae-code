@@ -29,6 +29,8 @@ interface PromptActionAutocompleteOptions {
 	copyCurrentLine: () => void;
 	copyPrompt: () => void;
 	pasteImage: () => void;
+	newSession: () => void;
+	showHelp: () => void;
 	scrollTmuxToPreviousUserInput: () => void;
 	undo: (prefix: string) => void;
 	moveCursorToMessageEnd: () => void;
@@ -101,6 +103,12 @@ function mergeAutocompleteSuggestions(
 
 	return { items, prefix: primary.prefix };
 }
+const ADVANCED_SLASH_COMMAND_PRIORITIES = new Map<string, number>([["grok-build-usage", -100]]);
+
+function getSlashCommandPriority(command: SlashCommand | undefined, item: AutocompleteItem): number {
+	if (command?.priority !== undefined) return command.priority;
+	return ADVANCED_SLASH_COMMAND_PRIORITIES.get(item.value) ?? 0;
+}
 
 function sortSlashCommandSuggestions(
 	suggestions: { items: AutocompleteItem[]; prefix: string } | null,
@@ -123,7 +131,7 @@ function sortSlashCommandSuggestions(
 				index,
 				commandIndex,
 				matchRank: getSlashCommandMatchRank(query, lowerName),
-				priority: command?.priority ?? 0,
+				priority: getSlashCommandPriority(command, item),
 				score: Math.max(nameScore, descScore),
 			};
 		})
@@ -358,6 +366,20 @@ export function createPromptActionAutocompleteProvider(
 ): PromptActionAutocompleteProvider {
 	const editorKeybindings = getKeybindings();
 	const actions: PromptActionDefinition[] = [
+		{
+			id: "new-session",
+			label: "Start new session",
+			description: formatKeyHints(options.keybindings.getKeys("app.session.new")) || "/new",
+			keywords: ["new", "session", "fresh", "clear", "start", "conversation"],
+			execute: options.newSession,
+		},
+		{
+			id: "help",
+			label: "Open command help",
+			description: "/help",
+			keywords: ["help", "commands", "command", "palette", "shortcuts", "beginner"],
+			execute: options.showHelp,
+		},
 		{
 			id: "copy-line",
 			label: "Copy current line",

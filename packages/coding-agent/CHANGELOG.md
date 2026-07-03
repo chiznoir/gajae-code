@@ -1,6 +1,28 @@
 # Changelog
 
 ## [Unreleased]
+### Fixed
+
+- Native Windows terminals now default `app.message.queue` to `Alt+Q` instead of `Alt+Enter`, avoiding the Windows Terminal fullscreen shortcut conflict (#1422).
+- Coordinator MCP tmux prompt delivery now submits with tmux `Enter` instead of `C-m`, while preserving runtime prompt-ack/`turn_start` as the delivery success gate (#1409).
+- The session-close resume hint now prints the `gjc --resume <id>` command on its own line so it can be selected and copied without the surrounding prose.
+- Coordinator MCP tmux prompt delivery now uses a paste buffer for prompt text before submitting with `Enter`, preserving multiline delegated `/skill:*` prompt separators that `send-keys -l` could flatten into an unstarted visible prompt (#1416).
+
+- `/retry` now resumes sessions left with an interrupted user/custom/tool-result tail after a crash or power loss, and recovers unresolved assistant tool-use tails instead of reporting "Nothing to retry".
+- Queued prompt shortcuts now keep working during auto context-full compaction: Tab/Alt+Enter queue text immediately, `/skill:*` entries replay through the skill invocation path after compaction, and Alt+Up restores only the newest queued prompt for editing instead of merging the full queue.
+- Skill prompt cards now size their collapsed arguments preview to the current terminal width instead of wrapping at a fixed narrow column.
+- `gjc update` now refreshes opted-in on-disk default workflow skill copies (written by `gjc setup defaults` under the agent dir) after a successful update, so they no longer stay stale relative to the embedded defaults; copies that were never installed are left absent.
+- `gjc migrate` skill imports now tolerate project or agent directories reached through macOS system symlinks such as `/var` while still rejecting symlinked destination skill directories, so local dry-run/live parity tests no longer fail on Darwin temp paths.
+- cmux workspace auto-renames now include a `GJC: ` prefix so renamed workspaces remain identifiable as GJC sessions.
+- The cmux workspace auto-rename is now ownership-guarded: GJC reads the current workspace title via `cmux workspace list` and only renames a workspace that still has its default title, so it no longer overwrites a user-pinned workspace name or thrash a shared workspace title across multiple sessions running under the same `CMUX_WORKSPACE_ID`. Opt out with `GJC_NO_CMUX_RENAME`.
+- `gjc --tmux --resume` now reaches the session picker/resume target instead of auto-attaching a same-branch managed tmux session before the inner resume resolver runs.
+- `gjc --tmux` now preserves a newly created managed tmux session when `attach-session` exits after the parent SSH/PTY closes but the tmux server still reports the session live, so closing a Windows Terminal tab no longer kills the Mac host session before reattach.
+- Managed `gjc --tmux` launches now size the inner tmux window to the caller terminal minus inherited tmux status lines, preventing the bottom of the GJC input from being clipped when the user's tmux status bar is visible.
+- Managed `gjc --tmux` launches no longer pin the initial window to `manual` sizing on native tmux. The pre-attach reassert used `resize-window`, which flips the window's `window-size` option to `manual` and stops `attach-session` from resizing the window to the real terminal; when the attaching terminal was larger than the capture-time size, tmux left a smaller-than-client window and painted the uncovered area with `·` fill. The window now stays on `window-size latest` so it tracks the attaching client (psmux keeps the explicit `resize-window` reassert).
+
+### Changed
+
+- `web_search` latency overhaul: provider hard timeouts are now class-based (pure search APIs 15s, LLM-mediated providers 120s, Kimi 35s aligned to its upstream 30s budget, replacing the uniform 300s ceiling; an explicitly configured `web_search.timeout` still overrides — the schema default no longer reinstalls 300s), DuckDuckGo is fired as a background hedge 3s into a slower primary so a failing primary falls back to an already-settled result, the Gemini 429/5xx retry-delay budget dropped from 5 minutes to 30 seconds, resolved provider chains are cached per AuthStorage for 60s keyed on the credential generation (availability probes skipped on repeat searches; login/logout invalidates immediately), and `WebSearchTool` prewarms the chain at construction. Measured: hung-primary fallback 301s → 15s, slow-failing-primary fallback ~7s → 6s, repeat chain resolution ~26ms → ~0.01ms.
 
 ## [0.7.10] - 2026-07-02
 ### Added
@@ -13,6 +35,7 @@
 
 - Deep Interview option-clarification prompts now stay out of the interview transcript and ambiguity recorder, so asking about displayed choices no longer persists as the round answer before the user selects an actual option.
 - `gjc daemon reload telegram` now spawns the replacement daemon with a stable owner pid so the new daemon does not exit immediately after the short-lived reload CLI process ends.
+- Ralplan role agents can now persist Planner/Architect/Critic artifacts through a sanctioned `GJC_RALPLAN_ARTIFACT` env handoff (`--artifact-env GJC_RALPLAN_ARTIFACT`), avoiding restricted-bash failures on markdown containing quotes, backslashes, shell-expansion characters, or command-substitution syntax.
 - Managed `gjc --tmux` launches now size the initial window correctly (#1376).
 - Coordinator tmux-delivered turns now submit correctly on Enter (#1372).
 - Generic long `retry-after` rate limits are now kept retryable instead of being treated as fatal (#1370).

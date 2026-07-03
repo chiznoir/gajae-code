@@ -235,7 +235,7 @@ providers:
 
 ### Interactive `--tmux` startup and scroll/mouse profile
 
-`gjc --tmux` launches the interactive TUI inside a fresh GJC-managed tmux session. Plain `gjc --tmux` does not auto-attach a scoped managed session from the same project/branch; use an explicit resume path such as `gjc --tmux --continue`, `gjc --tmux --resume`, or `gjc session attach <session>` when you intend to continue existing tmux context. Older-version sessions are not auto-attached after upgrades. When GJC creates a session it applies a profile that is **scoped to the GJC session only** (it never runs `set -g` / global tmux options), including:
+`gjc --tmux` launches the interactive TUI inside a fresh GJC-managed tmux session. Plain `gjc --tmux` does not auto-attach a scoped managed session from the same project/branch; use `gjc --tmux --continue` or `gjc session attach <session>` when you intend to continue existing tmux context. `gjc --tmux --resume` still reaches the inner GJC session resolver, so value-less resume shows the session picker and `--resume <id>` honors that target instead of reusing a branch tmux session. Older-version sessions are not auto-attached after upgrades. When GJC creates a session it applies a profile that is **scoped to the GJC session only** (it never runs `set -g` / global tmux options), including:
 
 - `mouse on` — enables mouse-wheel scrolling into tmux copy-mode (history/scrollback).
 - `set-clipboard on` and a readable copy-mode `mode-style`.
@@ -444,6 +444,7 @@ Extra conditional behavior:
 | `GJC_SLOW_MODEL`              | Ephemeral model-role override for `slow` (CLI `--slow` takes precedence)                           |
 | `GJC_PLAN_MODEL`              | Ephemeral model-role override for `plan` (CLI `--plan` takes precedence)                           |
 | `GJC_NO_TITLE`                | If set (any non-empty value), disables auto session title generation on first user message         |
+| `GJC_NO_CMUX_RENAME`         | If set (any non-empty value), disables renaming the containing cmux workspace to the current session name |
 | `NULL_PROMPT`                | If `true`, system prompt builder returns empty string                                              |
 | `GJC_BLOCKED_AGENT`           | Blocks a specific subagent type in task tool                                                       |
 | `GJC_SUBPROCESS_CMD`          | Overrides subagent spawn command (`gjc` / `gjc.cmd` resolution bypass)                             |

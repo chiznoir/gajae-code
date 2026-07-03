@@ -156,6 +156,8 @@ export class InputController {
 		this.ctx.editor.onSuspend = () => this.handleCtrlZ();
 		this.ctx.editor.setActionKeys("app.thinking.cycle", this.ctx.keybindings.getKeys("app.thinking.cycle"));
 		this.ctx.editor.onCycleThinkingLevel = () => this.cycleThinkingLevel();
+		this.ctx.editor.setActionKeys("app.commandPalette.open", this.ctx.keybindings.getKeys("app.commandPalette.open"));
+		this.ctx.editor.onOpenCommandPalette = () => this.openCommandPalette();
 		this.ctx.editor.setActionKeys("app.model.cycleForward", this.ctx.keybindings.getKeys("app.model.cycleForward"));
 		this.ctx.editor.onCycleModelForward = () => this.cycleRoleModel();
 		this.ctx.editor.setActionKeys("app.model.cycleBackward", this.ctx.keybindings.getKeys("app.model.cycleBackward"));
@@ -201,7 +203,7 @@ export class InputController {
 		this.ctx.editor.setActionKeys("app.message.queue", this.ctx.keybindings.getKeys("app.message.queue"));
 		this.ctx.editor.onQueue = () => void this.handleQueueSubmit();
 		this.ctx.editor.onTabDeclined = () => {
-			if (this.ctx.session.isStreaming) void this.handleQueueSubmit();
+			if (this.ctx.session.isStreaming || this.ctx.session.isCompacting) void this.handleQueueSubmit();
 		};
 
 		this.ctx.editor.clearCustomKeyHandlers();
@@ -492,7 +494,7 @@ export class InputController {
 	}
 
 	handleDequeue(): void {
-		const restored = this.restoreQueuedMessagesToEditor();
+		const restored = this.restoreLatestQueuedMessageToEditor();
 		if (restored === 0) {
 			this.ctx.showStatus("No queued messages to restore");
 		} else {
@@ -603,13 +605,15 @@ export class InputController {
 		const text = this.ctx.editor.getText().trim();
 		if (!text) return;
 
-		// Compaction first: while compacting, free text gets queued via
-		// `queueCompactionMessage`, and `/skill:*` rides the same queue so a
-		// skill typed during compaction is not lost or short-circuited through
-		// `promptCustomMessage`. The skill text is queued verbatim; whether
-		// the queued entry is later re-parsed into a skill invocation is a
-		// separate concern owned by the compaction-resume path.
+		// Compaction first: while compacting, queue free text and `/skill:*`
+		// commands in the compaction-local queue. `flushCompactionQueue`
+		// replays skill entries through the custom-message skill path after
+		// compaction finishes so they are not degraded into plain prompts.
 		if (this.ctx.session.isCompacting) {
+			if (this.ctx.pendingImages.length > 0) {
+				this.ctx.showStatus("Compaction in progress. Retry after it completes to send images.");
+				return;
+			}
 			this.ctx.queueCompactionMessage(text, "followUp");
 			return;
 		}
@@ -643,10 +647,28 @@ export class InputController {
 		return this.handleFollowUp();
 	}
 
+	restoreLatestQueuedMessageToEditor(options?: { currentText?: string }): number {
+		const compactionQueued = this.ctx.compactionQueuedMessages.pop();
+		const queuedText = compactionQueued?.text ?? this.ctx.session.popLastQueuedMessage();
+		if (!queuedText) {
+			this.ctx.updatePendingMessagesDisplay();
+			return 0;
+		}
+
+		this.ctx.locallySubmittedUserSignatures.delete(`${queuedText}\u00000`);
+		const currentText = options?.currentText ?? this.ctx.editor.getText();
+		const combinedText = [queuedText, currentText].filter(t => t.trim()).join("\n\n");
+		this.ctx.editor.setText(combinedText);
+		this.ctx.updatePendingMessagesDisplay();
+		return 1;
+	}
+
 	restoreQueuedMessagesToEditor(options?: { abort?: boolean; currentText?: string }): number {
 		this.ctx.locallySubmittedUserSignatures.clear();
 		const { steering, followUp } = this.ctx.session.clearQueue();
-		const allQueued = [...steering, ...followUp];
+		const compactionQueued = (this.ctx.compactionQueuedMessages ?? []).map(entry => entry.text);
+		this.ctx.compactionQueuedMessages = [];
+		const allQueued = [...steering, ...followUp, ...compactionQueued];
 		if (allQueued.length === 0) {
 			this.ctx.updatePendingMessagesDisplay();
 			if (options?.abort) {
@@ -859,6 +881,8 @@ export class InputController {
 			copyCurrentLine: () => this.handleCopyCurrentLine(),
 			copyPrompt: () => this.handleCopyPrompt(),
 			pasteImage: () => void this.handleImagePaste(),
+			newSession: () => void this.ctx.handleClearCommand(),
+			showHelp: () => this.ctx.handleHelpCommand(),
 			scrollTmuxToPreviousUserInput: () => this.scrollTmuxToPreviousUserInput(),
 			undo: prefix => this.ctx.editor.undoPastTransientText(prefix),
 			moveCursorToMessageEnd: () => this.ctx.editor.moveToMessageEnd(),
@@ -901,6 +925,14 @@ export class InputController {
 		} catch {
 			this.ctx.showWarning("Failed to copy to clipboard");
 		}
+	}
+
+	openCommandPalette(): void {
+		if (this.ctx.editor.getText().trim().length > 0) {
+			this.ctx.showStatus("Command palette opens from an empty prompt. Type / for inline commands.");
+			return;
+		}
+		this.ctx.editor.handleInput("/");
 	}
 
 	cycleThinkingLevel(): void {

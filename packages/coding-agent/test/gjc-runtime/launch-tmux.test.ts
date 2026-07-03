@@ -380,6 +380,39 @@ describe("default GJC tmux launch", () => {
 		]);
 	});
 
+	it("reserves caller terminal rows for tmux status lines", () => {
+		const plan = buildDefaultTmuxLaunchPlan({
+			parsed: args({ messages: ["hello world"], tmux: true }),
+			rawArgs: ["--tmux", "hello world"],
+			cwd: "/repo",
+			env: {},
+			argv: ["bun", "packages/coding-agent/src/cli.ts"],
+			execPath: "/bin/bun",
+			platform: "darwin",
+			tty: { stdin: true, stdout: true, columns: 178, rows: 35 },
+			tmuxAvailable: true,
+			tmuxStatusLines: 1,
+			currentBranch: "",
+			existingBranchSessionName: null,
+		});
+
+		expect(plan).toBeDefined();
+		if (!plan) throw new Error("expected tmux plan");
+		expect(plan.initialSize).toEqual({ columns: 178, rows: 34 });
+		expect(plan.newSessionArgs.slice(0, 10)).toEqual([
+			"new-session",
+			"-d",
+			"-x",
+			"178",
+			"-y",
+			"34",
+			"-s",
+			plan.sessionName,
+			"-c",
+			"/repo",
+		]);
+	});
+
 	it("omits detached tmux sizing when caller dimensions are unknown", () => {
 		const plan = buildDefaultTmuxLaunchPlan({
 			parsed: args({ messages: ["hello world"], tmux: true }),
@@ -421,7 +454,7 @@ describe("default GJC tmux launch", () => {
 		expect(plan).toBeUndefined();
 	});
 
-	it("reasserts caller dimensions before attaching a newly created managed tmux session", () => {
+	it("keeps a newly created managed tmux window in automatic sizing mode before attaching", () => {
 		const calls: Array<{ command: string; args: string[]; options: TmuxSpawnOptions }> = [];
 		const handled = launchDefaultTmuxIfNeeded({
 			parsed: args({ messages: ["hello world"], tmux: true }),
@@ -443,23 +476,75 @@ describe("default GJC tmux launch", () => {
 
 		expect(handled).toBe(true);
 		const newSession = calls.find(call => call.args[0] === "new-session");
-		const resizeIndex = calls.findIndex(call => call.args[0] === "resize-window");
+		const setWindowSizeIndex = calls.findIndex(
+			call => call.args[0] === "set-window-option" && call.args.includes("window-size"),
+		);
 		const attachIndex = calls.findIndex(call => call.args[0] === "attach-session");
 		expect(newSession?.args).toContain("-x");
 		expect(newSession?.args).toContain("178");
 		expect(newSession?.args).toContain("-y");
 		expect(newSession?.args).toContain("35");
-		expect(resizeIndex).toBeGreaterThan(0);
-		expect(resizeIndex).toBeLessThan(attachIndex);
-		expect(calls[resizeIndex]?.args).toEqual([
-			"resize-window",
+		// The initial size comes from new-session -x/-y. On native tmux the window
+		// must then stay in automatic sizing mode so attach-session fits it to the
+		// real client. A `resize-window` reassert would flip window-size to
+		// `manual`, pinning the window to the capture-time size and leaving a
+		// smaller-than-client window that tmux paints with `·` fill.
+		expect(calls.some(call => call.args[0] === "resize-window")).toBe(false);
+		expect(setWindowSizeIndex).toBeGreaterThan(0);
+		expect(setWindowSizeIndex).toBeLessThan(attachIndex);
+		expect(calls[setWindowSizeIndex]?.args).toEqual([
+			"set-window-option",
 			"-t",
 			expect.stringMatching(/^=gajae_code_.*:$/),
-			"-x",
-			"178",
-			"-y",
-			"35",
+			"window-size",
+			"latest",
 		]);
+	});
+
+	it("keeps the explicit resize-window reassert on the psmux (Windows) launch path", () => {
+		__setBinaryResolverForTests(candidate => (candidate === "psmux" ? "/fake/psmux" : null));
+		const calls: Array<{ command: string; args: string[]; options: TmuxSpawnOptions }> = [];
+		try {
+			const handled = launchDefaultTmuxIfNeeded({
+				parsed: args({ messages: ["hello world"], tmux: true }),
+				rawArgs: ["--tmux", "hello world"],
+				cwd: "/repo",
+				env: { GJC_TMUX_COMMAND: "psmux", GJC_PSMUX_COMMAND: "psmux" },
+				argv: ["bun", "packages/coding-agent/src/cli.ts"],
+				execPath: "/bin/bun",
+				platform: "win32",
+				tty: { stdin: true, stdout: true, columns: 178, rows: 35 },
+				tmuxAvailable: true,
+				currentBranch: "feature/demo",
+				existingBranchSessionName: null,
+				spawnSync: (command, spawnArgs, options) => {
+					calls.push({ command, args: spawnArgs, options });
+					return { exitCode: 0 };
+				},
+			});
+
+			expect(handled).toBe(true);
+			const resizeIndex = calls.findIndex(call => call.args[0] === "resize-window");
+			const attachIndex = calls.findIndex(call => call.args[0] === "attach-session");
+			// psmux does not share tmux's window-size semantics, so the launch path
+			// keeps the explicit resize-window reassert and never emits window-size.
+			expect(resizeIndex).toBeGreaterThan(0);
+			expect(resizeIndex).toBeLessThan(attachIndex);
+			expect(calls[resizeIndex]?.args).toEqual([
+				"resize-window",
+				"-t",
+				expect.stringMatching(/^gajae_code_/),
+				"-x",
+				"178",
+				"-y",
+				"35",
+			]);
+			expect(calls.some(call => call.args[0] === "set-window-option" && call.args.includes("window-size"))).toBe(
+				false,
+			);
+		} finally {
+			__setBinaryResolverForTests(null);
+		}
 	});
 
 	it("plans native Windows --tmux launches when tmux is available", () => {
@@ -583,8 +668,8 @@ describe("default GJC tmux launch", () => {
 		const calls: { command: string; args: string[]; options: TmuxSpawnOptions }[] = [];
 		try {
 			const handled = launchDefaultTmuxIfNeeded({
-				parsed: args({ messages: ["hello world"], tmux: true, resume: true }),
-				rawArgs: ["--tmux", "--resume", "hello world"],
+				parsed: args({ messages: ["hello world"], tmux: true, continue: true }),
+				rawArgs: ["--tmux", "--continue", "hello world"],
 				cwd: "/repo",
 				env: { GJC_TMUX_COMMAND: "psmux", GJC_PSMUX_COMMAND: "psmux" },
 				argv: ["bun", "packages/coding-agent/src/cli.ts"],
@@ -607,11 +692,11 @@ describe("default GJC tmux launch", () => {
 		}
 	});
 
-	it("explicit resume attaches existing tagged session for matching worktree branch", () => {
+	it("value-less resume launches inner picker instead of attaching an existing tagged session", () => {
 		const calls: { command: string; args: string[]; options: TmuxSpawnOptions }[] = [];
 		const handled = launchDefaultTmuxIfNeeded({
-			parsed: args({ messages: ["hello world"], tmux: true, resume: true }),
-			rawArgs: ["--tmux", "--resume", "hello world"],
+			parsed: args({ tmux: true, resume: true }),
+			rawArgs: ["--tmux", "--resume"],
 			cwd: "/repo",
 			env: {},
 			argv: ["bun", "packages/coding-agent/src/cli.ts"],
@@ -628,15 +713,38 @@ describe("default GJC tmux launch", () => {
 		});
 
 		expect(handled).toBe(true);
-		expect(calls.some(call => call.args[0] === "new-session")).toBe(false);
-		expect(calls.at(-1)?.args).toEqual(["attach-session", "-t", "=gajae_code_feature"]);
+		expect(calls.some(call => call.args[0] === "new-session")).toBe(true);
+		expect(calls.some(call => call.args[0] === "attach-session" && call.args[2] === "=gajae_code_feature")).toBe(
+			false,
+		);
+		expect(calls.find(call => call.args[0] === "new-session")?.args.at(-1)).toContain("--resume");
+	});
+
+	it("targeted resume launches inner session resolver instead of branch tmux attach", () => {
+		const plan = buildDefaultTmuxLaunchPlan({
+			parsed: args({ tmux: true, resume: "abc123" }),
+			rawArgs: ["--tmux", "--resume", "abc123"],
+			cwd: "/repo",
+			env: {},
+			argv: ["bun", "packages/coding-agent/src/cli.ts"],
+			execPath: "/bin/bun",
+			platform: "darwin",
+			tty: interactiveTty,
+			tmuxAvailable: true,
+			worktreeBranch: "feature/demo",
+			existingBranchSessionName: "gajae_code_feature",
+		});
+
+		expect(plan?.attachSessionName).toBeUndefined();
+		expect(plan?.innerCommand).toContain("--resume");
+		expect(plan?.innerCommand).toContain("abc123");
 	});
 
 	it("falls through to a fresh session when existing tagged session attach fails", () => {
 		const calls: { command: string; args: string[]; options: TmuxSpawnOptions }[] = [];
 		const handled = launchDefaultTmuxIfNeeded({
-			parsed: args({ messages: ["hello world"], tmux: true, resume: true }),
-			rawArgs: ["--tmux", "--resume", "hello world"],
+			parsed: args({ messages: ["hello world"], tmux: true, continue: true }),
+			rawArgs: ["--tmux", "--continue", "hello world"],
 			cwd: "/repo",
 			env: {},
 			argv: ["bun", "packages/coding-agent/src/cli.ts"],
@@ -832,7 +940,7 @@ describe("default GJC tmux launch", () => {
 		const stdout = process.stdout as typeof process.stdout & { isTTY?: boolean };
 		const previousIsTTY = stdout.isTTY;
 		const writeSpy = spyOn(process.stdout, "write").mockImplementation(() => true);
-		stdout.isTTY = true;
+		Object.defineProperty(stdout, "isTTY", { configurable: true, value: true });
 
 		try {
 			const handled = launchDefaultTmuxIfNeeded({
@@ -862,7 +970,7 @@ describe("default GJC tmux launch", () => {
 			expect(writeSpy).not.toHaveBeenCalled();
 			expect(diagnostics[0]).toStartWith("gjc --tmux failed after creating tmux session: attach failed.");
 		} finally {
-			stdout.isTTY = previousIsTTY;
+			Object.defineProperty(stdout, "isTTY", { configurable: true, value: previousIsTTY });
 		}
 	});
 
@@ -1151,7 +1259,7 @@ describe("default GJC tmux launch", () => {
 		const stdout = process.stdout as typeof process.stdout & { isTTY?: boolean };
 		const previousIsTTY = stdout.isTTY;
 		const writeSpy = spyOn(process.stdout, "write").mockImplementation(() => true);
-		stdout.isTTY = true;
+		Object.defineProperty(stdout, "isTTY", { configurable: true, value: true });
 		try {
 			const handled = launchDefaultTmuxIfNeeded({
 				parsed: args({ tmux: true }),
@@ -1176,7 +1284,7 @@ describe("default GJC tmux launch", () => {
 			expect(calls[0].args[0]).toBe("new-session");
 			expect(writeSpy).not.toHaveBeenCalled();
 		} finally {
-			stdout.isTTY = previousIsTTY;
+			Object.defineProperty(stdout, "isTTY", { configurable: true, value: previousIsTTY });
 		}
 	});
 
@@ -1366,6 +1474,38 @@ describe("default GJC tmux launch", () => {
 		expect(handled).toBe(true);
 		expect(calls.some(call => call.args[0] === "new-session")).toBe(true);
 		expect(calls.some(call => call.args[0] === "attach-session")).toBe(true);
+		expect(calls.some(call => call.args[0] === "kill-session")).toBe(false);
+		expect(diagnostics).toHaveLength(1);
+		expect(diagnostics[0]).toStartWith("gjc --tmux failed after creating tmux session: attach disconnected.");
+	});
+
+	it("preserves a live newly created managed session when attach exits after PTY close", () => {
+		const calls: { command: string; args: string[]; options: TmuxSpawnOptions }[] = [];
+		const diagnostics: string[] = [];
+		const handled = launchDefaultTmuxIfNeeded({
+			parsed: args({ tmux: true }),
+			rawArgs: [],
+			cwd: "/repo",
+			env: {},
+			argv: ["/usr/local/bin/gjc"],
+			execPath: "/bin/bun",
+			platform: "darwin",
+			tty: interactiveTty,
+			tmuxAvailable: true,
+			currentBranch: "",
+			existingBranchSessionName: null,
+			diagnosticWriter: message => diagnostics.push(message),
+			spawnSync: (command, spawnArgs, options) => {
+				calls.push({ command, args: spawnArgs, options });
+				if (spawnArgs[0] === "attach-session") return { exitCode: 1 };
+				return { exitCode: 0 };
+			},
+		});
+
+		expect(handled).toBe(true);
+		expect(calls.some(call => call.args[0] === "new-session")).toBe(true);
+		expect(calls.some(call => call.args[0] === "attach-session")).toBe(true);
+		expect(calls.filter(call => call.args[0] === "has-session").length).toBeGreaterThanOrEqual(2);
 		expect(calls.some(call => call.args[0] === "kill-session")).toBe(false);
 		expect(diagnostics).toHaveLength(1);
 		expect(diagnostics[0]).toStartWith("gjc --tmux failed after creating tmux session: attach disconnected.");
@@ -1770,4 +1910,116 @@ it("retries new-session when the psmux server has not yet registered the session
 	const newSessionCalls = calls.filter(call => call.command === "new-session");
 	expect(newSessionCalls.length).toBe(2);
 	expect(calls.filter(call => call.command === "has-session").length).toBeGreaterThanOrEqual(2);
+});
+
+it("retries Windows psmux attach once after transient os error 10061", () => {
+	const calls: Array<{ command: string; args: string[] }> = [];
+	let attachAttempts = 0;
+	const result = launchDefaultTmuxIfNeeded({
+		parsed: args({ messages: ["hello world"], tmux: true }),
+		rawArgs: ["--tmux", "hello world"],
+		cwd: "/repo",
+		env: { GJC_TMUX_COMMAND: "psmux", GJC_PSMUX_COMMAND: "psmux" },
+		argv: ["bun", "packages/coding-agent/src/cli.ts"],
+		execPath: "/bin/bun",
+		platform: "win32",
+		tty: interactiveTty,
+		tmuxAvailable: true,
+		currentBranch: "",
+		existingBranchSessionName: null,
+		diagnosticWriter: () => {},
+		spawnSync: (_command, spawnArgs) => {
+			calls.push({ command: spawnArgs[0], args: spawnArgs });
+			if (spawnArgs[0] === "attach-session") {
+				attachAttempts++;
+				if (attachAttempts === 1) {
+					return {
+						exitCode: 1,
+						stderr: "psmux: 대상 컴퓨터에서 연결을 거부했으므로 연결하지 못했습니다. (os error 10061)",
+					};
+				}
+			}
+			return { exitCode: 0 };
+		},
+	});
+
+	expect(result).toBe(true);
+	expect(calls.filter(call => call.command === "attach-session")).toHaveLength(2);
+	expect(calls.some(call => call.command === "has-session")).toBe(true);
+	expect(calls.some(call => call.command === "kill-session")).toBe(false);
+});
+
+it("recreates a Windows psmux session that disappears after transient attach os error 10061", () => {
+	const calls: Array<{ command: string; args: string[] }> = [];
+	let attachAttempts = 0;
+	let newSessionCount = 0;
+	const result = launchDefaultTmuxIfNeeded({
+		parsed: args({ messages: ["hello world"], tmux: true }),
+		rawArgs: ["--tmux", "hello world"],
+		cwd: "/repo",
+		env: { GJC_TMUX_COMMAND: "psmux", GJC_PSMUX_COMMAND: "psmux" },
+		argv: ["bun", "packages/coding-agent/src/cli.ts"],
+		execPath: "/bin/bun",
+		platform: "win32",
+		tty: interactiveTty,
+		tmuxAvailable: true,
+		currentBranch: "",
+		existingBranchSessionName: null,
+		diagnosticWriter: () => {},
+		spawnSync: (_command, spawnArgs) => {
+			calls.push({ command: spawnArgs[0], args: spawnArgs });
+			if (spawnArgs[0] === "new-session") {
+				newSessionCount++;
+				return { exitCode: 0 };
+			}
+			if (spawnArgs[0] === "has-session" && attachAttempts > 0 && newSessionCount === 1) {
+				return { exitCode: 1, stderr: "psmux: can't find session (no server running)" };
+			}
+			if (spawnArgs[0] === "attach-session") {
+				attachAttempts++;
+				if (attachAttempts === 1) {
+					return {
+						exitCode: 1,
+						stderr: "psmux: 대상 컴퓨터에서 연결을 거부했으므로 연결하지 못했습니다. (os error 10061)",
+					};
+				}
+			}
+			return { exitCode: 0 };
+		},
+	});
+
+	expect(result).toBe(true);
+	expect(calls.filter(call => call.command === "new-session")).toHaveLength(2);
+	expect(calls.filter(call => call.command === "attach-session")).toHaveLength(2);
+	expect(calls.some(call => call.args.includes("@gjc-profile"))).toBe(true);
+	expect(calls.some(call => call.command === "kill-session")).toBe(false);
+});
+
+it("does not retry Windows psmux attach failures without os error 10061", () => {
+	const calls: Array<{ command: string; args: string[] }> = [];
+	const diagnostics: string[] = [];
+	const result = launchDefaultTmuxIfNeeded({
+		parsed: args({ messages: ["hello world"], tmux: true }),
+		rawArgs: ["--tmux", "hello world"],
+		cwd: "/repo",
+		env: { GJC_TMUX_COMMAND: "psmux", GJC_PSMUX_COMMAND: "psmux" },
+		argv: ["bun", "packages/coding-agent/src/cli.ts"],
+		execPath: "/bin/bun",
+		platform: "win32",
+		tty: interactiveTty,
+		tmuxAvailable: true,
+		currentBranch: "",
+		existingBranchSessionName: null,
+		diagnosticWriter: message => diagnostics.push(message),
+		spawnSync: (_command, spawnArgs) => {
+			calls.push({ command: spawnArgs[0], args: spawnArgs });
+			if (spawnArgs[0] === "attach-session") return { exitCode: 1, stderr: "psmux: attach failed" };
+			return { exitCode: 0 };
+		},
+	});
+
+	expect(result).toBe(true);
+	expect(calls.filter(call => call.command === "attach-session")).toHaveLength(1);
+	expect(calls.some(call => call.command === "kill-session")).toBe(true);
+	expect(diagnostics[0]).toStartWith("gjc --tmux failed after creating tmux session: attach failed.");
 });

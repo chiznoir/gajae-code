@@ -47,6 +47,29 @@ function writeSkillFile(dir: string, skillName: string, body: string): string {
 	return skillPath;
 }
 
+function isBusyRmError(error: unknown): boolean {
+	return typeof error === "object" && error !== null && "code" in error && error.code === "EBUSY";
+}
+
+async function removeTempDirWithRetry(tempDir: TempDir): Promise<void> {
+	for (let attempt = 0; attempt < 10; attempt += 1) {
+		try {
+			await fs.promises.rm(tempDir.path(), { recursive: true, force: true });
+			return;
+		} catch (error) {
+			if (!isBusyRmError(error)) {
+				throw error;
+			}
+			if (attempt === 9) {
+				// Windows can keep the SQLite temp directory busy after close; do
+				// not fail queue-behavior assertions on best-effort cleanup.
+				return;
+			}
+			await Bun.sleep(100);
+		}
+	}
+}
+
 // ============================================================================
 // E1-E3: InputController tag generation with a stubbed session.
 // ============================================================================
@@ -222,6 +245,30 @@ describe("InputController #invokeSkillCommand (E1-E3)", () => {
 		expect(ctx.showError).not.toHaveBeenCalled();
 	});
 
+	it("E3c: compaction queue flush replays /skill entries through the skill custom-message path", async () => {
+		const { ctx, prompt, promptCustomMessage } = createStubInputControllerContext({
+			skillCommands,
+			isStreaming: false,
+		});
+		ctx.compactionQueuedMessages.push({ text: "/skill:test-skill from compaction", mode: "followUp" });
+
+		const uiHelpers = new UiHelpers(ctx);
+		await uiHelpers.flushCompactionQueue();
+
+		expect(prompt).not.toHaveBeenCalled();
+		expect(promptCustomMessage).toHaveBeenCalledTimes(1);
+		const firstCall = promptCustomMessage.mock.calls[0];
+		expect(firstCall).toBeDefined();
+		if (!firstCall) {
+			throw new Error("expected promptCustomMessage to be called");
+		}
+		const messageArg = firstCall[0];
+		expect(messageArg.content).toContain("Do the thing.");
+		expect(messageArg.content).toContain("User: from compaction");
+		expect(firstCall[1]).toEqual({ streamingBehavior: "followUp" });
+		expect(ctx.compactionQueuedMessages).toEqual([]);
+	});
+
 	it("E3: not streaming -> enqueueCustomMessageDisplay NOT called and tag absent", async () => {
 		const { ctx, editor, enqueueCustomMessageDisplay, promptCustomMessage } = createStubInputControllerContext({
 			skillCommands,
@@ -393,7 +440,7 @@ describe("AgentSession custom-role tag dequeue (E4-E7)", () => {
 		if (fixture) {
 			await fixture.session.dispose();
 			fixture.authStorage.close();
-			fixture.tempDir.removeSync();
+			await removeTempDirWithRetry(fixture.tempDir);
 			fixture = undefined;
 		}
 		vi.restoreAllMocks();
@@ -481,6 +528,21 @@ describe("AgentSession custom-role tag dequeue (E4-E7)", () => {
 		await Promise.resolve();
 		expect(session.getQueuedMessages().steering).toEqual([]);
 	});
+	it("E7b: popLastQueuedMessage follows newest cross-queue insertion order", async () => {
+		fixture = await createRealSession();
+		const { session } = fixture;
+
+		await session.steer("first steer");
+		await session.followUp("latest follow-up");
+
+		expect(session.popLastQueuedMessage()).toBe("latest follow-up");
+		expect(session.getQueuedMessages().steering).toEqual(["first steer"]);
+		expect(session.getQueuedMessages().followUp).toEqual([]);
+
+		expect(session.popLastQueuedMessage()).toBe("first steer");
+		expect(session.getQueuedMessages().steering).toEqual([]);
+		expect(session.getQueuedMessages().followUp).toEqual([]);
+	});
 });
 
 // ============================================================================
@@ -541,7 +603,7 @@ describe("UiHelpers / InputController against the queued-display layer (E8-E9)",
 		if (fixture) {
 			await fixture.session.dispose();
 			fixture.authStorage.close();
-			fixture.tempDir.removeSync();
+			await removeTempDirWithRetry(fixture.tempDir);
 			fixture = undefined;
 		}
 		vi.restoreAllMocks();

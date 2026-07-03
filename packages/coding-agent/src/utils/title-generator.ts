@@ -219,7 +219,7 @@ export function setTerminalTitle(title: string): void {
 
 export function setSessionTerminalTitle(sessionName: string | undefined, cwd?: string): void {
 	setTerminalTitle(formatSessionTerminalTitle(sessionName, cwd));
-	syncCmuxWorkspaceTitle(sessionName);
+	void syncCmuxWorkspaceTitle(sessionName);
 }
 
 /**

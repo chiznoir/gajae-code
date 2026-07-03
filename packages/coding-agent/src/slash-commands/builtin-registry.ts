@@ -322,7 +322,8 @@ const shutdownHandlerTui = (_command: ParsedSlashCommand, runtime: TuiSlashComma
 const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 	{
 		name: "settings",
-		description: "Open settings menu",
+		priority: 40,
+		description: "Open settings and preferences",
 		handleTui: (_command, runtime) => {
 			runtime.ctx.showSettingsSelector();
 			runtime.ctx.editor.setText("");
@@ -338,7 +339,8 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 	},
 	{
 		name: "goal",
-		description: "Toggle goal mode (persistent autonomous objective for this session)",
+		priority: 84,
+		description: "Plan and track an autonomous goal",
 		subcommands: [
 			{ name: "set", description: "Set or replace the goal", usage: "<objective>" },
 			{ name: "show", description: "Show current goal details" },
@@ -541,7 +543,8 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 	},
 	{
 		name: "export",
-		description: "Export session to HTML file",
+		priority: 50,
+		description: "Export this session to an HTML file",
 		inlineHint: "[path]",
 		allowArgs: true,
 		handle: async (command, runtime) => {
@@ -568,7 +571,8 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 	},
 	{
 		name: "copy",
-		description: "Copy last response as markdown",
+		priority: 55,
+		description: "Copy the last response for review or sharing",
 		// Public `/copy` is strict zero-argument, but `allowArgs` lets the
 		// TUI dispatcher route `/copy <arg>` here so it can be rejected locally
 		// instead of falling through as a model prompt.
@@ -585,7 +589,8 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 	},
 	{
 		name: "dump",
-		description: "Copy session transcript to clipboard",
+		priority: 54,
+		description: "Dump the full transcript for review or sharing",
 		acpDescription: "Return full transcript as plain text",
 		handle: async (_command, runtime) => {
 			const text = runtime.session.formatSessionAsText();
@@ -599,11 +604,12 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 	},
 	{
 		name: "session",
-		description: "Session management commands",
+		priority: 88,
+		description: "Show current session info or delete current session",
 		acpDescription: "Show session information",
 		acpInputHint: "info|delete",
 		subcommands: [
-			{ name: "info", description: "Show session info and stats" },
+			{ name: "info", description: "Show current session id, title, and workspace" },
 			{ name: "delete", description: "Delete current session and return to selector" },
 		],
 		allowArgs: true,
@@ -710,6 +716,15 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		},
 		handleTui: async (_command, runtime) => {
 			await runtime.ctx.handleUsageCommand();
+			runtime.ctx.editor.setText("");
+		},
+	},
+	{
+		name: "help",
+		priority: 100,
+		description: "Learn commands and beginner workflows",
+		handleTui: (_command, runtime) => {
+			runtime.ctx.handleHelpCommand();
 			runtime.ctx.editor.setText("");
 		},
 	},
@@ -953,6 +968,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 	},
 	{
 		name: "new",
+		priority: 96,
 		description: "Start a new session",
 		handleTui: async (_command, runtime) => {
 			runtime.ctx.editor.setText("");
@@ -969,7 +985,8 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 	},
 	{
 		name: "compact",
-		description: "Manually compact the session context",
+		priority: 72,
+		description: "Compact context and continue this session",
 		acpDescription: "Compact the conversation",
 		inlineHint: "[focus instructions]",
 		allowArgs: true,
@@ -1026,7 +1043,8 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 	},
 	{
 		name: "resume",
-		description: "Resume a different session",
+		priority: 92,
+		description: "Resume a previous session",
 		handleTui: (_command, runtime) => {
 			runtime.ctx.showSessionSelector();
 			runtime.ctx.editor.setText("");
@@ -1045,7 +1063,8 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 	},
 	{
 		name: "retry",
-		description: "Retry the last failed agent turn",
+		priority: 70,
+		description: "Retry or continue the last interrupted turn",
 		handleTui: async (_command, runtime) => {
 			const didRetry = await runtime.ctx.session.retry();
 			if (!didRetry) {
@@ -1242,6 +1261,7 @@ export const BUILTIN_SLASH_COMMAND_DEFS: ReadonlyArray<BuiltinSlashCommand> = AC
 		description: command.description,
 		subcommands: command.subcommands,
 		inlineHint: command.inlineHint,
+		priority: command.priority,
 	}),
 );
 

@@ -37,6 +37,7 @@ export const GJC_TMUX_LAUNCHED_ENV = "GJC_TMUX_LAUNCHED";
 export const GJC_LAUNCH_POLICY_ENV = "GJC_LAUNCH_POLICY";
 export const GJC_TMUX_WINDOW_LABEL_MAX_WIDTH = 48;
 export const GJC_PSMUX_PROFILE_FORCE_ENV = "GJC_PSMUX_PROFILE_FORCE";
+const WINDOWS_PSMUX_ATTACH_RETRY_DELAY_MS = 100;
 const TERMINAL_TITLE_CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f]/g;
 
 type LaunchPolicy = "direct" | "tmux";
@@ -59,6 +60,7 @@ export interface TmuxLaunchContext {
 	tty?: TtyState;
 	spawnSync?: TmuxSpawnSync;
 	tmuxAvailable?: boolean;
+	tmuxStatusLines?: number;
 	worktreeBranch?: string | null;
 	currentBranch?: string | null;
 	existingBranchSessionName?: string | null;
@@ -107,6 +109,8 @@ export interface TmuxLaunchPlan {
 	project?: string | null;
 	sessionId?: string | null;
 	sessionStateFile?: string | null;
+	isPsmux: boolean;
+	platform: NodeJS.Platform;
 }
 
 function explicitTmuxSessionName(env: NodeJS.ProcessEnv): string | undefined {
@@ -117,7 +121,9 @@ function hasCurrentGjcVersion(session: GjcTmuxSessionStatus | undefined): boolea
 }
 
 function allowsExistingTmuxAttach(parsed: Args, env: NodeJS.ProcessEnv): boolean {
-	return Boolean(parsed.continue || parsed.resume || explicitTmuxSessionName(env));
+	// `--resume` belongs to the inner GJC session resolver. Let it reach main.ts so
+	// value-less resume can show the session picker and valued resume can honor the target.
+	return Boolean(parsed.continue || explicitTmuxSessionName(env));
 }
 
 function findExistingSessionForLaunch(context: {
@@ -544,42 +550,88 @@ function isTmuxAttachDisconnectError(result: TmuxSpawnResult): boolean {
 	const stderr = result.stderr?.toLowerCase() ?? "";
 	return stderr.includes("eio") || stderr.includes("input/output error");
 }
+function isWindowsPsmuxAttachConnectionRefused(plan: TmuxLaunchPlan, result: TmuxSpawnResult): boolean {
+	if (plan.platform !== "win32" || !plan.isPsmux) return false;
+	return result.stderr?.toLowerCase().includes("os error 10061") === true;
+}
+function waitForWindowsPsmuxAttachRetry(): void {
+	Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, WINDOWS_PSMUX_ATTACH_RETRY_DELAY_MS);
+}
 function normalizeTmuxTerminalDimension(value: number | undefined): number | undefined {
 	if (value === undefined || !Number.isSafeInteger(value) || value <= 0) return undefined;
 	return value;
 }
 
-function resolveCallerTmuxTerminalSize(tty: TtyState): TmuxTerminalSize | undefined {
+function normalizeTmuxStatusLineCount(value: number | undefined): number {
+	if (value === undefined || !Number.isSafeInteger(value) || value <= 0) return 0;
+	return value;
+}
+
+function parseTmuxStatusLineCount(value: string): number {
+	const normalized = value.trim().toLowerCase();
+	if (normalized.length === 0 || normalized === "off" || normalized === "0") return 0;
+	if (normalized === "on") return 1;
+	const parsed = Number.parseInt(normalized, 10);
+	return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : 1;
+}
+
+function readTmuxStatusLineCount(tmuxCommand: string, cwd: string, env: NodeJS.ProcessEnv): number {
+	const result = Bun.spawnSync([tmuxCommand, "show-options", "-gqv", "status"], {
+		cwd,
+		env,
+		stdin: "pipe",
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	if (result.exitCode !== 0) return 0;
+	return parseTmuxStatusLineCount(new TextDecoder().decode(result.stdout));
+}
+
+function resolveCallerTmuxTerminalSize(tty: TtyState, tmuxStatusLines = 0): TmuxTerminalSize | undefined {
 	if (!tty.stdout) return undefined;
 	const columns = normalizeTmuxTerminalDimension(tty.columns);
 	const rows = normalizeTmuxTerminalDimension(tty.rows);
 	if (columns === undefined || rows === undefined) return undefined;
-	return { columns, rows };
+	const adjustedRows = Math.max(1, rows - normalizeTmuxStatusLineCount(tmuxStatusLines));
+	return { columns, rows: adjustedRows };
 }
 
 function buildTmuxNewSessionSizeArgs(size: TmuxTerminalSize | undefined): string[] {
 	return size ? ["-x", String(size.columns), "-y", String(size.rows)] : [];
 }
 
-function resizeCreatedTmuxWindowToCallerTerminalSize(
+// Ensure the freshly created window fits the terminal that ultimately attaches.
+// `new-session` already starts the window (and the inner TUI) at the caller's
+// captured `-x/-y` size; this step governs what happens on `attach-session`.
+//
+// On native tmux we must NOT reassert with `resize-window`: that command flips
+// the window's `window-size` option to `manual`, pinning it to the capture-time
+// dimensions and stopping `attach-session` from resizing the window to the real
+// client. When the attaching terminal is larger than the capture — e.g. a GUI
+// terminal that reports a smaller size before it finishes sizing — the pinned
+// window stays small and tmux paints the uncovered client area with `·` fill
+// (the "window smaller than client" symptom). Keeping `window-size` on `latest`
+// lets tmux size the window to the attaching client (status line included).
+//
+// psmux (Windows) does not share tmux's `window-size` semantics, so preserve the
+// historical explicit `resize-window` reassert there rather than sending an
+// option its server may reject and echo into the user's pane.
+function ensureCreatedTmuxWindowTracksCallerTerminal(
 	plan: TmuxLaunchPlan,
 	spawnSync: TmuxSpawnSync,
 	options: TmuxSpawnOptions,
 ): void {
 	if (!plan.initialSize) return;
-	spawnSync(
-		plan.tmuxCommand,
-		[
-			"resize-window",
-			"-t",
-			buildGjcTmuxExactOptionTarget(plan.sessionName, { env: options.env }),
-			"-x",
-			String(plan.initialSize.columns),
-			"-y",
-			String(plan.initialSize.rows),
-		],
-		options,
-	);
+	const target = buildGjcTmuxExactOptionTarget(plan.sessionName, { env: options.env });
+	if (plan.isPsmux) {
+		spawnSync(
+			plan.tmuxCommand,
+			["resize-window", "-t", target, "-x", String(plan.initialSize.columns), "-y", String(plan.initialSize.rows)],
+			options,
+		);
+		return;
+	}
+	spawnSync(plan.tmuxCommand, ["set-window-option", "-t", target, "window-size", "latest"], options);
 }
 
 export function buildDefaultTmuxLaunchPlan(context: TmuxLaunchContext): TmuxLaunchPlan | undefined {
@@ -641,9 +693,14 @@ export function buildDefaultTmuxLaunchPlan(context: TmuxLaunchContext): TmuxLaun
 		},
 		context.rawArgs,
 	);
-	const initialSize = resolveCallerTmuxTerminalSize(tty);
+	const tmuxStatusLines =
+		context.tmuxStatusLines ??
+		(context.tmuxAvailable === undefined ? readTmuxStatusLineCount(tmuxCommand, cwd, env) : 0);
+	const initialSize = resolveCallerTmuxTerminalSize(tty, tmuxStatusLines);
 	return {
 		tmuxCommand,
+		isPsmux: resolvedBinary.isPsmux,
+		platform,
 		sessionName,
 		cwd,
 		innerCommand,
@@ -742,6 +799,30 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 	const rootTerminalTitle = shouldSetGjcTmuxRootTerminalTitle(context.parsed, env)
 		? buildGjcTmuxRootTerminalTitle(plan.project ?? plan.cwd, plan.branch)
 		: undefined;
+	const buildProfileInputs = (): GjcTmuxProfileContext => ({
+		tmuxCommand: plan.tmuxCommand,
+		target: plan.sessionName,
+		cwd: plan.cwd,
+		env,
+		spawnSync,
+		branch: plan.branch,
+		project: plan.project,
+		sessionId: plan.sessionId ?? null,
+		sessionStateFile: plan.sessionStateFile ?? null,
+		version: VERSION,
+	});
+	const probeHasSession = (): TmuxSpawnResult =>
+		spawnSync(
+			plan.tmuxCommand,
+			["has-session", "-t", buildGjcTmuxExactSessionTarget(plan.sessionName, { env })],
+			probeOptions,
+		);
+	const attachCreatedSession = (): TmuxSpawnResult =>
+		spawnSync(
+			plan.tmuxCommand,
+			["attach-session", "-t", buildGjcTmuxExactSessionTarget(plan.sessionName, { env })],
+			attachOptions,
+		);
 
 	if (plan.attachSessionName) {
 		applyGjcTmuxRootTerminalTitleProfile({
@@ -767,24 +848,6 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 		// server first, and if the race fired, retry new-session before
 		// we hand the session to rename-window / applyGjcTmuxProfile so the
 		// profile-tagging path always sees a registered session.
-		const buildProfileInputs = (): GjcTmuxProfileContext => ({
-			tmuxCommand: plan.tmuxCommand,
-			target: plan.sessionName,
-			cwd: plan.cwd,
-			env,
-			spawnSync,
-			branch: plan.branch,
-			project: plan.project,
-			sessionId: plan.sessionId ?? null,
-			sessionStateFile: plan.sessionStateFile ?? null,
-			version: VERSION,
-		});
-		const probeHasSession = (): TmuxSpawnResult =>
-			spawnSync(
-				plan.tmuxCommand,
-				["has-session", "-t", buildGjcTmuxExactSessionTarget(plan.sessionName, { env })],
-				probeOptions,
-			);
 		const probeResult = probeHasSession();
 		if (probeResult.exitCode !== 0) {
 			const retry = spawnSync(plan.tmuxCommand, plan.newSessionArgs, newSessionOptions);
@@ -851,7 +914,7 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 			}
 			// Recovery succeeded via retry — fall through to attach-session below.
 		}
-		resizeCreatedTmuxWindowToCallerTerminalSize(plan, spawnSync, controlOptions);
+		ensureCreatedTmuxWindowTracksCallerTerminal(plan, spawnSync, controlOptions);
 		applyGjcTmuxRootTerminalTitleProfile({
 			tmuxCommand: plan.tmuxCommand,
 			target: plan.sessionName,
@@ -875,15 +938,74 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 		return false;
 	}
 	// attach-session needs PTY inherit for the user-facing attach; keep it unchanged.
-	const attached = spawnSync(
-		plan.tmuxCommand,
-		["attach-session", "-t", buildGjcTmuxExactSessionTarget(plan.sessionName, { env })],
-		attachOptions,
-	);
+	const attached = attachCreatedSession();
 	if (attached.exitCode === 0) return true;
 	if (isTmuxAttachDisconnectError(attached)) {
 		(context.diagnosticWriter ?? safeStderrWrite)(formatTmuxLaunchDiagnostic("attach disconnected", attached.stderr));
 		return true;
+	}
+	if (isWindowsPsmuxAttachConnectionRefused(plan, attached)) {
+		waitForWindowsPsmuxAttachRetry();
+		const probeAfterAttach = probeHasSession();
+		if (probeAfterAttach.exitCode === 0) {
+			const retryAttached = attachCreatedSession();
+			if (retryAttached.exitCode === 0) return true;
+			if (isTmuxAttachDisconnectError(retryAttached)) {
+				(context.diagnosticWriter ?? safeStderrWrite)(
+					formatTmuxLaunchDiagnostic("attach disconnected", retryAttached.stderr),
+				);
+				return true;
+			}
+		} else {
+			const retry = spawnSync(plan.tmuxCommand, plan.newSessionArgs, newSessionOptions);
+			const retryProbe = probeHasSession();
+			if (retry.exitCode === 0 && retryProbe.exitCode === 0) {
+				renameTmuxWindow(
+					plan.tmuxCommand,
+					windowTitle,
+					spawnSync,
+					controlOptions,
+					buildGjcTmuxExactSessionTarget(plan.sessionName, { env }),
+				);
+				const retryProfile = applyGjcTmuxProfile(buildProfileInputs());
+				const retryOwnershipFailure = retryProfile.failures.find(item =>
+					item.command.args.includes("@gjc-profile"),
+				);
+				if (!retryOwnershipFailure) {
+					ensureCreatedTmuxWindowTracksCallerTerminal(plan, spawnSync, controlOptions);
+					applyGjcTmuxRootTerminalTitleProfile({
+						tmuxCommand: plan.tmuxCommand,
+						target: plan.sessionName,
+						title: rootTerminalTitle,
+						spawnSync,
+						options,
+					});
+					const retryAttached = attachCreatedSession();
+					if (retryAttached.exitCode === 0) return true;
+					if (isTmuxAttachDisconnectError(retryAttached)) {
+						(context.diagnosticWriter ?? safeStderrWrite)(
+							formatTmuxLaunchDiagnostic("attach disconnected", retryAttached.stderr),
+						);
+						return true;
+					}
+				}
+			}
+		}
+	}
+	// Closing an SSH/Windows Terminal tab can make `tmux attach-session`
+	// exit with code 1 and no captured stderr while the tmux server correctly
+	// keeps the just-created session alive. Preserve that live session so the
+	// user can reattach instead of treating the parent client teardown as a
+	// launch failure.
+	const attachFailureStderr = attached.stderr?.trim() ?? "";
+	if (attachFailureStderr.length === 0) {
+		const probeAfterAttachFailure = probeHasSession();
+		if (probeAfterAttachFailure.exitCode === 0) {
+			(context.diagnosticWriter ?? safeStderrWrite)(
+				formatTmuxLaunchDiagnostic("attach disconnected", attached.stderr),
+			);
+			return true;
+		}
 	}
 	cleanupCreatedTmuxSession(plan, spawnSync, options);
 	(context.diagnosticWriter ?? safeStderrWrite)(formatTmuxLaunchDiagnostic("attach failed", attached.stderr));

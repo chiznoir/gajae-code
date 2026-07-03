@@ -334,7 +334,7 @@ function cliExecutorQa(artifactRefs: Record<string, unknown>[]): Record<string, 
 }
 
 async function expectRejectedExecutorQa(root: string, executorQa: Record<string, unknown>): Promise<string> {
-	const created = await createUltragoalPlan({ cwd: root, brief: "Ship CLI replay" });
+	await createUltragoalPlan({ cwd: root, brief: "Ship CLI replay" });
 	await startNextUltragoalGoal({ cwd: root });
 	const result = await runNativeUltragoalCommand(
 		[
@@ -355,7 +355,7 @@ async function expectRejectedExecutorQa(root: string, executorQa: Record<string,
 }
 
 async function expectAcceptedExecutorQa(root: string, executorQa: Record<string, unknown>): Promise<void> {
-	const created = await createUltragoalPlan({ cwd: root, brief: "Ship CLI replay" });
+	await createUltragoalPlan({ cwd: root, brief: "Ship CLI replay" });
 	await startNextUltragoalGoal({ cwd: root });
 	const result = await runNativeUltragoalCommand(
 		[
@@ -497,7 +497,7 @@ async function mutateLiveQualityGate(
 
 async function expectRejectedCompleteGate(
 	root: string,
-	created: { gjcObjective: string },
+	_created: { gjcObjective: string },
 	qualityGateJson: string,
 ): Promise<string> {
 	const beforeGoals = await Bun.file(path.join(sessionUltragoalDir(root, TEST_SESSION_ID), "goals.json")).text();
@@ -842,7 +842,7 @@ describe("native GJC ultragoal runtime", () => {
 
 	it("prints receipt-only json for checkpoint", async () => {
 		const root = await tempDir();
-		const created = await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
+		await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
 		await startNextUltragoalGoal({ cwd: root });
 
 		const result = await runNativeUltragoalCommand(
@@ -1249,7 +1249,7 @@ describe("native GJC ultragoal runtime", () => {
 
 	it("prints receipt-only json for review blockers", async () => {
 		const root = await tempDir();
-		const created = await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
+		await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
 		await startNextUltragoalGoal({ cwd: root });
 
 		const result = await runNativeUltragoalCommand(
@@ -1280,7 +1280,7 @@ describe("native GJC ultragoal runtime", () => {
 
 	it("starts and checkpoints the current goal", async () => {
 		const root = await tempDir();
-		const created = await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
+		await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
 
 		const started = await startNextUltragoalGoal({ cwd: root });
 		expect(started.goal?.status).toBe("active");
@@ -1360,7 +1360,7 @@ describe("native GJC ultragoal runtime", () => {
 
 	it("completes from durable active goal state", async () => {
 		const root = await tempDir();
-		const created = await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
+		await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
 		await startNextUltragoalGoal({ cwd: root });
 
 		const plan = await checkpointUltragoalGoal({
@@ -1376,7 +1376,7 @@ describe("native GJC ultragoal runtime", () => {
 
 	it("completes without goal snapshot freshness input", async () => {
 		const root = await tempDir();
-		const created = await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
+		await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
 		await startNextUltragoalGoal({ cwd: root });
 
 		const plan = await checkpointUltragoalGoal({
@@ -1410,7 +1410,7 @@ describe("native GJC ultragoal runtime", () => {
 	});
 	it("continues to next ultragoal goal after checkpointing G001 complete", async () => {
 		const root = await tempDir();
-		const created = await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
+		await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
 		await addUltragoalSubgoal({
 			cwd: root,
 			title: "Second stage",
@@ -1447,7 +1447,7 @@ describe("native GJC ultragoal runtime", () => {
 
 	it("keeps per-goal receipt fresh after unrelated next goal starts", async () => {
 		const root = await tempDir();
-		const created = await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
+		await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
 		await addUltragoalSubgoal({
 			cwd: root,
 			title: "Second stage",
@@ -1488,7 +1488,7 @@ describe("native GJC ultragoal runtime", () => {
 
 	it("treats receipts as stale after target goal mutation", async () => {
 		const root = await tempDir();
-		const created = await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
+		await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
 		await startNextUltragoalGoal({ cwd: root });
 		const plan = await checkpointUltragoalGoal({
 			cwd: root,
@@ -1513,7 +1513,7 @@ describe("native GJC ultragoal runtime", () => {
 
 	it("treats receipts as dirty after quality gate ledger mutation", async () => {
 		const root = await tempDir();
-		const created = await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
+		await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
 		await startNextUltragoalGoal({ cwd: root });
 		const plan = await checkpointUltragoalGoal({
 			cwd: root,
@@ -1679,7 +1679,7 @@ describe("native GJC ultragoal runtime", () => {
 
 	it("rejects complete gates with missing evidence or dirty blockers before mutation", async () => {
 		const root = await tempDir();
-		const created = await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
+		await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
 		await startNextUltragoalGoal({ cwd: root });
 		const beforeGoals = await Bun.file(path.join(sessionUltragoalDir(root, TEST_SESSION_ID), "goals.json")).text();
 		const beforeLedger = await Bun.file(path.join(sessionUltragoalDir(root, TEST_SESSION_ID), "ledger.jsonl")).text();
@@ -2048,7 +2048,7 @@ describe("native GJC ultragoal runtime", () => {
 
 	it("accepts live artifact files as proof for completed checkpoints", async () => {
 		const root = await tempDir();
-		const created = await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
+		await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
 		await startNextUltragoalGoal({ cwd: root });
 		const mixedProof = await passingLiveQualityGate(root);
 
@@ -2311,7 +2311,7 @@ describe("native GJC ultragoal runtime", () => {
 
 	it("unblocks plans after verification blocker stories complete cleanly", async () => {
 		const root = await tempDir();
-		const created = await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
+		await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
 		await startNextUltragoalGoal({ cwd: root });
 
 		const blockers = await runNativeUltragoalCommand(
@@ -2347,7 +2347,7 @@ describe("native GJC ultragoal runtime", () => {
 
 	it("blocks complete checkpoints without the strict architect/executor/iteration quality gate", async () => {
 		const root = await tempDir();
-		const created = await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
+		await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
 		await startNextUltragoalGoal({ cwd: root });
 
 		await expect(
@@ -2378,7 +2378,7 @@ describe("native GJC ultragoal runtime", () => {
 
 	it("blocks complete checkpoint commands without the strict quality gate", async () => {
 		const root = await tempDir();
-		const created = await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
+		await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
 		await startNextUltragoalGoal({ cwd: root });
 
 		const result = await runNativeUltragoalCommand(
@@ -2605,7 +2605,7 @@ describe("ultragoal @goal decomposition", () => {
 
 	it("reconciles completed runs with mode-state and HUD active-state", async () => {
 		const root = await tempDir();
-		const created = await createUltragoalPlan({ cwd: root, brief: "Ship state reconciliation" });
+		await createUltragoalPlan({ cwd: root, brief: "Ship state reconciliation" });
 		await startNextUltragoalGoal({ cwd: root });
 		await seedStaleUltragoalWorkflowState(root);
 
@@ -2660,7 +2660,7 @@ describe("ultragoal @goal decomposition", () => {
 
 	it("reconciles terminal checkpoints despite corrupt stale mode-state", async () => {
 		const root = await tempDir();
-		const created = await createUltragoalPlan({ cwd: root, brief: "Ship corrupt state reconciliation" });
+		await createUltragoalPlan({ cwd: root, brief: "Ship corrupt state reconciliation" });
 		await startNextUltragoalGoal({ cwd: root });
 		await seedStaleUltragoalActiveEntry(root);
 		await fs.mkdir(sessionStateDir(root, TEST_SESSION_ID), { recursive: true });
@@ -2695,7 +2695,7 @@ describe("ultragoal @goal decomposition", () => {
 
 	it("schedules each @goal story in order through the existing API", async () => {
 		const root = await tempDir();
-		const created = await createUltragoalPlan({
+		await createUltragoalPlan({
 			cwd: root,
 			brief: "@goal: Parse\nstep one\n@goal: Normalize\nstep two\n@goal: Export\nstep three",
 		});
@@ -2845,7 +2845,7 @@ describe("ultragoal mode-state + HUD reconciliation (#342)", () => {
 	it("reconciles to terminal complete/active:false on aggregate completion (AC2)", async () => {
 		const root = await tempDir();
 		await withSessionId(TEST_SESSION_ID, async () => {
-			const created = await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
+			await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
 			await startNextUltragoalGoal({ cwd: root });
 			const result = await runNativeUltragoalCommand(
 				[
