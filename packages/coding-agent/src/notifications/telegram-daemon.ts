@@ -814,6 +814,8 @@ export class TelegramNotificationDaemon {
 	private readonly flatIdentitySent = new Set<string>();
 	/** Cached result of whether the paired chat is a private chat (flat-fallback gate). */
 	private pairedChatPrivate: boolean | undefined;
+	/** Bot username from getMe, cached once at owner startup for group/forum command targeting. */
+	private botUsername: string | undefined;
 	/** Sessions whose agent loop is currently busy (drives the typing indicator). */
 	private get busy(): Set<string> {
 		return this.dispatchState.busy;
@@ -1072,8 +1074,9 @@ export class TelegramNotificationDaemon {
 		text: string | undefined,
 		updateId: number | undefined,
 		threadId: number | undefined,
+		commandCtx: { chatType?: string; botUsername?: string },
 	): Promise<boolean> {
-		if (!isLifecycleCommandText(text)) return false;
+		if (!isLifecycleCommandText(text, commandCtx)) return false;
 		const reply = async (body: string): Promise<void> => {
 			for (const text of splitTelegramPlainText(body)) {
 				await this.botApi
@@ -1105,7 +1108,7 @@ export class TelegramNotificationDaemon {
 		if (updateId !== undefined && this.dispatchState.seenUpdateIds.has(updateId)) return true;
 		if (updateId !== undefined) this.dispatchState.seenUpdateIds.add(updateId);
 
-		const parsed = parseLifecycleCommand(text);
+		const parsed = parseLifecycleCommand(text, commandCtx);
 		if (parsed.kind === "none") return false;
 		if (parsed.kind === "usage" || parsed.kind === "reject") {
 			await reply(parsed.message);
@@ -1170,6 +1173,26 @@ export class TelegramNotificationDaemon {
 			backoff: this.pollConflictBackoff,
 			processUpdate: update => this.handleTelegramUpdate(update),
 		});
+	}
+	private async refreshBotIdentity(): Promise<void> {
+		try {
+			const response = (await this.botApi.call("getMe", {})) as {
+				result?: { username?: unknown };
+			};
+			const username = response.result?.username;
+			if (typeof username === "string" && username.trim().length > 0) {
+				this.botUsername = username.trim().replace(/^@/, "");
+			}
+		} catch {
+			// Fail closed for group/forum targeted commands when the bot identity is unavailable.
+			this.botUsername = undefined;
+		}
+	}
+	private commandTargetContext(chatType: string | undefined): { chatType?: string; botUsername?: string } {
+		return {
+			...(chatType !== undefined ? { chatType } : {}),
+			...(this.botUsername !== undefined ? { botUsername: this.botUsername } : {}),
+		};
 	}
 
 	private createSessionRouter(): OperatorEventRouter<SessionSocket> {
@@ -1910,12 +1933,19 @@ export class TelegramNotificationDaemon {
 		// session input.
 		{
 			const m = (update as { update_id?: number; message?: Record<string, unknown> }).message;
-			const chatId = (m?.chat as { id?: unknown } | undefined)?.id;
+			const chat = m?.chat as { id?: unknown; type?: unknown } | undefined;
+			const chatId = chat?.id;
+			const chatType = typeof chat?.type === "string" ? chat.type : undefined;
 			const cmdText = typeof m?.text === "string" ? m.text : undefined;
-			if (m !== undefined && String(chatId) === String(this.opts.chatId) && isLifecycleCommandText(cmdText)) {
+			const commandCtx = this.commandTargetContext(chatType);
+			if (
+				m !== undefined &&
+				String(chatId) === String(this.opts.chatId) &&
+				isLifecycleCommandText(cmdText, commandCtx)
+			) {
 				const updateId = (update as { update_id?: number }).update_id;
 				const threadId = typeof m.message_thread_id === "number" ? (m.message_thread_id as number) : undefined;
-				if (await this.handleLifecycleCommand(cmdText, updateId, threadId)) return;
+				if (await this.handleLifecycleCommand(cmdText, updateId, threadId, commandCtx)) return;
 			}
 		}
 		// Threaded injection: a free-text message in a known topic (not a button
@@ -1924,7 +1954,7 @@ export class TelegramNotificationDaemon {
 		// update_id dedupe are all enforced by decideThreadedInbound.
 		const raw = update as {
 			callback_query?: unknown;
-			message?: { reply_to_message?: { message_id?: unknown } };
+			message?: { chat?: { type?: unknown }; reply_to_message?: { message_id?: unknown } };
 		};
 		// A reply to a known ask message routes to that ask (below). Any OTHER
 		// message in a topic (plain text, or a reply to a non-ask message) is a
@@ -1932,6 +1962,7 @@ export class TelegramNotificationDaemon {
 		const replyTo = raw.message?.reply_to_message?.message_id;
 		const isAskReply =
 			replyTo !== undefined && (this.messageRoutes.has(String(replyTo)) || this.messageRoutes.has(Number(replyTo)));
+		const chatType = typeof raw.message?.chat?.type === "string" ? raw.message.chat.type : undefined;
 		if (!raw.callback_query && !isAskReply) {
 			const inbound = decideThreadedInbound(update as never, {
 				pairedChatId: this.opts.chatId,
@@ -1950,7 +1981,9 @@ export class TelegramNotificationDaemon {
 					const fileNotes = attachmentResult?.fileNotes ?? [];
 					const hasMedia = images.length > 0 || fileNotes.length > 0;
 					const injectedText = [inbound.text, ...fileNotes].filter(Boolean).join("\n");
-					const cfg = hasMedia ? undefined : parseInThreadConfigCommand(inbound.text);
+					const cfg = hasMedia
+						? undefined
+						: parseInThreadConfigCommand(inbound.text, this.commandTargetContext(chatType));
 					// A plain (non-config) message while an ask is pending for this session
 					// answers that ask as free-input — instead of starting a new user turn.
 					// Telegram asks always accept custom text (the SDK maps a string answer
@@ -2054,6 +2087,7 @@ export class TelegramNotificationDaemon {
 		this.startScanTimer();
 		this.startTypingTimer();
 		try {
+			await this.refreshBotIdentity();
 			await this.registerBotCommands();
 			await this.loadAliases();
 			await this.loadTopics();

@@ -6,6 +6,15 @@ describe("parseInThreadConfigCommand", () => {
 		expect(parseInThreadConfigCommand("/verbose")).toEqual({ verbosity: "verbose" });
 		expect(parseInThreadConfigCommand("/lean")).toEqual({ verbosity: "lean" });
 	});
+	test("accepts only this bot's Telegram username suffix on config commands in non-private chats", () => {
+		const groupCtx = { chatType: "supergroup", botUsername: "GajaeCodeBot" };
+		expect(parseInThreadConfigCommand("/verbose@GajaeCodeBot", groupCtx)).toEqual({ verbosity: "verbose" });
+		expect(parseInThreadConfigCommand("/verbosity@GajaeCodeBot lean", groupCtx)).toEqual({ verbosity: "lean" });
+		expect(parseInThreadConfigCommand("/redact@GajaeCodeBot off", groupCtx)).toEqual({ redact: false });
+		expect(parseInThreadConfigCommand("/verbose", groupCtx)).toBeUndefined();
+		expect(parseInThreadConfigCommand("/verbose@OtherBot", groupCtx)).toBeUndefined();
+		expect(parseInThreadConfigCommand("/verbose@GajaeCodeBot", { chatType: "supergroup" })).toBeUndefined();
+	});
 
 	test("/verbosity <arg> sets verbosity, rejects bad args", () => {
 		expect(parseInThreadConfigCommand("/verbosity verbose")).toEqual({ verbosity: "verbose" });

@@ -13,8 +13,10 @@
  */
 import * as os from "node:os";
 import type { SessionCloseTarget, SessionCreateTarget, SessionLifecycleResponse, SessionResumeTarget } from "./index";
+import { normalizeTelegramCommandTokenForBot, type TelegramCommandTargetContext } from "./telegram-commands";
 
 export type LifecycleCommandVerb = "session_create" | "session_close" | "session_resume";
+const LIFECYCLE_COMMAND_RE = /^\/session_(create|close|resume|recent)(?:@[A-Za-z0-9_]{5,32})?(?:\s|$)/;
 
 /** A parsed, validated lifecycle command (transport identity added by caller). */
 export type ParsedLifecycleCommand =
@@ -37,9 +39,11 @@ const USAGE = [
 ].join("\n");
 
 /** True when the text begins a /session_* command (cheap pre-gate). */
-export function isLifecycleCommandText(text: string | undefined): boolean {
+export function isLifecycleCommandText(text: string | undefined, ctx: TelegramCommandTargetContext = {}): boolean {
 	if (!text) return false;
-	return /^\/session_(create|close|resume|recent)\b/.test(text.trim());
+	const [rawCommand] = text.trim().split(/\s+/);
+	const command = normalizeTelegramCommandTokenForBot(rawCommand ?? "", ctx);
+	return command !== undefined && LIFECYCLE_COMMAND_RE.test(command);
 }
 
 /**
@@ -50,8 +54,11 @@ export function isLifecycleCommandText(text: string | undefined): boolean {
  * The caller MUST have already enforced paired-chat authorization; this function
  * performs grammar + target validation only.
  */
-export function parseLifecycleCommand(text: string | undefined): ParsedLifecycleCommand {
-	if (!isLifecycleCommandText(text)) return { kind: "none" };
+export function parseLifecycleCommand(
+	text: string | undefined,
+	ctx: TelegramCommandTargetContext = {},
+): ParsedLifecycleCommand {
+	if (!isLifecycleCommandText(text, ctx)) return { kind: "none" };
 	const raw = (text ?? "").trim();
 
 	// MVP: reject any initial-prompt separator outright (no prompt handling yet).
@@ -63,7 +70,8 @@ export function parseLifecycleCommand(text: string | undefined): ParsedLifecycle
 		};
 	}
 
-	const [command, ...args] = raw.split(/\s+/);
+	const [rawCommand, ...args] = raw.split(/\s+/);
+	const command = normalizeTelegramCommandTokenForBot(rawCommand ?? "", ctx) ?? "";
 
 	if (command === "/session_recent") {
 		const which = args[0];

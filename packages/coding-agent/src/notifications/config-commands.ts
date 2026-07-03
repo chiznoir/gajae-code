@@ -14,6 +14,8 @@
  * the returned change onto a `config_command` frame / settings update.
  */
 
+import { normalizeTelegramCommandTokenForBot, type TelegramCommandTargetContext } from "./telegram-commands";
+
 /** A parsed in-thread configuration change. */
 export interface ConfigCommandChange {
 	verbosity?: "lean" | "verbose";
@@ -25,11 +27,17 @@ export interface ConfigCommandChange {
  * `undefined` when the text is not a recognised config command (so the daemon
  * can fall through to treating it as a free-text injection).
  */
-export function parseInThreadConfigCommand(text: string): ConfigCommandChange | undefined {
+export function parseInThreadConfigCommand(
+	text: string,
+	ctx: TelegramCommandTargetContext = {},
+): ConfigCommandChange | undefined {
 	const trimmed = text.trim();
 	if (!trimmed.startsWith("/")) return undefined;
 	const [rawCommand, ...rest] = trimmed.slice(1).split(/\s+/);
-	const command = rawCommand?.toLowerCase();
+	const command = normalizeTelegramCommandTokenForBot(rawCommand ? `/${rawCommand}` : "", ctx)
+		?.slice(1)
+		.toLowerCase();
+	if (!command) return undefined;
 	const arg = rest[0]?.toLowerCase();
 
 	switch (command) {
