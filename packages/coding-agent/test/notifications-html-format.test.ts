@@ -113,6 +113,22 @@ describe("splitTelegramHtml", () => {
 		expect(chunks.join("")).toBe(raw);
 	});
 
+	test("prefers natural text boundaries before hard character splits", () => {
+		const raw = "alpha beta gamma";
+		const chunks = splitTelegramHtml(raw, 9);
+		expect(chunks).toEqual(["alpha ", "beta ", "gamma"]);
+		expect(chunks.join("")).toBe(raw);
+		expect(chunks.every(chunk => chunk.length <= 9)).toBe(true);
+	});
+
+	test("prefers a prior newline over later spaces to keep a sentence together", () => {
+		const raw = "first sentence.\n리더는 혼자 잘하는 사람이 아니라";
+		const chunks = splitTelegramHtml(raw, 25);
+		expect(chunks).toEqual(["first sentence.\n", "리더는 혼자 잘하는 사람이 아니라"]);
+		expect(chunks.join("")).toBe(raw);
+		expect(chunks.every(chunk => chunk.length <= 25)).toBe(true);
+	});
+
 	test("does not split HTML tags or entities and reopens preformatted blocks", () => {
 		const body = `<pre>${"x".repeat(40)}&amp;${"y".repeat(40)}</pre>`;
 		const chunks = splitTelegramHtml(body, 35);

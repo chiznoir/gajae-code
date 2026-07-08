@@ -347,6 +347,7 @@ export function splitTelegramHtml(message: string, max = TELEGRAM_MESSAGE_LIMIT)
 	const stack: OpenTag[] = [];
 	let out = "";
 	let chunkHasBody = false;
+	let lastBreak: { index: number; priority: number; stack: OpenTag[] } | undefined;
 
 	const closersFor = (s: OpenTag[]): string =>
 		s
@@ -355,11 +356,47 @@ export function splitTelegramHtml(message: string, max = TELEGRAM_MESSAGE_LIMIT)
 			.join("");
 	const openersFor = (s: OpenTag[]): string => s.map(t => t.tag).join("");
 	const minimumChunkLengthFor = (s: OpenTag[]): number => openersFor(s).length + closersFor(s).length + 1;
+	const breakPriority = (value: string): number => {
+		if (value === "\n") return 3;
+		if (/^[.!?。！？…]$/.test(value)) return 2;
+		if (/^[,;:，、；：)]$/.test(value)) return 1;
+		if (/^\s$/.test(value)) return 0;
+		return -1;
+	};
+	const rememberBreak = (value: string): void => {
+		const priority = breakPriority(value);
+		if (priority < 0) return;
+		const nextBreak = { index: out.length, priority, stack: stack.map(t => ({ ...t })) };
+		if (nextBreak.index + closersFor(nextBreak.stack).length > max) return;
+		if (
+			!lastBreak ||
+			nextBreak.priority > lastBreak.priority ||
+			(nextBreak.priority === lastBreak.priority && nextBreak.index > lastBreak.index)
+		) {
+			lastBreak = nextBreak;
+		}
+	};
 	const flush = (): void => {
 		if (!chunkHasBody) return;
 		chunks.push(out + closersFor(stack));
 		out = openersFor(stack);
 		chunkHasBody = false;
+		lastBreak = undefined;
+	};
+	const flushAtNaturalBreak = (): boolean => {
+		if (!lastBreak || lastBreak.index <= 0) return false;
+		const point = lastBreak;
+		const head = out.slice(0, point.index);
+		const tail = out.slice(point.index);
+		chunks.push(head + closersFor(point.stack));
+		out = openersFor(point.stack) + tail;
+		chunkHasBody = tail.length > 0;
+		lastBreak = undefined;
+		return true;
+	};
+	const flushFor = (nextStack: OpenTag[], extraLength: number): void => {
+		if (!chunkHasBody || out.length + extraLength + closersFor(nextStack).length <= max) return;
+		if (!flushAtNaturalBreak()) flush();
 	};
 
 	const updateStackForClose = (name: string): boolean => {
@@ -373,7 +410,7 @@ export function splitTelegramHtml(message: string, max = TELEGRAM_MESSAGE_LIMIT)
 		if (token.open) {
 			const nextStack = [...stack, { name: token.open, tag: token.openTag ?? token.value }];
 			if (minimumChunkLengthFor(nextStack) > max) continue;
-			if (chunkHasBody && out.length + token.value.length + closersFor(nextStack).length > max) flush();
+			flushFor(nextStack, token.value.length);
 			if (out.length + token.value.length + closersFor(nextStack).length > max) continue;
 			out += token.value;
 			chunkHasBody = true;
@@ -385,7 +422,7 @@ export function splitTelegramHtml(message: string, max = TELEGRAM_MESSAGE_LIMIT)
 			const idx = stack.findLastIndex(t => t.name === token.close);
 			if (idx === -1) continue;
 			const nextStack = stack.toSpliced(idx, 1);
-			if (chunkHasBody && out.length + token.value.length + closersFor(nextStack).length > max) flush();
+			flushFor(nextStack, token.value.length);
 			if (out.length + token.value.length + closersFor(nextStack).length > max) {
 				updateStackForClose(token.close);
 				continue;
@@ -396,9 +433,10 @@ export function splitTelegramHtml(message: string, max = TELEGRAM_MESSAGE_LIMIT)
 			continue;
 		}
 
-		if (chunkHasBody && out.length + token.value.length + closersFor(stack).length > max) flush();
+		flushFor(stack, token.value.length);
 		out += token.value;
 		chunkHasBody = true;
+		rememberBreak(token.value);
 	}
 	if (chunkHasBody) chunks.push(out + closersFor(stack));
 	return chunks;

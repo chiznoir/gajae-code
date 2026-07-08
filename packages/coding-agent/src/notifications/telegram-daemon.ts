@@ -2280,9 +2280,19 @@ export class TelegramNotificationDaemon {
 			const inline_keyboard = buildCompactChoiceGrid(options, (i: number) =>
 				this.aliasTable.put({ sessionId: session.sessionId, actionId: msg.id, answer: i }),
 			);
+			const kind = msg.kind === "idle" ? "idle" : "ask";
 			// HTML delivery: one sendMessage per chunk, keyboard on the last chunk;
 			// returns the last chunk's message_id (the reply-routable message).
 			const sendHtmlChunks = async (): Promise<number | undefined> => {
+				if (kind === "idle") {
+					this.pool.submit({
+						sessionId: session.sessionId,
+						lane: "idle",
+						payload: { send: { method: "sendMessage", lane: "idle", text: rendered.text }, topicId },
+					});
+					await this.flushPool();
+					return undefined;
+				}
 				const chunks = splitTelegramHtml(rendered.text);
 				let result: { result?: { message_id?: number } } = {};
 				for (let i = 0; i < chunks.length; i++) {
@@ -2296,7 +2306,6 @@ export class TelegramNotificationDaemon {
 				}
 				return result.result?.message_id;
 			};
-			const kind = msg.kind === "idle" ? "idle" : "ask";
 			if (this.opts.rich?.enabled !== false) {
 				// Rich (default on): promote to sendRichMessage with a top-level
 				// reply_markup (probe-confirmed). Any miss falls back to the HTML loop.

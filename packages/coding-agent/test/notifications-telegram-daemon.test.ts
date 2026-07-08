@@ -3853,3 +3853,55 @@ describe("telegram daemon /rich toggle (G005)", () => {
 		expect(bot.calls.some(c => c.method === "sendMessage" && c.body.text === "Rich messages: off")).toBe(false);
 	});
 });
+
+test("idle and context update are not repeated for each pending turn chunk", async () => {
+	const agentDir = tempAgentDir();
+	const bot = new FakeBotApi();
+	const now = 0;
+	const daemon = new TelegramNotificationDaemon({
+		settings: settings(agentDir),
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "42",
+		botApi: bot,
+		rich: { enabled: false },
+		now: () => now,
+	});
+	const session = { sessionId: "S", token: "tok", ws: { readyState: 1, send() {} }, pending: new Map() };
+
+	await daemon.handleSessionMessage(session as any, {
+		type: "identity_header",
+		sessionId: "S",
+		repo: "r",
+		branch: "b",
+	});
+	bot.calls = [];
+
+	const raw = "가".repeat(9000);
+	const expectedChunks = splitTelegramHtml(markdownToTelegramHtml(raw));
+	await daemon.handleSessionMessage(session as any, {
+		type: "turn_stream",
+		sessionId: "S",
+		phase: "finalized",
+		text: raw,
+	});
+	expect(bot.calls.filter(c => c.method === "sendMessage").map(c => c.body.text)).toEqual([expectedChunks[0]]);
+
+	bot.calls = [];
+	await daemon.handleSessionMessage(session as any, {
+		type: "action_needed",
+		id: "idle-1",
+		kind: "idle",
+		sessionId: "S",
+	});
+	await daemon.handleSessionMessage(session as any, {
+		type: "context_update",
+		sessionId: "S",
+		cwd: "repo",
+	});
+
+	const texts = bot.calls.filter(c => c.method === "sendMessage").map(c => String(c.body.text));
+	expect(texts.slice(0, expectedChunks.length - 1)).toEqual(expectedChunks.slice(1));
+	expect(texts.filter(text => text.includes("Agent idle"))).toHaveLength(1);
+	expect(texts.filter(text => text.includes("cwd:"))).toHaveLength(1);
+});
