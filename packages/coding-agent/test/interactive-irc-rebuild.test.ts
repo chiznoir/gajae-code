@@ -121,6 +121,38 @@ describe("IRC rebuild projection", () => {
 		expect(helpers.getRenderedIrcInlineComponents().has("expires-mid-reconcile")).toBe(false);
 	});
 
+	it("arms an expiry timer even when a legacy recheck window would have crossed the deadline", () => {
+		// Root-cause regression for the split-clock-read defect: reads are
+		// 9_999 (projection), 9_999 (what the removed reconcile-loop recheck
+		// would have seen), 10_001 (what the old scheduler's separate read saw,
+		// making it silently skip timer creation). The fixed implementation
+		// performs only two reads and arms a timer from the second (alive)
+		// read, so advancing fake time must remove the row.
+		vi.useFakeTimers({ now: 0 });
+		const { ctx, ledger, helpers, chatContainer } = makeContext();
+		ledger.observe(
+			{ observationId: "legacy-recheck-window", kind: "incoming", from: "peer", to: "you", text: "hello", timestamp: 0 },
+			true,
+		);
+		helpers.renderSessionContext(emptyContext);
+		expect(chatContainer.children).toHaveLength(2);
+
+		const realNow = Date.now;
+		let calls = 0;
+		Date.now = () => (++calls <= 2 ? 9_999 : 10_001);
+		try {
+			new EventController(ctx).reconcileIrcExpiryTimers(helpers.getRenderedIrcInlineComponents());
+		} finally {
+			Date.now = realNow;
+		}
+
+		// The row must not be stuck: either it was removed synchronously or a
+		// timer was armed. With the fixed two-read implementation a 1ms timer
+		// exists; fire it and assert removal.
+		vi.advanceTimersByTime(2);
+		expect(chatContainer.children).toHaveLength(0);
+	});
+
 	it("keeps persisted IRC observations between surrounding messages across rebuilds", () => {
 		const { ledger, helpers, chatContainer } = makeContext();
 		ledger.observe(
