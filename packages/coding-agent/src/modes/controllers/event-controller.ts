@@ -403,29 +403,39 @@ export class EventController {
 		for (const record of inlineProjection) {
 			const components = componentsByObservationId.get(record.observationId);
 			if (!components) continue;
-			// Recheck the deadline at scheduling time: a record can cross its
-			// deadline while projection/reconciliation ran above. The old timers
-			// were already cleared, so an expired row must be removed here or it
-			// would remain inline indefinitely.
-			if (record.mode === "ephemeral" && record.expiresAt! - Date.now() <= 0) {
-				for (const component of components) {
-					this.ctx.chatContainer.removeChild(component);
-				}
-				componentsByObservationId.delete(record.observationId);
-				continue;
-			}
 			this.#renderedIrcComponents.set(record.observationId, components);
-			this.#scheduleIrcExpiry(record, components);
+			// #scheduleIrcExpiry owns the single expiry clock read: a record that
+			// crossed its deadline while projection/reconciliation ran above is
+			// cleaned up there (old timers were already cleared, so silently
+			// skipping the timer would leave the row inline indefinitely).
+			if (!this.#scheduleIrcExpiry(record, components)) {
+				componentsByObservationId.delete(record.observationId);
+			}
 		}
 	}
 
+	/**
+	 * Arms the removal timer for an ephemeral record using a single clock read.
+	 * Returns false when the record's deadline has already elapsed — in that
+	 * case the rendered components are removed from the chat container and
+	 * {@link #renderedIrcComponents} here, and the caller must drop its own
+	 * bookkeeping entry. Persistent records always return true (no timer).
+	 */
 	#scheduleIrcExpiry(
 		record: IrcObservationRecord,
 		components: readonly Component[],
-	): void {
-		if (record.mode !== "ephemeral" || components.length === 0 || this.#ircExpiryTimers.has(record.observationId)) return;
+	): boolean {
+		if (record.mode !== "ephemeral" || components.length === 0 || this.#ircExpiryTimers.has(record.observationId)) {
+			return true;
+		}
 		const remainingMs = record.expiresAt! - Date.now();
-		if (remainingMs <= 0) return;
+		if (remainingMs <= 0) {
+			this.#renderedIrcComponents.delete(record.observationId);
+			for (const component of components) {
+				this.ctx.chatContainer.removeChild(component);
+			}
+			return false;
+		}
 		const timer = setTimeout(() => {
 			this.#ircExpiryTimers.delete(record.observationId);
 			this.#renderedIrcComponents.delete(record.observationId);
@@ -436,6 +446,7 @@ export class EventController {
 		}, remainingMs);
 		timer.unref?.();
 		this.#ircExpiryTimers.set(record.observationId, timer);
+		return true;
 	}
 
 	async #handleSubagentSteerMessage(

@@ -104,8 +104,10 @@ describe("IRC rebuild projection", () => {
 		helpers.renderSessionContext(emptyContext);
 		expect(chatContainer.children).toHaveLength(2);
 
-		// First Date.now() (projection snapshot) sees the record alive at 9_999;
-		// every later call (scheduling-time recheck) sees the deadline crossed.
+		// The projection snapshot (single clock read #1) sees the record alive
+		// at 9_999; the scheduler's own single clock read (#2) crosses the
+		// deadline at 10_001 — the previously missed scheduling boundary now
+		// owned by #scheduleIrcExpiry's cleanup path.
 		const realNow = Date.now;
 		let calls = 0;
 		Date.now = () => (++calls === 1 ? 9_999 : 10_001);
