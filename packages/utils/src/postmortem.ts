@@ -167,10 +167,12 @@ async function handleFatalError(label: string, reason: unknown, cleanupReason: R
 	process.exitCode = 1;
 	const err = errorForDiagnostic(reason);
 	safeStderrWrite(formatFatalError(label, err));
-	logger.error(label === "Uncaught Exception" ? "Uncaught exception" : "Unhandled rejection", {
-		err,
-		stack: err.stack,
-	});
+	if (!quietShutdownStarted) {
+		logger.error(label === "Uncaught Exception" ? "Uncaught exception" : "Unhandled rejection", {
+			err,
+			stack: err.stack,
+		});
+	}
 	await runCleanupAndWait(cleanupReason);
 	process.exit(1);
 }

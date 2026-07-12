@@ -174,6 +174,7 @@ describe("postmortem process stdout EPIPE policy", () => {
 
 			expect(JSON.parse(await fs.readFile(resultPath, "utf8"))).toEqual({ count: 1 });
 			expectOrdinaryFatal(result, "Uncaught Exception", "fixture: ordinary fatal during quiet cleanup");
+			expect(combinedOutput(result)).not.toContain('"message":"Uncaught exception"');
 		} finally {
 			await fs.rm(temporaryDirectory, { recursive: true, force: true });
 		}
