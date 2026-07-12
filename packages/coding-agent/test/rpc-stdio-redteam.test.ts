@@ -39,6 +39,8 @@ interface RpcHarness {
 	nextFrame(timeoutMs?: number): Promise<Frame>;
 	send(command: object | string): void;
 	closeStdin(): Promise<void>;
+	closeStdout(): Promise<void>;
+
 	kill(): void;
 }
 
@@ -137,6 +139,11 @@ function spawnRpcServer(options: { cwd?: string; sessionDir?: string } = {}): Rp
 				if (timer) clearTimeout(timer);
 			}
 		},
+		async closeStdout(): Promise<void> {
+			const closed = lines.return?.(undefined);
+			if (closed) await closed;
+		},
+
 		send(command: object | string): void {
 			const line = typeof command === "string" ? command : JSON.stringify(command);
 			proc.stdin.write(`${line}\n`);
@@ -219,6 +226,23 @@ describe("gjc --mode rpc red-team stdio lifecycle", () => {
 		}
 	}, 30_000);
 
+	it("terminalizes quietly after stdout closes without waiting for stdin EOF", async () => {
+		const harness = spawnRpcServer();
+		try {
+			expect(await harness.nextFrame()).toEqual({ type: "ready" });
+			await harness.closeStdout();
+			harness.send({ id: "trigger-epipe", type: "get_state" });
+			const exitCode = await Promise.race([
+				harness.proc.exited,
+				Bun.sleep(10_000).then(() => Promise.reject(new Error("RPC waited for stdin EOF after stdout closed"))),
+			]);
+			expect(exitCode).toBe(0);
+			expect((await harness.stderrText).trim()).toBe("");
+		} finally {
+			harness.kill();
+		}
+	}, 30_000);
+
 	it("flushes durable session state on EOF and reloads it in a new RPC process", async () => {
 		const marker = "RPC_PERSISTENCE_MARKER";
 		const firstRun = await driveRpcServer([
@@ -247,6 +271,20 @@ describe("gjc --mode rpc red-team stdio lifecycle", () => {
 		]);
 		expect(secondRun.exitCode, secondRun.stderr).toBe(0);
 		expect(findResponse(secondRun.frames, "switch")).toMatchObject({ success: true, data: { cancelled: false } });
+	}, 30_000);
+
+	it("drains ordered mutation responses before immediate stdin EOF", async () => {
+		const result = await driveRpcServer([
+			{ id: "first-name", type: "set_session_name", name: "first" },
+			{ id: "second-name", type: "set_session_name", name: "second" },
+		]);
+		expect(result.exitCode, result.stderr).toBe(0);
+		const firstIndex = result.frames.findIndex(frame => frame.type === "response" && frame.id === "first-name");
+		const secondIndex = result.frames.findIndex(frame => frame.type === "response" && frame.id === "second-name");
+		expect(firstIndex).toBeGreaterThanOrEqual(0);
+		expect(secondIndex).toBeGreaterThan(firstIndex);
+		expect(findResponse(result.frames, "first-name")).toMatchObject({ success: true, command: "set_session_name" });
+		expect(findResponse(result.frames, "second-name")).toMatchObject({ success: true, command: "set_session_name" });
 	}, 30_000);
 
 	it("survives a malformed JSONL frame and accepts the next command", async () => {

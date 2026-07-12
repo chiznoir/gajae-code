@@ -9,7 +9,7 @@
 ### Fixed
 
 - IRC deliveries now accept their exchange batch in the recipient's volatile current-session queue before recipient/main UI observations or sender success. Awaited deliveries generate the reply first, then accept the ordered incoming + auto-reply pair and commit the IRC roster claim before observation; provider failures and sender aborts before acceptance leave no ghost exchange, while observer failures after acceptance are isolated. This is not a durability guarantee: durable history injection remains a later flush and no fsync, recovery, persistent IDs, or deduplication was added.
-- Piping gjc output to a consumer that exits early (`gjc --help | head -1`, `gjc -p ... | jq -e`, an RPC host that dies) no longer crashes the process with a fatal `EPIPE` uncaught-exception dump and exit code 1. Print mode latches stdout writes to a no-op once the pipe is broken (the run still completes and persists), RPC mode drops frames whose sink peer vanished instead of tearing down the server (without latching the swappable `--listen` sink dead), and the process-level postmortem policy exits quietly with 141 (128 + SIGPIPE) for any remaining unhandled broken-pipe write, including socket `send` variants that previously killed live interactive sessions.
+- Print mode now records terminal text-mode errors as exit status 1 (or 78 for context overflow) without bypassing output quiescence or session disposal. It retains JSON event delivery through disposal and suppresses `EPIPE` from its owned stdout; `ERR_STREAM_DESTROYED` is suppressed only after that `EPIPE` has latched, while other output failures remain errors.
 
 ## [0.10.0] - 2026-07-12
 

@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- Broken output pipes no longer crash the process with a fatal internal-error dump. When an uncaught exception or unhandled rejection carries `EPIPE`/`ERR_STREAM_DESTROYED` (the consumer of stdout/stderr or another pipe exited early, e.g. `gjc --help | head -1`), the postmortem handlers now run cleanup and exit quietly with code 141 (128 + SIGPIPE), matching standard CLI pipeline semantics. Non-pipe fatal errors keep the existing dump and exit code 1. A shared `isBrokenPipeError` / `BROKEN_PIPE_EXIT_CODE` is exported for stream writers.
+- Broken stdout pipes no longer crash early CLI output with a fatal internal-error dump. The process-level fallback exits quietly with numeric status 141 only for `EPIPE` observed directly from `process.stdout.write` or carrying `syscall: "write"` with an open descriptor matching stdout or the same unchanged pipe identity; unrelated socket/child-pipe errors, unattributed `EPIPE`, and process-level `ERR_STREAM_DESTROYED` keep the existing fatal diagnostics and status 1. Local output owners use separate sink-aware classification so expected peer closure does not become a universal process policy.
 
 ## [0.9.6] - 2026-07-10
 ### Fixed
