@@ -3335,6 +3335,11 @@ export class SessionManager {
 
 	restoreState(snapshot: SessionManagerStateSnapshot): void {
 		const restoredFileEntries = [...snapshot.materializedFileEntries];
+		const retainsPersistWriter =
+			this.#persistWriter?.isOpen() === true &&
+			this.#sessionId === snapshot.sessionId &&
+			this.#sessionFile === snapshot.sessionFile &&
+			this.#persistWriterPath === snapshot.sessionFile;
 		this.#sessionId = snapshot.sessionId;
 		this.#sessionName = snapshot.sessionName;
 		this.#titleSource = snapshot.titleSource;
@@ -3342,8 +3347,10 @@ export class SessionManager {
 		this.#flushed = snapshot.flushed;
 		this.#needsFullRewriteOnNextPersist = snapshot.needsFullRewriteOnNextPersist;
 		this.#fileEntries = restoredFileEntries;
-		this.#persistWriter = undefined;
-		this.#persistWriterPath = undefined;
+		if (!retainsPersistWriter) {
+			this.#persistWriter = undefined;
+			this.#persistWriterPath = undefined;
+		}
 		this.#persistChain = Promise.resolve();
 		this.#persistError = undefined;
 		this.#persistErrorReported = false;

@@ -849,6 +849,66 @@ describe("AgentSession retry fallback", () => {
 		expect(session.model?.id).toBe(primaryModel.id);
 	});
 
+	it("restores the active retry fallback after a late default selection failure so cooldown expiry returns to primary", async () => {
+		// Given
+		const primaryModel = getBundledModel("anthropic", "claude-sonnet-4-5");
+		const fallbackModel = getBundledModel("openai", "gpt-4o-mini");
+		if (!primaryModel || !fallbackModel) {
+			throw new Error("Expected bundled test models to exist");
+		}
+
+		const requestedModels: string[] = [];
+		const agent = createFallbackAgent(primaryModel, requestedModels);
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.baseDelayMs": 5,
+			"retry.fallbackChains": {
+				default: [`${fallbackModel.provider}/${fallbackModel.id}`],
+			},
+			"retry.fallbackRevertPolicy": "cooldown-expiry",
+		});
+		settings.setModelRole("default", `${primaryModel.provider}/${primaryModel.id}`);
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+		});
+		let now = Date.now();
+		vi.spyOn(Date, "now").mockImplementation(() => now);
+
+		await session.prompt("First prompt triggers fallback");
+		await session.waitForIdle();
+		expect(requestedModels).toEqual([
+			`${primaryModel.provider}/${primaryModel.id}`,
+			`${fallbackModel.provider}/${fallbackModel.id}`,
+		]);
+		expect(session.model).toBe(fallbackModel);
+
+		const lateLiveApplyError = new Error("late default selection failure");
+		const originalLiveApply = session.setModelTemporary.bind(session);
+		vi.spyOn(session, "setModelTemporary").mockImplementationOnce(async (...args) => {
+			await originalLiveApply(...args);
+			throw lateLiveApplyError;
+		});
+
+		// When
+		const selection = session.setDefaultModelSelection(primaryModel, undefined);
+		await expect(selection).rejects.toBe(lateLiveApplyError);
+		expect(session.model).toBe(fallbackModel);
+		now += 240;
+		await session.prompt("Cooldown expiry should restore primary");
+		await session.waitForIdle();
+
+		// Then
+		expect(requestedModels).toEqual([
+			`${primaryModel.provider}/${primaryModel.id}`,
+			`${fallbackModel.provider}/${fallbackModel.id}`,
+			`${primaryModel.provider}/${primaryModel.id}`,
+		]);
+		expect(session.model).toBe(primaryModel);
+	});
+
 	it("preserves thinking on bare fallback selectors and does not overwrite user thinking on restore", async () => {
 		const primaryModel = getBundledModel("anthropic", "claude-sonnet-4-5");
 		const fallbackModel = getBundledModel("openai", "gpt-4o-mini");

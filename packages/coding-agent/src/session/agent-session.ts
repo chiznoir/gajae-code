@@ -7315,6 +7315,93 @@ export class AgentSession {
 		await this.#syncEditToolModeAfterModelChange(previousEditMode);
 	}
 
+	async setDefaultModelSelection(
+		model: Model,
+		thinkingLevel: ThinkingLevel | undefined,
+	): Promise<DefaultModelSelectionResult> {
+		const predecessor = this.#defaultModelSelectionTail;
+		const transaction = Promise.withResolvers<void>();
+		this.#defaultModelSelectionTail = transaction.promise;
+		try {
+			await predecessor;
+			if (thinkingLevel === ThinkingLevel.Inherit) {
+				throw new Error("Default model selection cannot inherit a thinking level");
+			}
+			const apiKey = await this.#modelRegistry.getApiKey(model, this.sessionId);
+			if (!apiKey) {
+				throw new Error(`No API key for ${model.provider}/${model.id}`);
+			}
+			const resolvedLevel = resolveThinkingLevelForModel(model, thinkingLevel);
+			const effectiveLevel =
+				resolvedLevel ??
+				resolveThinkingLevelForModel(model, model.thinking?.defaultLevel ?? this.thinkingLevel) ??
+				ThinkingLevel.Off;
+			await this.waitForIdle();
+			const previousDefaultModelRole = this.settings.getGlobal("modelRoles")?.default;
+			await this.sessionManager.flush();
+			const previousSessionState = this.sessionManager.captureState();
+			const previousModel = this.model;
+			const previousThinkingLevel = this.thinkingLevel;
+			const previousActiveRetryFallback = this.#activeRetryFallback ? { ...this.#activeRetryFallback } : undefined;
+			await this.settings.setGlobalModelRoleAndFlush(
+				"default",
+				formatModelSelectorValue(`${model.provider}/${model.id}`, effectiveLevel),
+			);
+			try {
+				await this.setModelTemporary(model, effectiveLevel);
+				if (this.thinkingLevel === previousThinkingLevel) {
+					this.sessionManager.appendThinkingLevelChange(this.thinkingLevel);
+				}
+				this.sessionManager.appendModelChange(`${model.provider}/${model.id}`, "default");
+			} catch (error) {
+				await this.settings.setGlobalModelRoleAndFlush("default", previousDefaultModelRole).catch(rollbackError => {
+					logger.warn("Failed to restore durable default model selection after live apply failure", {
+						error: String(rollbackError),
+					});
+				});
+				let restoredLiveState = false;
+				try {
+					const failedEditMode = this.#resolveActiveEditMode();
+					const currentModel = this.model;
+					const hasCompatibleModelTransport =
+						currentModel !== undefined &&
+						previousModel !== undefined &&
+						currentModel.provider === previousModel.provider &&
+						currentModel.id === previousModel.id &&
+						currentModel.api === previousModel.api;
+					if (hasCompatibleModelTransport) {
+						this.agent.setModel(previousModel);
+						this.#syncAppendOnlyContext(previousModel);
+					} else {
+						this.#setModelWithProviderSessionReset(previousModel);
+					}
+					this.#thinkingLevel = previousThinkingLevel;
+					this.agent.setThinkingLevel(toReasoningEffort(previousThinkingLevel));
+					await this.#syncEditToolModeAfterModelChange(failedEditMode);
+					restoredLiveState = true;
+				} catch (rollbackError) {
+					logger.warn("Failed to restore live default model selection after live apply failure", {
+						error: String(rollbackError),
+					});
+				}
+				if (restoredLiveState) {
+					this.#activeRetryFallback = previousActiveRetryFallback;
+				}
+				try {
+					this.sessionManager.restoreState(previousSessionState);
+					await this.sessionManager.rewriteEntries();
+				} catch (rollbackError) {
+					logger.warn("Failed to restore session state after live default model selection failure", {
+						error: String(rollbackError),
+					});
+				}
+				throw error;
+			}
+			return { provider: model.provider, modelId: model.id, thinkingLevel: effectiveLevel };
+		} finally {
+			transaction.resolve();
+		}
+	}
 	/**
 	 * Cycle to next/previous model.
 	 * Uses scoped models (from --models flag) if available, otherwise all available models.
@@ -8683,7 +8770,7 @@ export class AgentSession {
 		return candidate;
 	}
 
-	#setModelWithProviderSessionReset(model: Model): void {
+	#setModelWithProviderSessionReset(model: Model | undefined): void {
 		const currentModel = this.model;
 		if (currentModel) {
 			this.#closeProviderSessionsForModelSwitch(currentModel, model);
@@ -8723,15 +8810,15 @@ export class AgentSession {
 		}
 	}
 
-	#closeProviderSessionsForModelSwitch(currentModel: Model, nextModel: Model): void {
+	#closeProviderSessionsForModelSwitch(currentModel: Model, nextModel: Model | undefined): void {
 		const providerKeys = new Set<string>();
-		if (currentModel.api === "openai-codex-responses" || nextModel.api === "openai-codex-responses") {
+		if (currentModel.api === "openai-codex-responses" || nextModel?.api === "openai-codex-responses") {
 			providerKeys.add("openai-codex-responses");
 		}
 		if (currentModel.api === "openai-responses") {
 			providerKeys.add(`openai-responses:${currentModel.provider}`);
 		}
-		if (nextModel.api === "openai-responses") {
+		if (nextModel?.api === "openai-responses") {
 			providerKeys.add(`openai-responses:${nextModel.provider}`);
 		}
 
