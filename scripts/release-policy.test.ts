@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import * as path from "node:path";
+import { STABLE_GITHUB_RELEASE_FINALIZATION_JOB_NAME } from "./release";
 
 const repoRoot = path.join(import.meta.dir, "..");
 const ciWorkflowPath = path.join(repoRoot, ".github/workflows/ci.yml");
@@ -48,6 +49,7 @@ describe("stable release policy", () => {
 		expect(jobSection(ci, "release_github_verify")).toContain("gajae-release-packages-v1.json");
 		expect(jobSection(ci, "release_github_finalize")).toContain("--verify-stable-finalization");
 		expect(jobSection(ci, "release_github_finalize")).toContain("gh release edit \"$RELEASE_TAG\" --draft=false --prerelease=false");
+		expect(jobSection(ci, "release_github_finalize")).toContain(`name: ${STABLE_GITHUB_RELEASE_FINALIZATION_JOB_NAME}`);
 	});
 
 	test("serializes production release refs globally without cancelling them while retaining per-ref CI concurrency", async () => {

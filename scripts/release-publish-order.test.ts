@@ -11,7 +11,14 @@ import {
 	validateNpmRegistryUrl,
 } from "./ci-release-publish";
 import { PUBLIC_PACKAGE_DEFINITIONS, type PackageEvidenceRecord } from "./release-evidence";
-import { assertAtomicPushRemoteState, isStableReleaseVersion, parseReleaseCli, releaseAtomicPushArgs } from "./release";
+import {
+	assertAtomicPushRemoteState,
+	classifyStableReleaseFinalizationReceipt,
+	isStableReleaseVersion,
+	parseReleaseCli,
+	releaseAtomicPushArgs,
+	STABLE_GITHUB_RELEASE_FINALIZATION_JOB_NAME,
+} from "./release";
 
 
 interface PackageManifest {
@@ -363,6 +370,21 @@ describe("immutable stable release contracts", () => {
 		expect(parseReleaseCli(["1.2.3"])).toEqual({ mode: "release", version: "1.2.3" });
 		expect(() => parseReleaseCli(["watch", "--verbose"])).toThrow("exactly one argument");
 		expect(() => parseReleaseCli(["1.2.3", "--dry-run"])).toThrow("exactly one argument");
+	});
+	test("requires a successful stable GitHub release finalization receipt", () => {
+		const finalizationJob = (conclusion: string | null, status = "completed") => ({
+			databaseId: 1,
+			status,
+			conclusion,
+			name: STABLE_GITHUB_RELEASE_FINALIZATION_JOB_NAME,
+		});
+
+		expect(classifyStableReleaseFinalizationReceipt([]).outcome).toBe("missing");
+		expect(classifyStableReleaseFinalizationReceipt([finalizationJob("skipped")]).outcome).toBe("skipped");
+		expect(classifyStableReleaseFinalizationReceipt([finalizationJob("cancelled")]).outcome).toBe("cancelled");
+		expect(classifyStableReleaseFinalizationReceipt([finalizationJob("failure")]).outcome).toBe("failed");
+		expect(classifyStableReleaseFinalizationReceipt([finalizationJob("success")]).outcome).toBe("success");
+		expect(classifyStableReleaseFinalizationReceipt([finalizationJob("success", "in_progress")]).outcome).toBe("incomplete");
 	});
 
 	test("release checks fetched remote tags, typed CI observations, and version catalogs before committing", async () => {

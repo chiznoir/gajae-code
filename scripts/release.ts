@@ -35,11 +35,38 @@ interface ReleaseRunObservation {
 	event: string;
 }
 
-interface ReleaseRunJobObservation {
+export interface ReleaseRunJobObservation {
 	databaseId: number;
 	status: string;
 	conclusion: string | null;
 	name: string;
+}
+
+export const STABLE_GITHUB_RELEASE_FINALIZATION_JOB_NAME = "Finalize stable GitHub Release";
+
+export type StableReleaseFinalizationReceipt =
+	| { outcome: "missing" }
+	| { outcome: "multiple"; jobs: readonly ReleaseRunJobObservation[] }
+	| { outcome: "incomplete"; job: ReleaseRunJobObservation }
+	| { outcome: "skipped"; job: ReleaseRunJobObservation }
+	| { outcome: "cancelled"; job: ReleaseRunJobObservation }
+	| { outcome: "failed"; job: ReleaseRunJobObservation }
+	| { outcome: "success"; job: ReleaseRunJobObservation };
+
+export function classifyStableReleaseFinalizationReceipt(
+	jobs: readonly ReleaseRunJobObservation[],
+): StableReleaseFinalizationReceipt {
+	const finalizationJobs = jobs.filter(job => job.name === STABLE_GITHUB_RELEASE_FINALIZATION_JOB_NAME);
+	if (finalizationJobs.length === 0) return { outcome: "missing" };
+	if (finalizationJobs.length !== 1) return { outcome: "multiple", jobs: finalizationJobs };
+
+	const [job] = finalizationJobs;
+	if (job === undefined) throw new Error("Expected exactly one stable release finalization job");
+	if (job.status !== "completed") return { outcome: "incomplete", job };
+	if (job.conclusion === "success") return { outcome: "success", job };
+	if (job.conclusion === "skipped") return { outcome: "skipped", job };
+	if (job.conclusion === "cancelled") return { outcome: "cancelled", job };
+	return { outcome: "failed", job };
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {
@@ -147,6 +174,35 @@ async function printFailedJobLog(job: ReleaseRunJobObservation): Promise<void> {
 	console.error(`\n--- Last 20 lines of ${job.name} ---\n${tail}\n`);
 }
 
+async function reportStableReleaseFinalizationFailure(
+	run: ReleaseRunObservation,
+	receipt: Exclude<StableReleaseFinalizationReceipt, { outcome: "success" }>,
+): Promise<void> {
+	const runReference = `CI run ${run.databaseId} for release tag ${run.headBranch}`;
+	switch (receipt.outcome) {
+		case "missing":
+			console.error(`\nRelease finalization missing:\n  - ${runReference} did not contain required job "${STABLE_GITHUB_RELEASE_FINALIZATION_JOB_NAME}". The GitHub Release was not confirmed final; inspect and rerun this CI workflow.`);
+			return;
+		case "multiple":
+			console.error(`\nRelease finalization ambiguous:\n  - ${runReference} contained ${receipt.jobs.length} jobs named "${STABLE_GITHUB_RELEASE_FINALIZATION_JOB_NAME}". The GitHub Release was not confirmed final; inspect the CI workflow.`);
+			return;
+		case "incomplete":
+			console.error(`\nRelease finalization incomplete:\n  - ${runReference} reported "${STABLE_GITHUB_RELEASE_FINALIZATION_JOB_NAME}" as ${receipt.job.status}. The GitHub Release was not confirmed final; inspect and rerun this CI workflow.`);
+			return;
+		case "skipped":
+			console.error(`\nRelease finalization skipped:\n  - ${runReference} skipped "${STABLE_GITHUB_RELEASE_FINALIZATION_JOB_NAME}". Its release gates did not complete, so do not treat the tag as released; inspect the CI workflow.`);
+			return;
+		case "cancelled":
+			console.error(`\nRelease finalization cancelled:\n  - ${runReference} cancelled "${STABLE_GITHUB_RELEASE_FINALIZATION_JOB_NAME}". The GitHub Release was not confirmed final; inspect and rerun this CI workflow.`);
+			await printFailedJobLog(receipt.job);
+			return;
+		case "failed":
+			console.error(`\nRelease finalization failed:\n  - ${runReference} concluded "${receipt.job.conclusion ?? "unknown"}" for "${STABLE_GITHUB_RELEASE_FINALIZATION_JOB_NAME}". The GitHub Release was not confirmed final; inspect the failed job log.`);
+			await printFailedJobLog(receipt.job);
+			return;
+	}
+}
+
 async function watchCI(expectedTag?: string): Promise<boolean> {
 	const commitSha = (await git(["rev-parse", "HEAD"]).text()).trim();
 	if (!/^[0-9a-f]{40}$/u.test(commitSha)) throw new Error("Cannot resolve the current commit for CI observation");
@@ -196,6 +252,15 @@ async function watchCI(expectedTag?: string): Promise<boolean> {
 		}
 
 		if (pending.length === 0) {
+			if (expectedTag !== undefined) {
+				for (const run of passed) {
+					const receipt = classifyStableReleaseFinalizationReceipt(await queryReleaseRunJobs(run.databaseId));
+					if (receipt.outcome !== "success") {
+						await reportStableReleaseFinalizationFailure(run, receipt);
+						return false;
+					}
+				}
+			}
 			console.log("  All CI checks passed!\n");
 			return true;
 		}

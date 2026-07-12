@@ -912,6 +912,7 @@ jobs:
               HOME="$runtime_dir/home" XDG_DATA_HOME="$runtime_dir/xdg" ./gjc-darwin-arm64 --version
 
    release_github_finalize:
+      name: Finalize stable GitHub Release
       timeout-minutes: 15
       if: ${{ !cancelled() && needs.release_npm_publish.result == 'success' && needs.release_github_final_evidence.result == 'success' && needs.release_github_verify.result == 'success' && needs.release_source_verify.result == 'success' && needs.release_context.outputs.skip-npm != 'true' }}
       needs: [release_npm_publish, release_github_final_evidence, release_github_verify, release_context, release_source_verify]
