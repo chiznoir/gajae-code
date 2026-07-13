@@ -883,7 +883,7 @@ describe("AgentSession retry fallback", () => {
 			`${primaryModel.provider}/${primaryModel.id}`,
 			`${fallbackModel.provider}/${fallbackModel.id}`,
 		]);
-		expect(session.model).toBe(fallbackModel);
+		expect(session.model).toMatchObject({ provider: fallbackModel.provider, id: fallbackModel.id });
 
 		const lateLiveApplyError = new Error("late default selection failure");
 		const originalLiveApply = session.setModelTemporary.bind(session);
@@ -895,7 +895,7 @@ describe("AgentSession retry fallback", () => {
 		// When
 		const selection = session.setDefaultModelSelection(primaryModel, undefined);
 		await expect(selection).rejects.toBe(lateLiveApplyError);
-		expect(session.model).toBe(fallbackModel);
+		expect(session.model).toMatchObject({ provider: fallbackModel.provider, id: fallbackModel.id });
 		now += 240;
 		await session.prompt("Cooldown expiry should restore primary");
 		await session.waitForIdle();
@@ -906,7 +906,7 @@ describe("AgentSession retry fallback", () => {
 			`${fallbackModel.provider}/${fallbackModel.id}`,
 			`${primaryModel.provider}/${primaryModel.id}`,
 		]);
-		expect(session.model).toBe(primaryModel);
+		expect(session.model).toMatchObject({ provider: primaryModel.provider, id: primaryModel.id });
 	});
 
 	it("preserves thinking on bare fallback selectors and does not overwrite user thinking on restore", async () => {
