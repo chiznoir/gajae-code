@@ -26,6 +26,9 @@ const DARWIN_PROC_PIDTBSDINFO = 3;
 const DARWIN_PROC_BSDINFO_SIZE = 136;
 const DARWIN_PROC_BSDINFO_START_SECONDS_OFFSET = 120;
 const DARWIN_PROC_BSDINFO_START_MICROSECONDS_OFFSET = 128;
+const POWERSHELL_PROCESS_INCARNATION_COMMAND = "powershell.exe";
+const WIN32_PROCESS_INCARNATION_OUTPUT = /^(\d+)\t(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{7}Z)(?:\r?\n)?$/;
+
 const darwinProcLibrary =
 	process.platform === "darwin"
 		? (() => {
@@ -412,6 +415,56 @@ function processIncarnationForBroker(broker: Broker, pid: number): string | unde
 	return reader ? reader(pid) : processIncarnation(pid);
 }
 
+type ProcessIncarnationCommandResult = { exitCode: number | null; stdout: string } | undefined;
+
+export type ProcessIncarnationCommandRunner = (
+	command: string,
+	args: readonly string[],
+) => ProcessIncarnationCommandResult;
+
+export interface ProcessIncarnationOptions {
+	platform?: typeof process.platform;
+	runCommand?: ProcessIncarnationCommandRunner;
+}
+
+function runProcessIncarnationCommand(command: string, args: readonly string[]): ProcessIncarnationCommandResult {
+	try {
+		const result = Bun.spawnSync([command, ...args], { stdin: "ignore", stdout: "pipe", stderr: "ignore" });
+		return { exitCode: result.exitCode, stdout: Buffer.from(result.stdout).toString("utf8") };
+	} catch {
+		return undefined;
+	}
+}
+
+function windowsProcessIncarnationCommand(pid: number): { command: string; args: string[] } {
+	return {
+		command: POWERSHELL_PROCESS_INCARNATION_COMMAND,
+		args: [
+			"-NoLogo",
+			"-NoProfile",
+			"-NonInteractive",
+			"-Command",
+			[
+				"$ErrorActionPreference = 'Stop'",
+				"$OutputEncoding = [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)",
+				`$process = Get-Process -Id ${pid} -ErrorAction Stop`,
+				'$startTime = $process.StartTime.ToUniversalTime().ToString("o")',
+				'[Console]::Out.WriteLine(("{0}`t{1}" -f $process.Id, $startTime))',
+			].join("; "),
+		],
+	};
+}
+
+function parseWin32ProcessIncarnation(pid: number, output: string): string | undefined {
+	const match = WIN32_PROCESS_INCARNATION_OUTPUT.exec(output);
+	if (!match) return undefined;
+	if (match[1] !== String(pid)) return undefined;
+	const startedAt = match[2];
+	const date = new Date(startedAt);
+	if (!Number.isFinite(date.getTime()) || date.toISOString() !== `${startedAt.slice(0, 23)}Z`) return undefined;
+	return `win32:${startedAt}`;
+}
+
 /** Parse the microsecond-resolution start timestamp returned by Darwin proc_pidinfo. */
 export function parseDarwinProcessIncarnation(info: Uint8Array): string | undefined {
 	if (info.byteLength < DARWIN_PROC_BSDINFO_SIZE) return undefined;
@@ -427,9 +480,10 @@ export function parseDarwinProcessIncarnation(info: Uint8Array): string | undefi
 }
 
 /** A PID is reusable; bind it to the OS-provided process start incarnation. */
-export function processIncarnation(pid: number): string | undefined {
+export function processIncarnation(pid: number, options: ProcessIncarnationOptions = {}): string | undefined {
 	if (!Number.isSafeInteger(pid) || pid <= 0) return undefined;
-	if (process.platform === "linux") {
+	const platform = options.platform ?? process.platform;
+	if (platform === "linux") {
 		try {
 			const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
 			const close = stat.lastIndexOf(")");
@@ -442,7 +496,7 @@ export function processIncarnation(pid: number): string | undefined {
 			return undefined;
 		}
 	}
-	if (process.platform === "darwin") {
+	if (platform === "darwin") {
 		const info = new Uint8Array(DARWIN_PROC_BSDINFO_SIZE);
 		try {
 			const bytesRead = darwinProcLibrary?.symbols.proc_pidinfo(
@@ -456,6 +510,18 @@ export function processIncarnation(pid: number): string | undefined {
 		} catch {
 			return undefined;
 		}
+	}
+	if (platform === "win32") {
+		const command = windowsProcessIncarnationCommand(pid);
+		let result: ProcessIncarnationCommandResult;
+		try {
+			result = (options.runCommand ?? runProcessIncarnationCommand)(command.command, command.args);
+		} catch {
+			return undefined;
+		}
+		return result?.exitCode === 0 && typeof result.stdout === "string"
+			? parseWin32ProcessIncarnation(pid, result.stdout)
+			: undefined;
 	}
 	return undefined;
 }
