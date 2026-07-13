@@ -1160,11 +1160,15 @@ export class Settings {
 
 		const configPath = this.#configPath;
 		const patches = this.#pendingPatchesInGenerationOrder();
+		let durableBeforeWrite: RawSettings | undefined;
+		let durableVersionBeforeWrite: string | undefined;
 
 		const save = this.#saveTail.then(() =>
 			withFileLock(configPath, async () => {
 				const current = await this.#loadYaml(configPath);
 				const currentConfigVersion = readConfigVersion(configPath);
+				durableBeforeWrite = structuredClone(current);
+				durableVersionBeforeWrite = currentConfigVersion;
 				const externalLineageBreak = currentConfigVersion !== this.#defaultModelRoleOwnership.configVersion;
 				const applicablePatches = patches.filter(
 					patch =>
@@ -1220,6 +1224,7 @@ export class Settings {
 			await save;
 		} catch (error) {
 			logger.warn("Settings: save failed", { error: String(error) });
+			let droppedStaleDefault = false;
 			for (const patch of patches) {
 				const key = settingsPatchKey(patch);
 				const currentPatch = this.#modified.get(key);
@@ -1229,9 +1234,20 @@ export class Settings {
 					patch.modelRole === "default"
 				) {
 					this.#modified.delete(key);
+					droppedStaleDefault = true;
 				} else {
 					this.#modified.set(key, patch);
 				}
+			}
+			if (droppedStaleDefault && durableBeforeWrite) {
+				setRawModelRole(
+					this.#global,
+					"default",
+					defaultModelRoleFrom(durableBeforeWrite),
+					!Object.hasOwn(durableBeforeWrite, "modelRoles"),
+				);
+				this.#defaultModelRoleOwnership.configVersion = durableVersionBeforeWrite;
+				this.#defaultModelRoleOwnership.defaultLineageKnown = false;
 			}
 			if (options.throwOnError) {
 				this.#rebuildMerged();

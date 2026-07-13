@@ -157,6 +157,38 @@ describe("Settings global model role durability", () => {
 		});
 	});
 
+	it("restores the external default in memory when an unrelated save fails", async () => {
+		await Bun.write(configPath, YAML.stringify({ modelRoles: { default: "provider/original:low" } }));
+		const settings = await Settings.init({ cwd: projectDir, agentDir });
+		settings.setGlobalModelRole("default", "provider/pending-b:high");
+		settings.set("theme.dark", "amber-claw");
+		await Bun.write(configPath, YAML.stringify({ modelRoles: { default: "provider/external-c:medium" } }));
+		const originalWrite = Bun.write.bind(Bun);
+		const write = vi.spyOn(Bun, "write").mockImplementation(async (destination, input) => {
+			if (typeof destination !== "string" || typeof input !== "string") {
+				throw new Error("unexpected non-string settings write");
+			}
+			if (destination === configPath) throw new Error("injected unrelated save failure");
+			return originalWrite(destination, input);
+		});
+
+		await settings.flush();
+
+		expect(settings.getGlobal("modelRoles")).toEqual({ default: "provider/external-c:medium" });
+		expect(settings.get("theme.dark")).toBe("amber-claw");
+		expect(YAML.parse(await Bun.file(configPath).text())).toEqual({
+			modelRoles: { default: "provider/external-c:medium" },
+		});
+
+		write.mockRestore();
+		settings.setGlobalModelRole("default", "provider/next-d:high");
+		await settings.flushOrThrow();
+		expect(YAML.parse(await Bun.file(configPath).text())).toEqual({
+			modelRoles: { default: "provider/next-d:high" },
+			theme: { dark: "amber-claw" },
+		});
+	});
+
 	it("keeps an external default after a local unrelated write", async () => {
 		await Bun.write(configPath, YAML.stringify({ modelRoles: { default: "provider/original:low" } }));
 		const settings = await Settings.init({ cwd: projectDir, agentDir });
