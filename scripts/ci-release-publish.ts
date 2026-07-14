@@ -810,18 +810,34 @@ export async function publishRetainedPackage(
 		}
 		throw new Error(`npm publish failed for ${record.name}@${record.version}: ${publish.output || `exit ${publish.exitCode ?? "unknown"}`}`);
 	}
-	let observed = await operations.observe(record, retainedTarball);
-	if (observed === undefined) {
-		// npm's registry is read-after-write eventually consistent: a version that just
-		// published successfully can be briefly invisible to a follow-up read. Re-observe
-		// with backoff so a propagation lag is not reported as a publish failure.
-		const retries = operations.visibilityRetries ?? 12;
-		const delayMs = operations.visibilityDelayMs ?? 5000;
-		const sleep = operations.sleep ?? ((ms: number) => Bun.sleep(ms));
-		for (let attempt = 0; attempt < retries && observed === undefined; attempt++) {
-			await sleep(delayMs);
+	// npm's registry is read-after-write eventually consistent: right after a successful
+	// publish the version can be briefly invisible to a follow-up read AND the `latest`
+	// dist-tag can briefly lag behind the just-published version. Both resolve within
+	// seconds, so re-observe with bounded backoff before treating either as a failure.
+	// Real conflicts (integrity/byte mismatch) are rethrown immediately, never retried.
+	const retries = operations.visibilityRetries ?? 12;
+	const delayMs = operations.visibilityDelayMs ?? 5000;
+	const sleep = operations.sleep ?? ((ms: number) => Bun.sleep(ms));
+	const isTransientVisibilityError = (error: unknown): boolean => {
+		const message = error instanceof Error ? error.message : String(error);
+		return (
+			message.includes(`does not identify immutable expected evidence`) ||
+			message.includes(`stable ${NPM_RELEASE_TAG} is absent although`)
+		);
+	};
+	let observed: RegistryPackageObservation | undefined;
+	for (let attempt = 0; ; attempt++) {
+		try {
 			observed = await operations.observe(record, retainedTarball);
+		} catch (error) {
+			if (attempt < retries && isTransientVisibilityError(error)) {
+				await sleep(delayMs);
+				continue;
+			}
+			throw error;
 		}
+		if (observed !== undefined || attempt >= retries) break;
+		await sleep(delayMs);
 	}
 	if (observed === undefined) throw new Error(`Registry did not expose ${record.name}@${record.version} after publish`);
 	assertExactRegistryObservation(record, observed);
