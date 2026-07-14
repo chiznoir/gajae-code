@@ -72,7 +72,7 @@ import {
 	sessionTag,
 } from "./config";
 import { imageAttachmentsFromMessage, notificationActionPayload, summaryFromMessage } from "./helpers";
-import { ensureTelegramDaemonRunning } from "./telegram-daemon";
+import { type EnsureDaemonResult, ensureTelegramDaemonRunning } from "./telegram-daemon";
 
 // ===========================================================================
 // Session lifecycle control protocol (TypeScript mirror of the Rust wire
@@ -121,7 +121,7 @@ export interface SessionCreateFrame {
 	/** Control-endpoint token authorizing this frame. */
 	token: string;
 	target: SessionCreateTarget;
-	/** Reference to the daemon-written, once-consumed startup-prompt file. */
+	/** Reserved for a future capability transport; any supplied value is rejected before lifecycle acceptance. */
 	startupPromptRef?: string;
 	/** Model profile preset to activate for the spawned session (--mpreset). */
 	modelPreset?: string;
@@ -147,6 +147,7 @@ export interface SessionResumeFrame {
 	chatId: string;
 	token: string;
 	target: SessionResumeTarget;
+	/** Reserved for a future capability transport; any supplied value is rejected before lifecycle acceptance. */
 	startupPromptRef?: string;
 }
 
@@ -221,7 +222,8 @@ export type LifecycleErrorReason =
 	| "readiness_timeout"
 	| "close_refused"
 	| "not_found"
-	| "terminal_uncertain";
+	| "terminal_uncertain"
+	| "unsupported_platform";
 
 /** A candidate returned with an `ambiguous_target` resume error. */
 export interface ResumeCandidate {
@@ -1539,6 +1541,11 @@ export function createNotificationsExtension(
 	api: ExtensionAPI,
 	options: {
 		settings?: Settings;
+		ensureTelegramDaemon?: (input: {
+			settings: Settings;
+			cwd: string;
+			sessionId: string;
+		}) => Promise<EnsureDaemonResult>;
 		/** Suppress auto-delivery for a GJC-spawned child under `sessionScope=primary`. */
 		spawnedByGjc?: boolean;
 		onSdkRequest?: (kind: "control" | "query", connectionId: string, frame: Record<string, unknown>) => void;
@@ -1551,6 +1558,17 @@ export function createNotificationsExtension(
 	let activeRuntimeId: string | undefined;
 	let identityControlInFlight = false;
 	let deferredIdentityRotation: { event: { previousSessionFile?: string }; ctx: ExtensionContext } | undefined;
+	const ensureTelegramDaemon = options.ensureTelegramDaemon ?? ensureTelegramDaemonRunning;
+	async function ensureConfiguredDaemons(
+		settings: Settings,
+		cfg: NotificationConfig,
+		cwd: string,
+		id: string,
+	): Promise<void> {
+		if (isTelegramConfigured(cfg)) await ensureTelegramDaemon({ settings, cwd, sessionId: id });
+		if (isDiscordConfigured(cfg)) await ensureDiscordDaemon(settings);
+		if (isSlackConfigured(cfg)) await ensureSlackDaemon(settings);
+	}
 	const identityControlOperations = new Set([
 		"session.new",
 		"session.fork",
@@ -2408,10 +2426,7 @@ export function createNotificationsExtension(
 			}
 			if (notificationsEnabledForSession && settingsAvailable && settings) {
 				try {
-					if (isTelegramConfigured(cfg))
-						await ensureTelegramDaemonRunning({ settings, cwd: ctx.cwd, sessionId: id });
-					if (isDiscordConfigured(cfg)) await ensureDiscordDaemon(settings);
-					if (isSlackConfigured(cfg)) await ensureSlackDaemon(settings);
+					await ensureConfiguredDaemons(settings, cfg, ctx.cwd, id);
 				} catch (e) {
 					logger.warn(`notifications: failed to ensure notification daemon: ${String(e)}`);
 				}
@@ -2653,7 +2668,16 @@ export function createNotificationsExtension(
 					expectedRuntime?.host.started === true &&
 					expectedRuntime.host.generation === expectedGeneration &&
 					expectedRuntime.stopping === false;
-				if (enabled) expectedRuntime.enableNotifications();
+				if (enabled) {
+					expectedRuntime.enableNotifications();
+					if (resolved.settingsAvailable && resolved.settings) {
+						try {
+							await ensureConfiguredDaemons(resolved.settings, resolved.cfg, ctx.cwd, id);
+						} catch (error) {
+							logger.warn(`notifications: failed to ensure notification daemon: ${String(error)}`);
+						}
+					}
+				}
 				const startupWasFenced = result.status === "failed" && expectedRuntime?.stopping === true;
 				ctx.ui.notify(
 					enabled
