@@ -1,4 +1,4 @@
-import { describe, expect, test, vi } from "bun:test";
+import { describe, expect, spyOn, test, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -5023,6 +5023,190 @@ test("pollOnce backs off on a Telegram 409 conflict instead of processing update
 	expect(await daemon.pollOnce()).toBe(0);
 	expect(await daemon.pollOnce()).toBe(0);
 	expect(sleeps).toEqual([500, 1_000, 2_000, 4_000, 5_000, 5_000]);
+});
+
+test("TelegramUpdatePoller logs getUpdates failures only on transition and reports suppressed recovery", async () => {
+	const sleeps: number[] = [];
+	let calls = 0;
+	const bot = {
+		async call() {
+			calls += 1;
+			if (calls <= 3) throw new Error(`network-${calls}`);
+			return { ok: true, result: [] };
+		},
+	};
+	const errorSpy = spyOn(logger, "error").mockImplementation(() => {});
+	const infoSpy = spyOn(logger, "info").mockImplementation(() => {});
+	try {
+		const poller = new TelegramUpdatePoller({
+			botApi: bot,
+			runtime: { sleep: async (ms: number) => void sleeps.push(ms) } as any,
+			backoff: { next: () => 500, reset() {} } as any,
+			processUpdate: async () => "consumed",
+		});
+
+		expect(await poller.pollOnce()).toBe(0);
+		expect(await poller.pollOnce()).toBe(0);
+		expect(await poller.pollOnce()).toBe(0);
+		expect(await poller.pollOnce()).toBe(0);
+
+		const getUpdatesFailures = errorSpy.mock.calls.filter(
+			call => call[0] === "notifications daemon: getUpdates failed",
+		);
+		expect(getUpdatesFailures).toHaveLength(1);
+		expect(getUpdatesFailures[0]?.[1]).toMatchObject({ error: "Error: network-1", suppressedCount: 0 });
+		const recoveries = infoSpy.mock.calls.filter(
+			call => call[0] === "notifications daemon: Telegram getUpdates recovered",
+		);
+		expect(recoveries).toHaveLength(1);
+		expect(recoveries[0]?.[1]).toMatchObject({ from: "getUpdates_failed", suppressedCount: 2, updateCount: 0 });
+		expect(sleeps).toEqual([1_000, 1_000, 1_000]);
+	} finally {
+		errorSpy.mockRestore();
+		infoSpy.mockRestore();
+	}
+});
+
+test("TelegramUpdatePoller treats non-conflict API failures as unhealthy until a verified success", async () => {
+	const sleeps: number[] = [];
+	let calls = 0;
+	const bot = {
+		async call() {
+			calls += 1;
+			if (calls <= 2) return { ok: false, error_code: 401, description: "Unauthorized" };
+			return { ok: true, result: [] };
+		},
+	};
+	const errorSpy = spyOn(logger, "error").mockImplementation(() => {});
+	const infoSpy = spyOn(logger, "info").mockImplementation(() => {});
+	try {
+		const poller = new TelegramUpdatePoller({
+			botApi: bot,
+			runtime: { sleep: async (ms: number) => void sleeps.push(ms) } as any,
+			backoff: { next: () => 500, reset() {} } as any,
+			processUpdate: async () => "consumed",
+		});
+
+		expect(await poller.pollOnce()).toBe(0);
+		expect(await poller.pollOnce()).toBe(0);
+		expect(await poller.pollOnce()).toBe(0);
+
+		const apiFailures = errorSpy.mock.calls.filter(
+			call => call[0] === "notifications daemon: Telegram getUpdates API failed",
+		);
+		expect(apiFailures).toHaveLength(1);
+		expect(apiFailures[0]?.[1]).toMatchObject({
+			errorCode: 401,
+			description: "Unauthorized",
+			suppressedCount: 0,
+		});
+		const recoveries = infoSpy.mock.calls.filter(
+			call => call[0] === "notifications daemon: Telegram getUpdates recovered",
+		);
+		expect(recoveries).toHaveLength(1);
+		expect(recoveries[0]?.[1]).toMatchObject({ from: "api_failure", suppressedCount: 1, updateCount: 0 });
+		expect(sleeps).toEqual([1_000, 1_000]);
+	} finally {
+		errorSpy.mockRestore();
+		infoSpy.mockRestore();
+	}
+});
+
+test("TelegramUpdatePoller treats malformed update items as unhealthy and does not advance the offset", async () => {
+	const calls: Array<{ offset: unknown }> = [];
+	const sleeps: number[] = [];
+	let attempt = 0;
+	const bot = {
+		async call(_method: string, body: { offset?: unknown }) {
+			calls.push({ offset: body.offset });
+			attempt += 1;
+			if (attempt <= 2) return { ok: true, result: [{}] };
+			return { ok: true, result: [] };
+		},
+	};
+	const errorSpy = spyOn(logger, "error").mockImplementation(() => {});
+	const infoSpy = spyOn(logger, "info").mockImplementation(() => {});
+	try {
+		const poller = new TelegramUpdatePoller({
+			botApi: bot,
+			runtime: { sleep: async (ms: number) => void sleeps.push(ms) } as any,
+			backoff: { next: () => 500, reset() {} } as any,
+			processUpdate: async () => {
+				throw new Error("malformed update should not be processed");
+			},
+		});
+
+		expect(await poller.pollOnce()).toBe(0);
+		expect(await poller.pollOnce()).toBe(0);
+		expect(await poller.pollOnce()).toBe(0);
+
+		const apiFailures = errorSpy.mock.calls.filter(
+			call => call[0] === "notifications daemon: Telegram getUpdates API failed",
+		);
+		expect(apiFailures).toHaveLength(1);
+		expect(apiFailures[0]?.[1]).toMatchObject({
+			description: "Malformed getUpdates response",
+			suppressedCount: 0,
+		});
+		const recoveries = infoSpy.mock.calls.filter(
+			call => call[0] === "notifications daemon: Telegram getUpdates recovered",
+		);
+		expect(recoveries).toHaveLength(1);
+		expect(recoveries[0]?.[1]).toMatchObject({ from: "api_failure", suppressedCount: 1, updateCount: 0 });
+		expect(calls.map(call => call.offset)).toEqual([0, 0, 0]);
+		expect(sleeps).toEqual([1_000, 1_000]);
+	} finally {
+		errorSpy.mockRestore();
+		infoSpy.mockRestore();
+	}
+});
+
+test("TelegramUpdatePoller skips a poisoned update but still advances past valid updates in the same batch", async () => {
+	const calls: Array<{ offset: unknown }> = [];
+	const sleeps: number[] = [];
+	const processed: number[] = [];
+	let attempt = 0;
+	const bot = {
+		async call(_method: string, body: { offset?: unknown }) {
+			calls.push({ offset: body.offset });
+			attempt += 1;
+			if (attempt === 1) {
+				return { ok: true, result: [{ update_id: 5 }, {}, { update_id: 7 }] };
+			}
+			return { ok: true, result: [] };
+		},
+	};
+	const errorSpy = spyOn(logger, "error").mockImplementation(() => {});
+	const infoSpy = spyOn(logger, "info").mockImplementation(() => {});
+	try {
+		const poller = new TelegramUpdatePoller({
+			botApi: bot,
+			runtime: { sleep: async (ms: number) => void sleeps.push(ms) } as any,
+			backoff: { next: () => 500, reset() {} } as any,
+			processUpdate: async (update: any) => {
+				processed.push(update.update_id);
+				return "consumed";
+			},
+		});
+
+		// A poisoned middle entry must not wedge the offset: the valid updates on
+		// either side are still processed and the offset advances past them.
+		expect(await poller.pollOnce()).toBe(0);
+		// The second poll resumes AFTER the highest valid update_id (7 -> offset 8),
+		// proving the poison did not stall the stream.
+		expect(await poller.pollOnce()).toBe(0);
+
+		expect(processed).toEqual([5, 7]);
+		expect(calls.map(call => call.offset)).toEqual([0, 8]);
+		const apiFailures = errorSpy.mock.calls.filter(
+			call => call[0] === "notifications daemon: Telegram getUpdates API failed",
+		);
+		expect(apiFailures).toHaveLength(1);
+		expect(apiFailures[0]?.[1]).toMatchObject({ description: "Malformed getUpdates response" });
+	} finally {
+		errorSpy.mockRestore();
+		infoSpy.mockRestore();
+	}
 });
 
 test("requestStop aborts the active long poll and run() exits, releasing ownership", async () => {

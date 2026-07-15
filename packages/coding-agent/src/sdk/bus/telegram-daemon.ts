@@ -941,23 +941,96 @@ type PairedChatPrivacy = "private" | "non-private" | "indeterminate";
 
 export type TelegramUpdateOutcome = "consumed" | "retry";
 
+export type TelegramPollResult =
+	| { kind: "success"; updateCount: number }
+	| { kind: "aborted" }
+	| { kind: "getUpdates_failed"; error: string }
+	| { kind: "api_failure"; errorCode?: number; description: string }
+	| { kind: "conflict"; description: string; backoffMs: number };
+
 export interface TelegramUpdatePollerOptions {
 	botApi: BotApi;
 	runtime: NotificationOperatorRuntime;
 	backoff: OperatorBackoffPolicy;
 	processUpdate: (update: unknown) => Promise<TelegramUpdateOutcome>;
+	health?: TelegramPollHealth;
+}
+
+type TelegramPollHealthStatus = "healthy" | "getUpdates_failed" | "api_failure" | "conflict";
+
+export class TelegramPollHealth {
+	#status: TelegramPollHealthStatus = "healthy";
+	#suppressedCount = 0;
+
+	record(result: TelegramPollResult): void {
+		if (result.kind === "aborted") return;
+		if (result.kind === "success") {
+			if (this.#status !== "healthy") {
+				logger.info("notifications daemon: Telegram getUpdates recovered", {
+					from: this.#status,
+					suppressedCount: this.#suppressedCount,
+					updateCount: result.updateCount,
+				});
+			}
+			this.#status = "healthy";
+			this.#suppressedCount = 0;
+			return;
+		}
+
+		const previousStatus = this.#status;
+		if (previousStatus === result.kind) {
+			this.#suppressedCount += 1;
+			return;
+		}
+
+		const suppressedCount = this.#suppressedCount;
+		this.#status = result.kind;
+		this.#suppressedCount = 0;
+		if (result.kind === "conflict") {
+			logger.error("notifications daemon: Telegram getUpdates 409 conflict", {
+				description: result.description,
+				backoffMs: result.backoffMs,
+				previousStatus,
+				suppressedCount,
+			});
+			return;
+		}
+		if (result.kind === "api_failure") {
+			logger.error("notifications daemon: Telegram getUpdates API failed", {
+				errorCode: result.errorCode,
+				description: result.description,
+				previousStatus,
+				suppressedCount,
+			});
+			return;
+		}
+
+		logger.error("notifications daemon: getUpdates failed", {
+			error: result.error,
+			previousStatus,
+			suppressedCount,
+		});
+	}
 }
 
 /** Owns getUpdates offset, conflict backoff, and per-update error isolation. */
 export class TelegramUpdatePoller {
 	#offset = 0;
 	#opts: TelegramUpdatePollerOptions;
+	#health: TelegramPollHealth;
 
 	constructor(opts: TelegramUpdatePollerOptions) {
 		this.#opts = opts;
+		this.#health = opts.health ?? new TelegramPollHealth();
 	}
 
 	async pollOnce(signal?: AbortSignal): Promise<number> {
+		const result = await this.pollOnceResult(signal);
+		this.#health.record(result);
+		return result.kind === "success" ? result.updateCount : 0;
+	}
+
+	async pollOnceResult(signal?: AbortSignal): Promise<TelegramPollResult> {
 		let body: {
 			ok?: boolean;
 			error_code?: number;
@@ -972,24 +1045,37 @@ export class TelegramUpdatePoller {
 			)) as typeof body;
 		} catch (err) {
 			// A cooperative stop aborts the in-flight long poll; treat as a clean wake.
-			if (isAbortError(err)) return 0;
+			if (isAbortError(err)) return { kind: "aborted" };
 			// A transient Telegram API failure must never crash the daemon.
-			logger.error("notifications daemon: getUpdates failed", { error: sanitizeDiagnostic(String(err)) });
 			await this.#opts.runtime.sleep(POLL_BACKOFF_MS, signal);
-			return 0;
+			return { kind: "getUpdates_failed", error: sanitizeDiagnostic(String(err)) };
 		}
 		// Telegram allows only one active getUpdates poller per bot. A 409 means
 		// another poller is live; back off boundedly instead of hot-looping.
 		if (body && body.ok === false && (body.error_code === 409 || /409|conflict/i.test(body.description ?? ""))) {
 			const backoffMs = this.#opts.backoff.next();
-			logger.error(
-				`notifications daemon: Telegram getUpdates 409 conflict (${body.description ?? "no description"}); backing off ${backoffMs}ms`,
-			);
 			await this.#opts.runtime.sleep(backoffMs, signal);
-			return 0;
+			return { kind: "conflict", description: sanitizeDiagnostic(body.description ?? "no description"), backoffMs };
+		}
+		if (body?.ok !== true || !Array.isArray(body.result)) {
+			await this.#opts.runtime.sleep(POLL_BACKOFF_MS, signal);
+			return {
+				kind: "api_failure",
+				errorCode: typeof body?.error_code === "number" ? body.error_code : undefined,
+				description: sanitizeDiagnostic(body?.description ?? "Malformed getUpdates response"),
+			};
 		}
 		this.#opts.backoff.reset();
-		for (const update of body.result ?? []) {
+		let malformedSeen = false;
+		for (const update of body.result) {
+			// A single malformed update_id must not wedge the poller. Skip the
+			// bad entry (surfaced below as an api_failure health signal) while
+			// still processing valid updates and advancing the offset past them,
+			// so one poisoned item cannot stall an otherwise-valid stream.
+			if (!Number.isSafeInteger(update?.update_id)) {
+				malformedSeen = true;
+				continue;
+			}
 			try {
 				const outcome = await this.#opts.processUpdate(update);
 				if (outcome === "retry") {
@@ -998,11 +1084,17 @@ export class TelegramUpdatePoller {
 				}
 				this.#offset = update.update_id + 1;
 			} catch (err) {
-				logger.error("notifications daemon: handleTelegramUpdate failed", { error: String(err) });
+				logger.error("notifications daemon: handleTelegramUpdate failed", {
+					error: sanitizeDiagnostic(String(err)),
+				});
 				this.#offset = update.update_id + 1;
 			}
 		}
-		return body.result?.length ?? 0;
+		if (malformedSeen) {
+			await this.#opts.runtime.sleep(POLL_BACKOFF_MS, signal);
+			return { kind: "api_failure", description: "Malformed getUpdates response" };
+		}
+		return { kind: "success", updateCount: body.result.length };
 	}
 }
 
