@@ -39,7 +39,6 @@ import {
 } from "./release-evidence";
 import {
 	downloadNpmRegistryTarball,
-	RegistryPropagationPendingError,
 	publishRetainedPackage,
 	assertReleaseSerializationGuard,
 	parseReleasePublishCli,
@@ -109,13 +108,8 @@ function expectedRecord(definition: (typeof PUBLIC_PACKAGE_DEFINITIONS)[number],
 
 
 function expectedFixture(): { records: PackageEvidenceRecord[]; expected: ExpectedReleaseEvidence } {
-	const records = PUBLIC_PACKAGE_DEFINITIONS.map(definition =>
-		expectedRecord(
-			definition,
-			definition.name === "@gajae-code/coding-agent"
-				? { "@gajae-code/ai": "1.2.3", "@gajae-code/bridge-client": "1.2.3" }
-				: {},
-		),
+	const records = PUBLIC_PACKAGE_DEFINITIONS.map((definition, index) =>
+		expectedRecord(definition, index === 3 ? { "@gajae-code/ai": "1.2.3" } : {}),
 	);
 	return {
 		records,
@@ -341,203 +335,6 @@ describe("release package evidence", () => {
 			observe: async () => undefined,
 			publish: async () => ({ exitCode: 1, output: "E403 denied" }),
 		})).rejects.toThrow("E403 denied");
-	});
-	test("resumes pre-published exact evidence without publishing or waiting", async () => {
-		const { records } = expectedFixture();
-		const record = records[0]!;
-		const tarball = canonicalizePackageTarball(fixtureTarball(`{"name":"${record.name}","version":"${record.version}","dependencies":{}}\n`));
-		const exact = observation(record);
-		const delays: number[] = [];
-		let publishes = 0;
-
-		await expect(publishRetainedPackage(record, "retained.tgz", {
-			readTarball: async () => tarball,
-			observe: async () => exact,
-			publish: async () => {
-				publishes += 1;
-				return { exitCode: 0, output: "" };
-			},
-			delay: async (milliseconds) => {
-				delays.push(milliseconds);
-			},
-		})).resolves.toEqual(exact);
-		expect(publishes).toBe(0);
-		expect(delays).toEqual([]);
-	});
-
-	test("accepts exact evidence immediately after publication without waiting", async () => {
-		const { records } = expectedFixture();
-		const record = records[0]!;
-		const tarball = canonicalizePackageTarball(fixtureTarball(`{"name":"${record.name}","version":"${record.version}","dependencies":{}}\n`));
-		const exact = observation(record);
-		const observations: Array<RegistryPackageObservation | undefined> = [undefined, exact];
-		const delays: number[] = [];
-		let publishes = 0;
-
-		await expect(publishRetainedPackage(record, "retained.tgz", {
-			readTarball: async () => tarball,
-			observe: async () => observations.shift(),
-			publish: async () => {
-				publishes += 1;
-				return { exitCode: 0, output: "" };
-			},
-			delay: async (milliseconds) => {
-				delays.push(milliseconds);
-			},
-		})).resolves.toEqual(exact);
-		expect(publishes).toBe(1);
-		expect(delays).toEqual([]);
-	});
-
-	test("waits deterministically for delayed exact evidence after publication", async () => {
-		const { records } = expectedFixture();
-		const record = records[0]!;
-		const tarball = canonicalizePackageTarball(fixtureTarball(`{"name":"${record.name}","version":"${record.version}","dependencies":{}}\n`));
-		const exact = observation(record);
-		const observations: Array<RegistryPackageObservation | undefined> = [undefined, undefined, exact];
-		const delays: number[] = [];
-		let publishes = 0;
-
-		await expect(publishRetainedPackage(record, "retained.tgz", {
-			readTarball: async () => tarball,
-			observe: async () => observations.shift(),
-			publish: async () => {
-				publishes += 1;
-				return { exitCode: 0, output: "" };
-			},
-			delay: async (milliseconds) => {
-				delays.push(milliseconds);
-			},
-		})).resolves.toEqual(exact);
-		expect(publishes).toBe(1);
-		expect(delays).toEqual([1_000]);
-	});
-
-	test("waits for an exact target while the stable tag is still propagating", async () => {
-		const { records } = expectedFixture();
-		const record = records[0]!;
-		const tarball = canonicalizePackageTarball(fixtureTarball(`{"name":"${record.name}","version":"${record.version}","dependencies":{}}\n`));
-		const exact = observation(record);
-		let observationCall = 0;
-		const delays: number[] = [];
-		let publishes = 0;
-
-		await expect(publishRetainedPackage(record, "retained.tgz", {
-			readTarball: async () => tarball,
-			observe: async () => {
-				observationCall += 1;
-				if (observationCall === 1) return undefined;
-				if (observationCall === 2) throw new RegistryPropagationPendingError("stable tag still points to prior version");
-				return exact;
-			},
-			publish: async () => {
-				publishes += 1;
-				return { exitCode: 0, output: "" };
-			},
-			delay: async milliseconds => {
-				delays.push(milliseconds);
-			},
-		})).resolves.toEqual(exact);
-		expect(publishes).toBe(1);
-		expect(delays).toEqual([1_000]);
-	});
-
-	test("settles a pre-existing exact target without republishing while its stable tag propagates", async () => {
-		const { records } = expectedFixture();
-		const record = records[0]!;
-		const tarball = canonicalizePackageTarball(fixtureTarball(`{"name":"${record.name}","version":"${record.version}","dependencies":{}}\n`));
-		const exact = observation(record);
-		let observationCall = 0;
-		const delays: number[] = [];
-		let publishes = 0;
-
-		await expect(publishRetainedPackage(record, "retained.tgz", {
-			readTarball: async () => tarball,
-			observe: async () => {
-				observationCall += 1;
-				if (observationCall === 1) throw new RegistryPropagationPendingError("stable tag still points to prior version");
-				return exact;
-			},
-			publish: async () => {
-				publishes += 1;
-				return { exitCode: 0, output: "" };
-			},
-			delay: async milliseconds => {
-				delays.push(milliseconds);
-			},
-		})).resolves.toEqual(exact);
-		expect(publishes).toBe(0);
-		expect(delays).toEqual([1_000]);
-	});
-
-	test("settles a concurrent publication while its stable tag propagates", async () => {
-		const { records } = expectedFixture();
-		const record = records[0]!;
-		const tarball = canonicalizePackageTarball(fixtureTarball(`{"name":"${record.name}","version":"${record.version}","dependencies":{}}\n`));
-		const exact = observation(record);
-		let observationCall = 0;
-		const delays: number[] = [];
-
-		await expect(publishRetainedPackage(record, "retained.tgz", {
-			readTarball: async () => tarball,
-			observe: async () => {
-				observationCall += 1;
-				if (observationCall === 1) return undefined;
-				if (observationCall === 2) throw new RegistryPropagationPendingError("stable tag still points to prior version");
-				return exact;
-			},
-			publish: async () => ({ exitCode: 1, output: "E409 already published" }),
-			delay: async milliseconds => {
-				delays.push(milliseconds);
-			},
-		})).resolves.toEqual(exact);
-		expect(delays).toEqual([1_000]);
-	});
-
-	test("fails after bounded absent post-publish observations", async () => {
-		const { records } = expectedFixture();
-		const record = records[0]!;
-		const tarball = canonicalizePackageTarball(fixtureTarball(`{"name":"${record.name}","version":"${record.version}","dependencies":{}}\n`));
-		const delays: number[] = [];
-		let publishes = 0;
-
-		await expect(publishRetainedPackage(record, "retained.tgz", {
-			readTarball: async () => tarball,
-			observe: async () => undefined,
-			publish: async () => {
-				publishes += 1;
-				return { exitCode: 0, output: "" };
-			},
-			delay: async (milliseconds) => {
-				delays.push(milliseconds);
-			},
-		})).rejects.toThrow("registry propagation not observed after 6 attempts");
-		expect(publishes).toBe(1);
-		expect(delays).toEqual([1_000, 2_000, 3_000, 4_000, 5_000]);
-	});
-
-	test("fails closed on non-exact evidence observed after publication", async () => {
-		const { records } = expectedFixture();
-		const record = records[0]!;
-		const tarball = canonicalizePackageTarball(fixtureTarball(`{"name":"${record.name}","version":"${record.version}","dependencies":{}}\n`));
-		const exact = observation(record);
-		const observations: Array<RegistryPackageObservation | undefined> = [undefined, { ...exact, registry_sri: "sha512-conflict" }];
-		const delays: number[] = [];
-		let publishes = 0;
-
-		await expect(publishRetainedPackage(record, "retained.tgz", {
-			readTarball: async () => tarball,
-			observe: async () => observations.shift(),
-			publish: async () => {
-				publishes += 1;
-				return { exitCode: 0, output: "" };
-			},
-			delay: async (milliseconds) => {
-				delays.push(milliseconds);
-			},
-		})).rejects.toThrow("conflicts with immutable expected evidence");
-		expect(publishes).toBe(1);
-		expect(delays).toEqual([]);
 	});
 
 	test("rejects malformed tarballs and malformed expected evidence before publication", async () => {

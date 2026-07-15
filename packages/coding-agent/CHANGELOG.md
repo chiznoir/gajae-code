@@ -27,6 +27,18 @@
 - Serialized fresh prompt preflight and durable default-model selection through deterministic per-session admission, preventing a later `model.set` from overtaking an earlier prompt while preserving provider-stream and continuation behavior (#2199).
 - Direct SDK broker lifecycle hosts now wait for their session-owned startup capability before publishing lifecycle readiness. Only a `started` capability permits a ready marker; failed startup requires proven process, endpoint, and host cleanup before the broker reports `spawn_failed` with no endpoint available, otherwise it preserves terminal uncertainty (#2168).
 - Isolated default source-mode SDK broker and session-host respawns from caller Bun startup policy. Internal children now use fixed `--no-env-file` plus product-owned config/entrypoint paths, scrub `BUN_OPTIONS` and mutable compiled markers, preserve compiled/custom launch compatibility, and clean up owned broker children on startup failure without leaking launch secrets (#2178).
+## [0.10.2] - 2026-07-14
+
+### Added
+
+- Gajae Pet selection is now terminal-capability aware: unsupported terminals show an actionable warning (with multiplexer-specific guidance for tmux/screen/zellij, including the `PI_FORCE_IMAGE_PROTOCOL=sixel` expert opt-in), `/pet` and Settings disable the unavailable `RedGajae`/`BlueGajae` choices while `off` stays selectable, a saved-but-unavailable choice is identified as `(saved)`, and the public command names are consistent across execution, completion, and inline hints (`/pet RedGajae`, `/pet BlueGajae`, `/pet off`, case-insensitive).
+
+### Changed
+
+- Documented the current GPT-5.6 Codex and combo profile mappings as product judgments, including the durable `opus-codex` `anthropic/claude-sonnet-5` planner override and `fable-opus-codex` `anthropic/claude-opus-4-8:medium` planner.
+- RPC clients can now durably select the machine-global default model and effective thinking level for subsequent messages, while project policy and resumed session history retain precedence; a late live-apply failure now restores the prior runtime model and thinking level without masking the original error.
+
+### Fixed
 
 - Gajae Pet overlays no longer leak images or stale pixels across lifecycle changes: each widget owns a randomized Kitty image ID (deleted on disable, replace, switch, and dispose), the previous Sixel footprint is tracked and erased on movement, resize, and narrow-terminal fallback, replaced pet widgets are disposed before their successors install, and a saved pet preference survives editor replacement while graphics are still unavailable (so a delayed Sixel capability probe can still activate it). Teardown is exception-safe and idempotent: a failed or unavailable terminal write never aborts logical disposal or steals a successor widget's overlay slot, and Sixel/Kitty cleanup authority is retained until the erase is actually delivered so a later mode switch or dispose retries it.
 - Gajae Pet cleanup that fails during final widget disposal is now retained by the TUI for retry, and Kitty image IDs remain reserved until their exact-ID delete is delivered.
@@ -34,6 +46,7 @@
 - Fixed native Windows `GJC_TMUX_COMMAND=tmux` resolution when WinGet's `tmux.exe` is a psmux alias with a generic `tmux` banner: GJC now compares executable identity with the installed `psmux.exe`/`pmux.exe` companions and fails closed when identity cannot be established instead of authorizing native-tmux semantics (#2086).
 
 - Accepted or declined initial external credential-import decisions now persist across normal restarts and upgrades, suppressing automatic startup and bare `/login` discovery; same-version legacy markers remain compatible and explicit `/provider` import remains available ([#2117](https://github.com/Yeachan-Heo/gajae-code/issues/2117)).
+
 ## [0.10.1] - 2026-07-13
 
 ### Added
@@ -54,6 +67,8 @@
 - Extension contexts now receive a defensive copy from `getSystemPrompt()` instead of the live mutable system-prompt array, so an in-place mutation by an in-process extension can no longer bypass context-revision tracking and serve stale display-only context-usage estimates.
 - Completed bracketed-paste input now returns a manually paged transcript to live output before the paste is dispatched, including asynchronous consumed and unconsumed paste paths.
 - Prevented orphaned background processes by reaping failed detached harness owners and their exact SDK session children with verified TERM/KILL cleanup, giving only the invocation-scoped transport-close capability permission to break a direct owner-stop cycle while every public stop caller awaits truthful teardown, keeping runtime-owner lease/heartbeat authority live while failed teardown retries, binding broker discovery to OS process incarnations before accepting retained ownership, making isolated ACP and broker subprocess tests stop their exact broker before deleting temporary state, and adding a cooperative Telegram daemon watchdog that stops superseded or non-progressing owners.
+- Preserved clipboard image attachments when the interactive editor clears the composer before dispatching the submit callback, so Alt+V image placeholders still send their image blocks instead of placeholder-only text (#2126).
+- Completed bracketed-paste input now returns a manually paged transcript to live output before the paste is dispatched, including asynchronous consumed and unconsumed paste paths.
 
 ## [0.10.0] - 2026-07-12
 

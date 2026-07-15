@@ -675,13 +675,6 @@ async function observeLatestRegistryPackage(record: PackageEvidenceRecord): Prom
 	return latest;
 }
 
-export class RegistryPropagationPendingError extends Error {
-	constructor(message: string) {
-		super(message);
-		this.name = "RegistryPropagationPendingError";
-	}
-}
-
 async function observeRegistryPackage(record: PackageEvidenceRecord, retainedTarball: Buffer): Promise<RegistryPackageObservation | undefined> {
 	const specifier = `${record.name}@${record.version}`;
 	// Read current latest before target-version absence can authorize any mutation.
@@ -692,6 +685,7 @@ async function observeRegistryPackage(record: PackageEvidenceRecord, retainedTar
 		if (isMissingRegistryPackage(viewOutput)) return undefined;
 		throw new Error(`npm view failed for ${specifier}: ${viewOutput || `exit ${view.exitCode ?? "unknown"}`}`);
 	}
+	if (latest === undefined) throw new Error(`stable ${NPM_RELEASE_TAG} is absent although ${specifier} exists`);
 	let distValue: unknown;
 	try {
 		distValue = JSON.parse(view.stdout.toString()) as unknown;
@@ -702,6 +696,9 @@ async function observeRegistryPackage(record: PackageEvidenceRecord, retainedTar
 	if (dist.integrity !== record.expected_sri) {
 		throw new Error(`npm view integrity for ${specifier} conflicts with immutable expected evidence`);
 	}
+	if (latest.version !== record.version || latest.dist.integrity !== dist.integrity || latest.dist.tarball !== dist.tarball) {
+		throw new Error(`stable ${NPM_RELEASE_TAG} for ${record.name} does not identify immutable expected evidence`);
+	}
 
 	const registryTarball = await downloadNpmRegistryTarball(dist.tarball, record.expected_sri);
 	const retainedInspection = inspectPackageTarball(retainedTarball);
@@ -709,15 +706,6 @@ async function observeRegistryPackage(record: PackageEvidenceRecord, retainedTar
 	if (!retainedInspection.manifestBytes.equals(registryInspection.manifestBytes)) {
 		throw new Error(`Registry package/package.json bytes conflict with retained evidence for ${specifier}`);
 	}
-	if (latest === undefined || latest.version !== record.version) {
-		throw new RegistryPropagationPendingError(
-			`stable ${NPM_RELEASE_TAG} for ${record.name} has not propagated to immutable ${specifier}`,
-		);
-	}
-	if (latest.dist.integrity !== dist.integrity || latest.dist.tarball !== dist.tarball) {
-		throw new Error(`stable ${NPM_RELEASE_TAG} for ${record.name} does not identify immutable expected evidence`);
-	}
-
 	const observation: RegistryPackageObservation = {
 		registry_sri: dist.integrity,
 		registry_tarball_sha512: createHash("sha512").update(registryTarball).digest("hex"),
@@ -785,33 +773,9 @@ interface PublishRetainedPackageOperations {
 	readTarball(record: PackageEvidenceRecord, tarballPath: string): Promise<Buffer>;
 	observe(record: PackageEvidenceRecord, retainedTarball: Buffer): Promise<RegistryPackageObservation | undefined>;
 	publish(tarballPath: string): Promise<PublishAttempt>;
-	delay?(ms: number): Promise<void>;
-}
-
-const REGISTRY_PROPAGATION_ATTEMPTS = 6;
-const REGISTRY_PROPAGATION_BASE_DELAY_MS = 1_000;
-
-async function observeAfterRegistryPropagation(
-	record: PackageEvidenceRecord,
-	retainedTarball: Buffer,
-	operations: PublishRetainedPackageOperations,
-	initialPending = false,
-): Promise<RegistryPackageObservation | undefined> {
-	const delay = operations.delay ?? (ms => new Promise<void>(resolve => setTimeout(resolve, ms)));
-	if (initialPending) await delay(REGISTRY_PROPAGATION_BASE_DELAY_MS);
-	for (let attempt = initialPending ? 2 : 1; attempt <= REGISTRY_PROPAGATION_ATTEMPTS; attempt++) {
-		let observed: RegistryPackageObservation | undefined;
-		try {
-			observed = await operations.observe(record, retainedTarball);
-		} catch (error) {
-			if (!(error instanceof RegistryPropagationPendingError)) throw error;
-		}
-		if (observed !== undefined) return observed;
-		if (attempt < REGISTRY_PROPAGATION_ATTEMPTS) {
-			await delay(REGISTRY_PROPAGATION_BASE_DELAY_MS * attempt);
-		}
-	}
-	return undefined;
+	sleep?(ms: number): Promise<void>;
+	visibilityRetries?: number;
+	visibilityDelayMs?: number;
 }
 
 export async function publishRetainedPackage(
@@ -829,18 +793,7 @@ export async function publishRetainedPackage(
 	const retainedTarball = await operations.readTarball(record, tarballPath);
 	validateExpectedTarball(record, retainedTarball);
 
-	let existing: RegistryPackageObservation | undefined;
-	try {
-		existing = await operations.observe(record, retainedTarball);
-	} catch (error) {
-		if (!(error instanceof RegistryPropagationPendingError)) throw error;
-		existing = await observeAfterRegistryPropagation(record, retainedTarball, operations, true);
-		if (existing === undefined) {
-			throw new Error(
-				`Registry exposed ${record.name}@${record.version} without settling ${NPM_RELEASE_TAG} after ${REGISTRY_PROPAGATION_ATTEMPTS} attempts`,
-			);
-		}
-	}
+	const existing = await operations.observe(record, retainedTarball);
 	if (existing !== undefined) {
 		assertExactRegistryObservation(record, existing);
 		console.log(`Skipping ${record.name}@${record.version} (registry bytes match expected evidence)`);
@@ -849,13 +802,7 @@ export async function publishRetainedPackage(
 	console.log(`Publishing retained ${record.name}@${record.version}…`);
 	const publish = await operations.publish(tarballPath);
 	if (publish.exitCode !== 0) {
-		let raced: RegistryPackageObservation | undefined;
-		try {
-			raced = await operations.observe(record, retainedTarball);
-		} catch (error) {
-			if (!(error instanceof RegistryPropagationPendingError)) throw error;
-			raced = await observeAfterRegistryPropagation(record, retainedTarball, operations, true);
-		}
+		const raced = await operations.observe(record, retainedTarball);
 		if (raced !== undefined) {
 			assertExactRegistryObservation(record, raced);
 			console.log(`Skipping ${record.name}@${record.version} (concurrent exact publication)`);
@@ -863,8 +810,36 @@ export async function publishRetainedPackage(
 		}
 		throw new Error(`npm publish failed for ${record.name}@${record.version}: ${publish.output || `exit ${publish.exitCode ?? "unknown"}`}`);
 	}
-	const observed = await observeAfterRegistryPropagation(record, retainedTarball, operations);
-	if (observed === undefined) throw new Error(`Registry did not expose ${record.name}@${record.version} after publish (registry propagation not observed after ${REGISTRY_PROPAGATION_ATTEMPTS} attempts)`);
+	// npm's registry is read-after-write eventually consistent: right after a successful
+	// publish the version can be briefly invisible to a follow-up read AND the `latest`
+	// dist-tag can briefly lag behind the just-published version. Both resolve within
+	// seconds, so re-observe with bounded backoff before treating either as a failure.
+	// Real conflicts (integrity/byte mismatch) are rethrown immediately, never retried.
+	const retries = operations.visibilityRetries ?? 12;
+	const delayMs = operations.visibilityDelayMs ?? 5000;
+	const sleep = operations.sleep ?? ((ms: number) => Bun.sleep(ms));
+	const isTransientVisibilityError = (error: unknown): boolean => {
+		const message = error instanceof Error ? error.message : String(error);
+		return (
+			message.includes(`does not identify immutable expected evidence`) ||
+			message.includes(`stable ${NPM_RELEASE_TAG} is absent although`)
+		);
+	};
+	let observed: RegistryPackageObservation | undefined;
+	for (let attempt = 0; ; attempt++) {
+		try {
+			observed = await operations.observe(record, retainedTarball);
+		} catch (error) {
+			if (attempt < retries && isTransientVisibilityError(error)) {
+				await sleep(delayMs);
+				continue;
+			}
+			throw error;
+		}
+		if (observed !== undefined || attempt >= retries) break;
+		await sleep(delayMs);
+	}
+	if (observed === undefined) throw new Error(`Registry did not expose ${record.name}@${record.version} after publish`);
 	assertExactRegistryObservation(record, observed);
 	return observed;
 }
