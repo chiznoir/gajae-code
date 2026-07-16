@@ -2,7 +2,6 @@ import { describe, expect, it } from "bun:test";
 import type { DiscoverableTool } from "../../src/tool-discovery/tool-index";
 import {
 	buildDiscoverableToolSearchIndex,
-	collectDiscoverableMCPTools,
 	collectDiscoverableTools,
 	filterBySource,
 	formatDiscoverableToolServerSummary,
@@ -130,16 +129,6 @@ describe("getDiscoverableTool", () => {
 	});
 });
 
-describe("collectDiscoverableMCPTools", () => {
-	it("does not classify local inline mcp__-prefixed tools as MCP bridge tools", () => {
-		const localTool = makeAgentTool("mcp__local_helper", { description: "Local helper" });
-		const bridgeTool = mcpAgentTool("mcp__github_search", "github", "search", "Search repositories");
-
-		expect(collectDiscoverableMCPTools([localTool, bridgeTool]).map(tool => tool.name)).toEqual([
-			"mcp__github_search",
-		]);
-	});
-});
 
 // ─── collectDiscoverableTools ─────────────────────────────────────────────────
 
@@ -324,45 +313,3 @@ describe("BM25 search", () => {
 	});
 });
 
-// ─── Back-compat: legacy MCP functions ───────────────────────────────────────
-
-describe("back-compat MCP functions via mcp/discoverable-tool-metadata", () => {
-	it("isMCPToolName still works", async () => {
-		const { isMCPToolName: legacyIsMCPToolName } = await import("../../src/runtime-mcp/discoverable-tool-metadata");
-		expect(legacyIsMCPToolName("mcp__foo")).toBe(true);
-		expect(legacyIsMCPToolName("read")).toBe(false);
-	});
-
-	it("collectDiscoverableMCPTools still works", async () => {
-		const { collectDiscoverableMCPTools } = await import("../../src/runtime-mcp/discoverable-tool-metadata");
-		const tools = [
-			mcpAgentTool("mcp__gh_search", "github", "search", "Search repos", ["query"]),
-			makeAgentTool("read"), // non-MCP — should be filtered out
-		];
-		const result = collectDiscoverableMCPTools(tools as any);
-		expect(result).toHaveLength(1);
-		expect(result[0]!.name).toBe("mcp__gh_search");
-		expect(result[0]!.description).toBe("Search repos");
-	});
-
-	it("buildDiscoverableMCPSearchIndex still works and is searchable", async () => {
-		const { buildDiscoverableMCPSearchIndex, searchDiscoverableMCPTools } = await import(
-			"../../src/runtime-mcp/discoverable-tool-metadata"
-		);
-		const legacyTools = [
-			{
-				name: "mcp__test",
-				label: "test/tool",
-				description: "A test MCP tool",
-				serverName: "test",
-				mcpToolName: "tool",
-				schemaKeys: ["query"],
-			},
-		];
-		const index = buildDiscoverableMCPSearchIndex(legacyTools);
-		expect(index.documents).toHaveLength(1);
-		const results = searchDiscoverableMCPTools(index, "test", 5);
-		expect(results).toHaveLength(1);
-		expect(results[0]!.tool.name).toBe("mcp__test");
-	});
-});

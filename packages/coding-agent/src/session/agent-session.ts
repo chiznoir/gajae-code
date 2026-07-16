@@ -253,15 +253,7 @@ import planModeToolDecisionReminderPrompt from "../prompts/system/plan-mode-tool
 import ttsrInterruptTemplate from "../prompts/system/ttsr-interrupt.md" with { type: "text" };
 import ttsrToolReminderTemplate from "../prompts/system/ttsr-tool-reminder.md" with { type: "text" };
 import { type AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
-import {
-	buildDiscoverableMCPSearchIndex,
-	collectDiscoverableMCPTools,
-	type DiscoverableMCPSearchIndex,
-	type DiscoverableMCPTool,
-	isMCPBridgeTool,
-	isMCPToolName,
-	selectDiscoverableMCPToolNamesByServer,
-} from "../runtime-mcp/discoverable-tool-metadata";
+import { MCPManager } from "../runtime-mcp/manager";
 import { MCPManager } from "../runtime-mcp/manager";
 import type { NotificationSessionController } from "../sdk/bus/session-control";
 import { deobfuscateSessionContext, type SecretObfuscator } from "../secrets/obfuscator";
@@ -280,6 +272,9 @@ import {
 	collectDiscoverableTools,
 	type DiscoverableTool,
 	type DiscoverableToolSearchIndex,
+	isMCPBridgeTool,
+	isMCPToolName,
+	selectDiscoverableToolNamesByServer,
 } from "../tool-discovery/tool-index";
 import type { AskAnswerSource, ToolSession } from "../tools";
 import { AskTool } from "../tools/ask";
@@ -502,6 +497,8 @@ export interface AgentSessionConfig {
 	getMcpServerInstructions?: () => Map<string, string> | undefined;
 	/** Enable hidden-by-default MCP tool discovery for this session. */
 	mcpDiscoveryEnabled?: boolean;
+	/** Effective discovery mode normalized by the session factory. */
+	discoveryMode?: "off" | "mcp-only" | "all";
 	/** MCP tool names to activate for the current session when discovery mode is enabled. */
 	initialSelectedMCPToolNames?: string[];
 	/** Whether constructor-provided MCP defaults should be persisted immediately. */
@@ -1516,8 +1513,8 @@ export class AgentSession {
 	#baseSystemPromptGeneration = 0;
 	#pendingBaseSystemPromptRebuilds = new Set<Promise<void>>();
 	#mcpDiscoveryEnabled = false;
-	#discoverableMCPTools = new Map<string, DiscoverableMCPTool>();
-	#discoverableMCPSearchIndex: DiscoverableMCPSearchIndex | null = null;
+	#discoveryMode: "off" | "mcp-only" | "all" = "off";
+	#discoverableMCPTools = new Map<string, DiscoverableTool>();
 	#selectedMCPToolNames = new Set<string>();
 	// Generic tool discovery (covers built-in + MCP + extension when tools.discoveryMode === "all")
 	#discoverableToolSearchIndex: DiscoverableToolSearchIndex | null = null;
@@ -1938,6 +1935,7 @@ export class AgentSession {
 		this.#baseSystemPrompt = this.agent.state.systemPrompt;
 		this.#initialWorkspaceTree = config.workspaceTree;
 		this.#mcpDiscoveryEnabled = config.mcpDiscoveryEnabled ?? false;
+		this.#discoveryMode = config.discoveryMode ?? (this.#mcpDiscoveryEnabled ? "mcp-only" : "off");
 		this.#discoverableToolAllowedNames = config.discoverableToolAllowedNames
 			? new Set(config.discoverableToolAllowedNames.map(name => name.toLowerCase()))
 			: undefined;
@@ -4592,11 +4590,13 @@ export class AgentSession {
 		return this.#retryAttempt;
 	}
 
-	#collectDiscoverableMCPToolsFromRegistry(): Map<string, DiscoverableMCPTool> {
-		return new Map(collectDiscoverableMCPTools(this.#toolRegistry.values()).map(tool => [tool.name, tool] as const));
+	#collectDiscoverableMCPToolsFromRegistry(): Map<string, DiscoverableTool> {
+		return new Map(
+			collectDiscoverableTools(Array.from(this.#toolRegistry.values()).filter(isMCPBridgeTool)).map(tool => [tool.name, tool] as const),
+		);
 	}
 
-	#setDiscoverableMCPTools(discoverableMCPTools: Map<string, DiscoverableMCPTool>): void {
+	#setDiscoverableMCPTools(discoverableMCPTools: Map<string, DiscoverableTool>): void {
 		this.#discoverableMCPTools = discoverableMCPTools;
 		this.#invalidateDiscoveryCaches();
 	}
@@ -4605,7 +4605,6 @@ export class AgentSession {
 	 *  affect which tools should be discoverable: registry mutations (refreshMCPTools)
 	 *  or active-tool mutations (#applyActiveToolsByName). */
 	#invalidateDiscoveryCaches(): void {
-		this.#discoverableMCPSearchIndex = null;
 		this.#discoverableToolSearchIndex = null;
 	}
 
@@ -4616,7 +4615,7 @@ export class AgentSession {
 	#getConfiguredDefaultSelectedMCPToolNames(): string[] {
 		return this.#filterSelectableMCPToolNames([
 			...this.#defaultSelectedMCPToolNames,
-			...selectDiscoverableMCPToolNamesByServer(
+			...selectDiscoverableToolNamesByServer(
 				this.#discoverableMCPTools.values(),
 				this.#defaultSelectedMCPServerNames,
 			),
@@ -4821,31 +4820,6 @@ export class AgentSession {
 		}
 	}
 
-	isMCPDiscoveryEnabled(): boolean {
-		return this.#mcpDiscoveryEnabled;
-	}
-
-	/** @deprecated Use {@link getDiscoverableTools} with `{ source: "mcp" }` instead.
-	 *  Preserves the legacy `description`-bearing MCP shape for back-compat callers. */
-	getDiscoverableMCPTools(): DiscoverableMCPTool[] {
-		return Array.from(this.#discoverableMCPTools.values()).map(t => ({
-			name: t.name,
-			label: t.label,
-			description: t.description,
-			serverName: t.serverName,
-			mcpToolName: t.mcpToolName,
-			schemaKeys: t.schemaKeys,
-		}));
-	}
-
-	/** @deprecated Use {@link getDiscoverableToolSearchIndex} instead.
-	 *  Returns the legacy MCP search index whose documents expose `tool.description`. */
-	getDiscoverableMCPSearchIndex(): DiscoverableMCPSearchIndex {
-		if (!this.#discoverableMCPSearchIndex) {
-			this.#discoverableMCPSearchIndex = buildDiscoverableMCPSearchIndex(this.#discoverableMCPTools.values());
-		}
-		return this.#discoverableMCPSearchIndex;
-	}
 
 	getSelectedMCPToolNames(): string[] {
 		if (!this.#mcpDiscoveryEnabled) {
@@ -4854,7 +4828,7 @@ export class AgentSession {
 		return this.#filterSelectableMCPToolNames(this.#selectedMCPToolNames);
 	}
 
-	async activateDiscoveredMCPTools(toolNames: string[]): Promise<string[]> {
+	async #activateDiscoveredMCPTools(toolNames: string[]): Promise<string[]> {
 		const nextSelectedMCPToolNames = new Set(this.#selectedMCPToolNames);
 		const activated: string[] = [];
 		for (const name of toolNames) {
@@ -4877,12 +4851,8 @@ export class AgentSession {
 
 	// ── Generic tool discovery (covers built-in + MCP + extension) ────────────
 
-	/** Resolve effective discovery mode: tools.discoveryMode wins; mcp.discoveryMode is back-compat alias. */
 	#resolveEffectiveDiscoveryMode(): "off" | "mcp-only" | "all" {
-		const toolsMode = this.settings.get("tools.discoveryMode");
-		if (toolsMode !== "off") return toolsMode as "off" | "mcp-only" | "all";
-		if (this.settings.get("mcp.discoveryMode")) return "mcp-only";
-		return "off";
+		return this.#discoveryMode;
 	}
 
 	isToolDiscoveryEnabled(): boolean {
@@ -4894,17 +4864,7 @@ export class AgentSession {
 		// For "mcp-only" mode we only return MCP tools.
 		const mode = this.#resolveEffectiveDiscoveryMode();
 		const activeNames = new Set(this.getActiveToolNames());
-		const mcpTools: DiscoverableTool[] = Array.from(this.#discoverableMCPTools.values())
-			.filter(t => !activeNames.has(t.name))
-			.map(t => ({
-				name: t.name,
-				label: t.label,
-				summary: t.description,
-				source: "mcp" as const,
-				serverName: t.serverName,
-				mcpToolName: t.mcpToolName,
-				schemaKeys: t.schemaKeys,
-			}));
+		const mcpTools = Array.from(this.#discoverableMCPTools.values()).filter(t => !activeNames.has(t.name));
 		const builtinTools: DiscoverableTool[] = mode === "all" ? this.#collectDiscoverableBuiltinTools() : [];
 		const allTools = [...builtinTools, ...mcpTools];
 		return filter?.source ? allTools.filter(t => t.source === filter.source) : allTools;
@@ -4958,7 +4918,7 @@ export class AgentSession {
 
 		// Activate MCP tools via existing path
 		if (mcpNames.length > 0) {
-			const activatedMcp = await this.activateDiscoveredMCPTools(mcpNames);
+			const activatedMcp = await this.#activateDiscoveredMCPTools(mcpNames);
 			activated.push(...activatedMcp);
 		}
 

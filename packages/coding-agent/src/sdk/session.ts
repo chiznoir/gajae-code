@@ -1454,11 +1454,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			getCompactContext: () => session.formatCompactContext(),
 			getTodoPhases: () => session.getTodoPhases(),
 			setTodoPhases: phases => session.setTodoPhases(phases),
-			isMCPDiscoveryEnabled: () => session.isMCPDiscoveryEnabled(),
-			getDiscoverableMCPTools: () => session.getDiscoverableMCPTools(),
-			getDiscoverableMCPSearchIndex: () => session.getDiscoverableMCPSearchIndex(),
-			getSelectedMCPToolNames: () => session.getSelectedMCPToolNames(),
-			activateDiscoveredMCPTools: toolNames => session.activateDiscoveredMCPTools(toolNames),
 			// Generic tool discovery (unified — covers built-in + MCP + extension)
 			isToolDiscoveryEnabled: () => session.isToolDiscoveryEnabled(),
 			getDiscoverableTools: filter => session.getDiscoverableTools(filter),
@@ -2118,8 +2113,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				pluginAppendices: pluginSystemAppendices,
 				repeatToolDescriptions,
 				intentField,
-				mcpDiscoveryMode: false,
-				mcpDiscoveryServerSummaries: [],
 				toolDiscoveryActive: effectiveDiscoveryMode === "all" || mcpDiscoveryEnabled,
 				discoverableTools: [...discoverableBuiltinTools, ...discoverableMCPTools]
 					.map(tool => ({ name: tool.name, summary: tool.summary }))
@@ -2152,12 +2145,15 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			: toolNamesFromRegistry;
 		const normalizedRequested = requestedToolNames.filter(name => toolRegistry.has(name));
 		const requestedToolNameSet = new Set(normalizedRequested);
-		// Generic tool discovery hides non-essential built-ins behind search_tool_bm25.
-		// Legacy MCP discovery remains separately controlled by mcp.discoveryMode so
-		// loaded MCP catalogs can be searched without enabling every hidden built-in.
+		// Normalize the user-facing mcp.discoveryMode alias once at session construction.
 		const toolsDiscoveryModeSetting = settings.get("tools.discoveryMode");
-		const effectiveDiscoveryMode: "off" | "all" = toolsDiscoveryModeSetting === "all" ? "all" : "off";
-		const mcpDiscoveryEnabled = settings.get("mcp.discoveryMode") === true;
+		const effectiveDiscoveryMode: "off" | "mcp-only" | "all" =
+			toolsDiscoveryModeSetting !== "off"
+				? (toolsDiscoveryModeSetting as "mcp-only" | "all")
+				: settings.get("mcp.discoveryMode")
+					? "mcp-only"
+					: "off";
+		const mcpDiscoveryEnabled = effectiveDiscoveryMode !== "off";
 		const defaultInactiveToolNames = new Set(
 			registeredTools.filter(tool => tool.definition.defaultInactive).map(tool => tool.definition.name),
 		);
@@ -2546,6 +2542,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						}
 					: undefined,
 			mcpDiscoveryEnabled,
+			discoveryMode: effectiveDiscoveryMode,
 			initialSelectedMCPToolNames,
 			defaultSelectedMCPToolNames,
 			persistInitialMCPToolSelection: !hasExistingSession,

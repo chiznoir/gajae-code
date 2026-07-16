@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Changed
++- Removed deprecated `DiscoverableMCPTool`, `DiscoverableMCPSearchIndex`, and related MCP-only discovery helper exports. Use the unified `DiscoverableTool` discovery APIs; the `mcp.discoveryMode` settings alias remains supported.
+
 ## [0.11.1] - 2026-07-16
 
 ### Fixed
