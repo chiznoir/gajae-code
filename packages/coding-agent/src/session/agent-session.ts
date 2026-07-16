@@ -5337,19 +5337,14 @@ export class AgentSession {
 	 *      `tool.customWireName` and overrides the internal name on the model wire
 	 *      (e.g. `edit` exposes itself as `apply_patch` to GPT-5 in apply_patch mode);
 	 *      a stale wire name would desync prompt guidance from actual tool routing.
-	 *   3. When MCP discovery is on, every registry tool's name+label+description+
-	 *      customWireName, since `rebuildSystemPrompt` summarizes discoverable MCP
-	 *      tools that are not in the active set.
-	 *   4. MCP server instructions text (per server), since `rebuildSystemPrompt`
+	 *   3. MCP server instructions text (per server), since `rebuildSystemPrompt`
 	 *      embeds these in the appended prompt under "## MCP Server Instructions".
 	 *      A server upgrade can change instructions while keeping tools identical.
 	 *
-	 * Settings-driven tool metadata is covered automatically: built-in tools that
-	 * depend on settings expose `description`/`label` via getters (see `TaskTool`,
-	 * `SearchToolBm25Tool`, `EditTool`), and the signature reads them live on every
-	 * call - so a settings flip that mutates the rendered string differs the signature
-	 * the next time `#applyActiveToolsByName` runs. Do not refactor `describeTool` to
-	 * cache per-tool strings without preserving this property.
+	 * Settings-driven tool metadata is covered automatically: built-in tools with
+	 * dynamic `description`/`label` getters (for example `TaskTool` and `EditTool`)
+	 * are read live on every call, so a settings flip that changes rendered metadata
+	 * changes the signature. Do not cache per-tool strings without preserving this.
 	 *
 	 * Inputs NOT covered: tool input schemas; memory instructions read from disk;
 	 * and SDK-init-time closure constants in `sdk/session.ts` (`repeatToolDescriptions`,

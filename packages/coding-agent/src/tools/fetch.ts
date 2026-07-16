@@ -1292,14 +1292,14 @@ async function materializeReadUrlCacheEntry(
 	session: ToolSession,
 	entry: ReadUrlCacheEntry,
 ): Promise<ReadUrlCacheEntry | null> {
+	if (entry.output.length > 0) return entry;
 	if (entry.artifactId) {
 		const artifactOutput = await readArtifactOutput(session, entry.artifactId);
 		if (artifactOutput !== null) {
 			return { ...entry, output: artifactOutput };
 		}
 	}
-
-	return entry.output.length > 0 ? entry : null;
+	return null;
 }
 
 async function persistReadUrlArtifact(session: ToolSession, output: string): Promise<string | undefined> {
@@ -1383,7 +1383,7 @@ const UNTRUSTED_CONTENT_OPEN = "<untrusted-content>";
 const UNTRUSTED_CONTENT_CLOSE = "</untrusted-content>";
 
 export function wrapUntrustedContent(content: string): string {
-	return `${UNTRUSTED_CONTENT_OPEN}\n${content.replaceAll(UNTRUSTED_CONTENT_CLOSE, "&lt;/untrusted-content>")}\n${UNTRUSTED_CONTENT_CLOSE}`;
+	return `${UNTRUSTED_CONTENT_OPEN}\n${content.replace(/<\/untrusted-content>/gi, "&lt;/untrusted-content>")}\n${UNTRUSTED_CONTENT_CLOSE}`;
 }
 
 function buildUrlReadOutput(result: FetchRenderResult, content: string): string {

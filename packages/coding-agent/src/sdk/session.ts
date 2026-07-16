@@ -126,12 +126,7 @@ import {
 } from "../system-prompt";
 import { AgentOutputManager } from "../task/output-manager";
 import { parseThinkingLevel, resolveThinkingLevelForModel, toReasoningEffort } from "../thinking";
-import {
-	collectDiscoverableTools,
-	type DiscoverableTool,
-	isMCPBridgeTool,
-	isMCPToolName,
-} from "../tool-discovery/tool-index";
+import { isMCPBridgeTool } from "../tool-discovery/tool-index";
 import {
 	applyConfiguredSearchTimeout,
 	BashTool,
@@ -2034,30 +2029,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			candidateModel?: Model,
 		): Promise<BuildSystemPromptResult> => {
 			toolContextStore.setToolNames(toolNames);
-			const { discoverableBuiltinTools, discoverableMCPTools, promptTools } = (() => {
+			const promptTools = (() => {
 				const previousPromptMetadataModel = promptMetadataModel;
 				promptMetadataModel = candidateModel;
 				try {
-					const activeToolNames = new Set(toolNames);
-					const discoverableBuiltinTools: DiscoverableTool[] =
-						effectiveDiscoveryMode === "all"
-							? collectDiscoverableTools(
-									Array.from(tools.values()).filter(
-										tool => tool.loadMode === "discoverable" && !activeToolNames.has(tool.name),
-									),
-									{ source: "builtin" },
-								)
-							: [];
-					const discoverableMCPTools: DiscoverableTool[] = mcpDiscoveryEnabled
-						? collectDiscoverableTools(
-								Array.from(tools.values()).filter(
-									tool => isMCPToolName(tool.name) && !activeToolNames.has(tool.name),
-								),
-								{ source: "mcp" },
-							)
-						: [];
-					const promptTools = buildSystemPromptToolMetadata(tools);
-					return { discoverableBuiltinTools, discoverableMCPTools, promptTools };
+					return buildSystemPromptToolMetadata(tools);
 				} finally {
 					promptMetadataModel = previousPromptMetadataModel;
 				}

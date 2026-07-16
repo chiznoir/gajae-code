@@ -370,7 +370,7 @@ export function convertToLlm(messages: AgentMessage[]): Message[] {
 				case "fileMention": {
 					const fileContents = m.files
 						.map(file => {
-							const inner = file.content ? `\n${file.content.replaceAll("</system-reminder>", "&lt;/system-reminder>")}\n` : "\n";
+							const inner = file.content ? `\n${file.content.replace(/<\/system-reminder>/gi, "&lt;/system-reminder>")}\n` : "\n";
 							return `<file path="${file.path}">${inner}</file>`;
 						})
 						.join("\n\n");
