@@ -452,6 +452,7 @@ function handlePath(): void {
 type ConfigDoctorReport = { unknownKeys: string[]; invalidValues: Array<{ path: string; value: unknown }>; legacyShapes: string[] };
 
 function flattenConfig(value: unknown, prefix = ""): Array<[string, unknown]> {
+	if (prefix && ALL_SETTING_PATHS.includes(prefix as SettingPath)) return [[prefix, value]];
 	if (value === null || typeof value !== "object" || Array.isArray(value)) return prefix ? [[prefix, value]] : [];
 	return Object.entries(value).flatMap(([key, child]) => flattenConfig(child, prefix ? `${prefix}.${key}` : key));
 }
