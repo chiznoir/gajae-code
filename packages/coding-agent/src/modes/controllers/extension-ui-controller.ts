@@ -357,6 +357,10 @@ export class ExtensionUiController {
 			},
 			getActiveTools: () => this.ctx.session.getActiveToolNames(),
 			getAllTools: () => this.ctx.session.getAllToolNames(),
+			resolveTool: name => {
+				const tool = this.ctx.session.getToolByName(name);
+				return tool ? { safeSummary: tool.safeSummary, safeSummaryFields: tool.safeSummaryFields } : undefined;
+			},
 			setActiveTools: toolNames => this.ctx.session.setActiveToolsByName(toolNames),
 			setModel: async model => {
 				const key = await this.ctx.session.modelRegistry.getApiKey(model);
@@ -393,6 +397,10 @@ export class ExtensionUiController {
 			getQueuedMessages: () => this.ctx.session.getQueuedMessageEntries(),
 			getActiveTools: () => this.ctx.session.getActiveToolNames(),
 			getAllTools: () => this.ctx.session.getAllToolNames(),
+			resolveTool: name => {
+				const tool = this.ctx.session.getToolByName(name);
+				return tool ? { safeSummary: tool.safeSummary, safeSummaryFields: tool.safeSummaryFields } : undefined;
+			},
 
 			shutdown: () => {
 				// Defer the actual teardown to the main loop, which calls
@@ -651,6 +659,10 @@ export class ExtensionUiController {
 			},
 			getActiveTools: () => this.ctx.session.getActiveToolNames(),
 			getAllTools: () => this.ctx.session.getAllToolNames(),
+			resolveTool: name => {
+				const tool = this.ctx.session.getToolByName(name);
+				return tool ? { safeSummary: tool.safeSummary, safeSummaryFields: tool.safeSummaryFields } : undefined;
+			},
 			setActiveTools: toolNames => this.ctx.session.setActiveToolsByName(toolNames),
 			setModel: async model => {
 				const key = await this.ctx.session.modelRegistry.getApiKey(model);
@@ -687,6 +699,10 @@ export class ExtensionUiController {
 			getQueuedMessages: () => this.ctx.session.getQueuedMessageEntries(),
 			getActiveTools: () => this.ctx.session.getActiveToolNames(),
 			getAllTools: () => this.ctx.session.getAllToolNames(),
+			resolveTool: name => {
+				const tool = this.ctx.session.getToolByName(name);
+				return tool ? { safeSummary: tool.safeSummary, safeSummaryFields: tool.safeSummaryFields } : undefined;
+			},
 
 			shutdown: () => {
 				// Defer the actual teardown to the main loop, which calls
@@ -906,6 +922,12 @@ export class ExtensionUiController {
 						getQueuedMessages: () => this.ctx.session.getQueuedMessageEntries(),
 						getActiveTools: () => this.ctx.session.getActiveToolNames(),
 						getAllTools: () => this.ctx.session.getAllToolNames(),
+						resolveTool: name => {
+							const tool = this.ctx.session.getToolByName(name);
+							return tool
+								? { safeSummary: tool.safeSummary, safeSummaryFields: tool.safeSummaryFields }
+								: undefined;
+						},
 						hasQueuedMessages: () => this.ctx.session.queuedMessageCount > 0,
 						abort: () => {
 							this.ctx.session.abort();

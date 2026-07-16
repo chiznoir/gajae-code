@@ -131,6 +131,11 @@ export declare class NotificationServer {
    */
   onSdkFrame(callback: (err: null | Error, frame: SdkFrameEvent) => void): void
   /**
+   * Register the negotiated-capabilities callback. Must be called before
+   * [`Self::start`].
+   */
+  onNegotiatedCapabilities(callback: (err: null | Error, connectionId: string, capabilities: string[]) => void): void
+  /**
    * Register the connection-close callback. Must be called before
    * [`Self::start`].
    */
@@ -190,7 +195,7 @@ export declare class NotificationServer {
    * Fails if not started or `frame_json` is not a valid `ServerMessage`.
    */
   pushFrame(frameJson: string): void
-  /** Send raw JSON to one connected v3 SDK client. */
+  /** Send a validated, bounded JSON envelope to one connected v3 SDK client. */
   sendTo(connectionId: string, json: string): void
   /**
    * Publish a replayable `session_ready` readiness signal. `ready_json` is a
