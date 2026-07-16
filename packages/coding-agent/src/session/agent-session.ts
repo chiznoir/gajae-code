@@ -1935,7 +1935,14 @@ export class AgentSession {
 		this.#baseSystemPrompt = this.agent.state.systemPrompt;
 		this.#initialWorkspaceTree = config.workspaceTree;
 		this.#mcpDiscoveryEnabled = config.mcpDiscoveryEnabled ?? false;
-		this.#discoveryMode = config.discoveryMode ?? (this.#mcpDiscoveryEnabled ? "mcp-only" : "off");
+		const configuredDiscoveryMode = config.settings.get("tools.discoveryMode");
+		this.#discoveryMode =
+			config.discoveryMode ??
+			(configuredDiscoveryMode !== "off"
+				? configuredDiscoveryMode
+				: this.#mcpDiscoveryEnabled
+					? "mcp-only"
+					: "off");
 		this.#discoverableToolAllowedNames = config.discoverableToolAllowedNames
 			? new Set(config.discoverableToolAllowedNames.map(name => name.toLowerCase()))
 			: undefined;

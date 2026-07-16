@@ -37,7 +37,9 @@ interface EmbeddedAgentDef {
 
 function buildAgentContent(def: EmbeddedAgentDef): string {
 	const restrictedBash = prompt.render(restrictedBashTemplate);
-	const ralplanPersistence = prompt.render(ralplanPersistenceTemplate, { stage: def.frontmatter?.name ?? "" });
+	const ralplanPersistence = prompt.render(ralplanPersistenceTemplate, {
+		stage: def.frontmatter?.name ?? def.fileName.replace(/\.md$/, ""),
+	});
 	const body = prompt.render(def.template, { restrictedBash, ralplanPersistence });
 	if (!def.frontmatter) return body;
 	return prompt.render(agentFrontmatterTemplate, { ...def.frontmatter, body });

@@ -158,9 +158,9 @@ describe("collectDiscoverableTools", () => {
 
 describe("filterBySource", () => {
 	const mixed: DiscoverableTool[] = [
-		{ name: "read", label: "read", summary: "x", source: "builtin", schemaKeys: [] },
-		{ name: "mcp__gh", label: "gh", summary: "x", source: "mcp", serverName: "gh", schemaKeys: [] },
-		{ name: "ext_foo", label: "ext_foo", summary: "x", source: "extension", schemaKeys: [] },
+		{ name: "read", label: "read", description: "x", summary: "x", source: "builtin", schemaKeys: [] },
+		{ name: "mcp__gh", label: "gh", description: "x", summary: "x", source: "mcp", serverName: "gh", schemaKeys: [] },
+		{ name: "ext_foo", label: "ext_foo", description: "x", summary: "x", source: "extension", schemaKeys: [] },
 	];
 
 	it("filters by builtin", () => {
@@ -179,10 +179,10 @@ describe("filterBySource", () => {
 describe("summarizeDiscoverableTools", () => {
 	it("groups tools by server and counts them", () => {
 		const tools: DiscoverableTool[] = [
-			{ name: "mcp__gh_1", label: "gh/1", summary: "x", source: "mcp", serverName: "github", schemaKeys: [] },
-			{ name: "mcp__gh_2", label: "gh/2", summary: "x", source: "mcp", serverName: "github", schemaKeys: [] },
-			{ name: "mcp__sl_1", label: "sl/1", summary: "x", source: "mcp", serverName: "slack", schemaKeys: [] },
-			{ name: "builtin_read", label: "read", summary: "x", source: "builtin", schemaKeys: [] },
+			{ name: "mcp__gh_1", label: "gh/1", description: "x", summary: "x", source: "mcp", serverName: "github", schemaKeys: [] },
+			{ name: "mcp__gh_2", label: "gh/2", description: "x", summary: "x", source: "mcp", serverName: "github", schemaKeys: [] },
+			{ name: "mcp__sl_1", label: "sl/1", description: "x", summary: "x", source: "mcp", serverName: "slack", schemaKeys: [] },
+			{ name: "builtin_read", label: "read", description: "x", summary: "x", source: "builtin", schemaKeys: [] },
 		];
 		const summary = summarizeDiscoverableTools(tools);
 		expect(summary.toolCount).toBe(4);
@@ -194,7 +194,7 @@ describe("summarizeDiscoverableTools", () => {
 
 	it("returns empty servers for tools without serverName", () => {
 		const tools: DiscoverableTool[] = [
-			{ name: "read", label: "read", summary: "x", source: "builtin", schemaKeys: [] },
+			{ name: "read", label: "read", description: "x", summary: "x", source: "builtin", schemaKeys: [] },
 		];
 		const summary = summarizeDiscoverableTools(tools);
 		expect(summary.toolCount).toBe(1);
@@ -217,9 +217,9 @@ describe("formatDiscoverableToolServerSummary", () => {
 
 describe("selectDiscoverableToolNamesByServer", () => {
 	const tools: DiscoverableTool[] = [
-		{ name: "mcp__gh_1", label: "gh/1", summary: "x", source: "mcp", serverName: "github", schemaKeys: [] },
-		{ name: "mcp__sl_1", label: "sl/1", summary: "x", source: "mcp", serverName: "slack", schemaKeys: [] },
-		{ name: "read", label: "read", summary: "x", source: "builtin", schemaKeys: [] },
+		{ name: "mcp__gh_1", label: "gh/1", description: "x", summary: "x", source: "mcp", serverName: "github", schemaKeys: [] },
+		{ name: "mcp__sl_1", label: "sl/1", description: "x", summary: "x", source: "mcp", serverName: "slack", schemaKeys: [] },
+		{ name: "read", label: "read", description: "x", summary: "x", source: "builtin", schemaKeys: [] },
 	];
 
 	it("returns names for tools in the specified servers", () => {
@@ -239,6 +239,7 @@ describe("BM25 search", () => {
 		{
 			name: "mcp__github_create_issue",
 			label: "github/create_issue",
+			description: "Create a GitHub issue in the selected repository",
 			summary: "Create a GitHub issue in the selected repository",
 			source: "mcp",
 			serverName: "github",
@@ -248,6 +249,7 @@ describe("BM25 search", () => {
 		{
 			name: "mcp__github_list_prs",
 			label: "github/list_pull_requests",
+			description: "List pull requests for a GitHub repository",
 			summary: "List pull requests for a GitHub repository",
 			source: "mcp",
 			serverName: "github",
@@ -257,6 +259,7 @@ describe("BM25 search", () => {
 		{
 			name: "mcp__slack_post",
 			label: "slack/post_message",
+			description: "Post a message to a Slack channel",
 			summary: "Post a message to a Slack channel",
 			source: "mcp",
 			serverName: "slack",
@@ -266,6 +269,7 @@ describe("BM25 search", () => {
 		{
 			name: "find",
 			label: "find",
+			description: "Find files and directories matching a glob pattern",
 			summary: "Find files and directories matching a glob pattern",
 			source: "builtin",
 			schemaKeys: ["pattern", "path"],

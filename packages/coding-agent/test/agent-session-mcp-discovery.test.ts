@@ -859,8 +859,8 @@ describe("AgentSession MCP discovery", () => {
 		expect(session.systemPrompt).toEqual(["tools:read"]);
 	});
 
-	// ── Findings #2: legacy MCP discovery shapes ───────────────────────────────
-	it("getDiscoverableMCPTools returns the legacy MCP shape with `summary` populated", () => {
+	// ── Findings #2: unified MCP discovery descriptors ─────────────────────────
+	it("getDiscoverableTools returns unified MCP descriptors with description and summary", () => {
 		const readTool = createBasicTool("read", "Read");
 		const docsSearchTool = createMcpTool("mcp__docs_search", "docs", "search", "Search internal docs", ["query"]);
 		const toolRegistry = new Map([
@@ -886,8 +886,7 @@ describe("AgentSession MCP discovery", () => {
 		const entry = discoverable[0]!;
 		expect(entry.name).toBe("mcp__docs_search");
 		expect(entry.description).toBe("Search internal docs");
-		// Legacy shape must NOT carry `summary` — back-compat callers expect `summary`.
-		expect((entry as { summary?: string }).summary).toBeUndefined();
+		expect(entry.summary).toBe("Search internal docs");
 	});
 
 	it("getDiscoverableMCPSearchIndex documents expose tool.summary (legacy shape)", () => {

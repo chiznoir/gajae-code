@@ -10,6 +10,7 @@ import {
 	buildDiscoverableToolSearchIndex,
 	type DiscoverableTool,
 	type DiscoverableToolSearchIndex,
+	searchDiscoverableTools,
 } from "../tool-discovery/tool-index";
 import { renderStatusLine, renderTreeList, truncateToWidth } from "../tui";
 import type { ToolSession } from ".";

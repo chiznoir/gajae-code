@@ -2150,7 +2150,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		const effectiveDiscoveryMode: "off" | "mcp-only" | "all" =
 			toolsDiscoveryModeSetting !== "off"
 				? (toolsDiscoveryModeSetting as "mcp-only" | "all")
-				: settings.get("mcp.discoveryMode")
+				: settings.get("mcp.discoveryMode") || explicitMcpConfigPath !== undefined
 					? "mcp-only"
 					: "off";
 		const mcpDiscoveryEnabled = effectiveDiscoveryMode !== "off";
@@ -2186,7 +2186,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				toolRegistry.has(name),
 			);
 			defaultSelectedMCPToolNames = [
-				...new Set([...discoveryDefaultServerToolNames, ...explicitlyRequestedMCPToolNames]),
+				...new Set([
+					...discoveryDefaultServerToolNames,
+					...explicitlyRequestedMCPToolNames,
+					...(explicitMcpConfigPath !== undefined ? exactMcpToolNames : []),
+				]),
 			];
 			initialSelectedMCPToolNames = existingSession.hasPersistedMCPToolSelection
 				? restoredSelectedMCPToolNames

@@ -7,6 +7,7 @@ export type DiscoverableToolSource = "builtin" | "mcp" | "extension" | "custom";
 export interface DiscoverableTool {
 	name: string;
 	label: string;
+	description: string;
 	/** Short BM25 corpus entry; falls back to description first 200 chars */
 	summary: string;
 	source: DiscoverableToolSource;
@@ -154,6 +155,7 @@ export function getDiscoverableTool(
 	return {
 		name: tool.name,
 		label: typeof toolRecord.label === "string" ? toolRecord.label : tool.name,
+		description: rawDescription,
 		summary,
 		source,
 		serverName: typeof toolRecord.mcpServerName === "string" ? toolRecord.mcpServerName : undefined,
