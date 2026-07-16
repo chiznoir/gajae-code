@@ -465,7 +465,11 @@ function parseModelPatternWithContext(
 	pattern: string,
 	availableModels: Model<Api>[],
 	context: ModelPreferenceContext,
-	options?: { allowInvalidThinkingSelectorFallback?: boolean; modelRegistry?: CanonicalModelRegistry; sessionId?: string },
+	options?: {
+		allowInvalidThinkingSelectorFallback?: boolean;
+		modelRegistry?: CanonicalModelRegistry;
+		sessionId?: string;
+	},
 ): ParsedModelResult {
 	// Try exact match first
 	const exactMatch = tryMatchModel(pattern, availableModels, context, options);
@@ -522,7 +526,11 @@ export function parseModelPattern(
 	pattern: string,
 	availableModels: Model<Api>[],
 	preferences?: ModelMatchPreferences,
-	options?: { allowInvalidThinkingSelectorFallback?: boolean; modelRegistry?: CanonicalModelRegistry; sessionId?: string },
+	options?: {
+		allowInvalidThinkingSelectorFallback?: boolean;
+		modelRegistry?: CanonicalModelRegistry;
+		sessionId?: string;
+	},
 ): ParsedModelResult {
 	const context = buildPreferenceContext(availableModels, preferences);
 	return parseModelPatternWithContext(pattern, availableModels, context, options);
