@@ -7,7 +7,8 @@ import type { SlashCommand } from "@gajae-code/tui";
 describe("SelectorController command palette", () => {
 	it("surfaces rejected handlers without an unhandled rejection", async () => {
 		const component = { clear: vi.fn(), addChild: vi.fn() };
-		const showError = vi.fn();
+		const errorShown = Promise.withResolvers<void>();
+		const showError = vi.fn(() => errorShown.resolve());
 		const ctx = {
 			editorContainer: component,
 			editor: {},
@@ -18,21 +19,27 @@ describe("SelectorController command palette", () => {
 		} as unknown as InteractiveModeContext;
 		const controller = new SelectorController(ctx);
 		const unhandled = vi.fn();
-		process.once("unhandledRejection", unhandled);
+		process.on("unhandledRejection", unhandled);
 
-		controller.showCommandPalette([{ name: "broken", description: "Rejects" }] as SlashCommand[], [], async () => {
-			throw new Error("palette command failed");
-		});
-		const palette = component.addChild.mock.calls[0]?.[0] as CommandPaletteComponent;
-		palette.handleInput("\r");
-		await Bun.sleep(0);
+		try {
+			controller.showCommandPalette([{ name: "broken", description: "Rejects" }] as SlashCommand[], [], async () => {
+				throw new Error("palette command failed");
+			});
+			const palette = component.addChild.mock.calls[0]?.[0] as CommandPaletteComponent;
+			palette.handleInput("\r");
+			await errorShown.promise;
+			await new Promise<void>(resolve => setImmediate(resolve));
 
-		expect(showError).toHaveBeenCalledWith("palette command failed");
-		expect(unhandled).not.toHaveBeenCalled();
+			expect(showError).toHaveBeenCalledWith("palette command failed");
+			expect(unhandled).not.toHaveBeenCalled();
+		} finally {
+			process.off("unhandledRejection", unhandled);
+		}
 	});
 	it("surfaces rejected action handlers", async () => {
 		const component = { clear: vi.fn(), addChild: vi.fn() };
-		const showError = vi.fn();
+		const errorShown = Promise.withResolvers<void>();
+		const showError = vi.fn(() => errorShown.resolve());
 		const ctx = {
 			editorContainer: component,
 			editor: {},
@@ -58,7 +65,7 @@ describe("SelectorController command palette", () => {
 		);
 		const palette = component.addChild.mock.calls[0]?.[0] as CommandPaletteComponent;
 		palette.handleInput("\r");
-		await Bun.sleep(0);
+		await errorShown.promise;
 
 		expect(showError).toHaveBeenCalledWith("external editor failed");
 	});

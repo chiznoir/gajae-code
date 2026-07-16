@@ -52,6 +52,17 @@ export type SubmittedUserInput = {
 	started: boolean;
 };
 
+export type ComposerSubmissionOptions = Readonly<{
+	ownsComposer: boolean;
+	editor: CustomEditor;
+}>;
+
+export function canApplyComposerSubmission(
+	options: ComposerSubmissionOptions | undefined,
+	editor: CustomEditor,
+): boolean {
+	return options === undefined || (options.ownsComposer && editor === options.editor);
+}
 export type TodoStatus = "pending" | "in_progress" | "completed" | "abandoned";
 
 export type TodoItem = {
@@ -175,7 +186,7 @@ export interface InteractiveModeContext {
 	showNewVersionNotification(newVersion: string): void;
 	clearEditor(): void;
 	updatePendingMessagesDisplay(): void;
-	queueCompactionMessage(text: string, mode: "steer" | "followUp"): void;
+	queueCompactionMessage(text: string, mode: "steer" | "followUp", options?: ComposerSubmissionOptions): void;
 	flushCompactionQueue(options?: { willRetry?: boolean }): Promise<void>;
 	flushPendingBashComponents(): void;
 	flushPendingModelSwitch(): Promise<void>;
@@ -197,12 +208,15 @@ export interface InteractiveModeContext {
 	commitPetPreviewMode(mode: PetMode): boolean;
 	/** Re-mount the composer (pet-aware) after an overlay/selector closes. */
 	restoreComposer(): void;
-	startPendingSubmission(input: {
-		text: string;
-		images?: ImageContent[];
-		customType?: string;
-		display?: boolean;
-	}): SubmittedUserInput;
+	startPendingSubmission(
+		input: {
+			text: string;
+			images?: ImageContent[];
+			customType?: string;
+			display?: boolean;
+		},
+		options?: ComposerSubmissionOptions,
+	): SubmittedUserInput;
 	cancelPendingSubmission(): boolean;
 	markPendingSubmissionStarted(input: SubmittedUserInput): boolean;
 	finishPendingSubmission(input: SubmittedUserInput): void;

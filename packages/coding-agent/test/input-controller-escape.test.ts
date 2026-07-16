@@ -2,7 +2,11 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "bun:te
 import { AsyncJobManager } from "@gajae-code/coding-agent/async";
 import { resetSettingsForTest, Settings, settings } from "@gajae-code/coding-agent/config/settings";
 import { InputController } from "@gajae-code/coding-agent/modes/controllers/input-controller";
-import type { InteractiveModeContext, SubmittedUserInput } from "@gajae-code/coding-agent/modes/types";
+import type {
+	ComposerSubmissionOptions,
+	InteractiveModeContext,
+	SubmittedUserInput,
+} from "@gajae-code/coding-agent/modes/types";
 import { SubagentTool, type ToolSession } from "@gajae-code/coding-agent/tools";
 import type { SlashCommand } from "@gajae-code/tui";
 
@@ -41,6 +45,8 @@ type FakeEditor = {
 	onChange?: (text: string) => void;
 	setText(text: string): void;
 	getText(): string;
+	getCursor(): { line: number; col: number };
+	setCursor(line: number, col: number): void;
 	addToHistory(text: string): void;
 	setActionKeys(action: string, keys: string[]): void;
 	setCustomKeyHandler(key: string, handler: () => void): void;
@@ -90,6 +96,7 @@ function createContext(): {
 	};
 } {
 	let editorText = "";
+	let editorCursor = { line: 0, col: 0 };
 	const abort = vi.fn(() => Promise.resolve());
 	const abortBash = vi.fn();
 	const abortEval = vi.fn();
@@ -115,17 +122,29 @@ function createContext(): {
 			if (index >= 0) inputListeners.splice(index, 1);
 		};
 	});
-	const startPendingSubmission = vi.fn((input: { text: string; images?: InteractiveModeContext["pendingImages"] }) => {
-		ensureLoadingAnimation();
-		return createSubmission(input);
-	});
+	const startPendingSubmission = vi.fn(
+		(
+			input: { text: string; images?: InteractiveModeContext["pendingImages"] },
+			_options?: ComposerSubmissionOptions,
+		) => {
+			ensureLoadingAnimation();
+			return createSubmission(input);
+		},
+	);
 	const editor: FakeEditor = {
 		setText(text: string) {
 			editorText = text;
+			editorCursor = { line: 0, col: text.length };
 			editor.onChange?.(text);
 		},
 		getText() {
 			return editorText;
+		},
+		getCursor() {
+			return editorCursor;
+		},
+		setCursor(line: number, col: number) {
+			editorCursor = { line, col };
 		},
 		addToHistory: vi.fn(),
 		setActionKeys: vi.fn(),
@@ -252,7 +271,8 @@ describe("InputController escape behavior", () => {
 		controller.setupEditorSubmitHandler();
 		await editor.onSubmit?.("hello");
 
-		expect(spies.startPendingSubmission).toHaveBeenCalledWith({ text: "hello", images: undefined });
+		expect(spies.startPendingSubmission.mock.calls[0]?.[0]).toEqual({ text: "hello", images: undefined });
+		expect(spies.startPendingSubmission.mock.calls[0]?.[1]).toEqual({ ownsComposer: true, editor: ctx.editor });
 		expect(spies.onInputCallback).toHaveBeenCalledWith(submission);
 		expect(editor.shouldBypassAutocompleteOnEscape?.()).toBe(true);
 
@@ -979,13 +999,12 @@ describe("InputController command palette", () => {
 		ctx.showCommandPalette = showCommandPalette;
 		(ctx.session as { isStreaming: boolean }).isStreaming = true;
 		ctx.withLocalSubmission = async (_text, submit) => submit();
-		let resolveCommand!: () => void;
-		spies.prompt.mockImplementation(
-			() =>
-				new Promise<void>(resolve => {
-					resolveCommand = resolve;
-				}),
-		);
+		const commandEntered = Promise.withResolvers<void>();
+		const commandRelease = Promise.withResolvers<void>();
+		spies.prompt.mockImplementation(async () => {
+			commandEntered.resolve();
+			await commandRelease.promise;
+		});
 		const controller = new InputController(ctx);
 
 		controller.setupKeyHandlers();
@@ -993,15 +1012,217 @@ describe("InputController command palette", () => {
 		controller.openCommandPalette();
 		const executeSlashCommand = showCommandPalette.mock.calls[0]?.[2] as (name: string) => Promise<void>;
 		const execution = executeSlashCommand("delayed");
-		await Bun.sleep(0);
+		await commandEntered.promise;
 		expect(spies.prompt).toHaveBeenCalledTimes(1);
 
 		editor.setText("new draft");
-		resolveCommand();
+		commandRelease.resolve();
 		await execution;
 
 		// Command-authored composer mutations are the command's contract, not the palette's.
 		expect(editor.getText()).toBe("new draft");
+	});
+	it("preserves newer composer state when an async palette input hook handles the command", async () => {
+		const { ctx, editor } = createContext();
+		const showCommandPalette = vi.fn();
+		const hookEntered = Promise.withResolvers<void>();
+		const hookRelease = Promise.withResolvers<void>();
+		const successorImage = { type: "image", data: "successor" } as InteractiveModeContext["pendingImages"][number];
+		ctx.showCommandPalette = showCommandPalette;
+		(ctx.session as unknown as { extensionRunner: unknown }).extensionRunner = {
+			hasHandlers: () => true,
+			getShortcuts: () => [],
+			emitInput: vi.fn(async () => {
+				hookEntered.resolve();
+				await hookRelease.promise;
+				return { handled: true };
+			}),
+		};
+		const controller = new InputController(ctx);
+		controller.setupKeyHandlers();
+		controller.createAutocompleteProvider([{ name: "delayed" }] as SlashCommand[], "");
+		controller.openCommandPalette();
+		const executeSlashCommand = showCommandPalette.mock.calls[0]?.[2] as (name: string) => Promise<void>;
+
+		const execution = executeSlashCommand("delayed");
+		await hookEntered.promise;
+		editor.setText("/delayed");
+		editor.setCursor(0, 3);
+		ctx.pendingImages = [successorImage];
+		hookRelease.resolve();
+		await execution;
+
+		expect(editor.getText()).toBe("/delayed");
+		expect(editor.getCursor()).toEqual({ line: 0, col: 3 });
+		expect(ctx.pendingImages).toEqual([successorImage]);
+		expect(editor.addToHistory).not.toHaveBeenCalled();
+	});
+	it("dispatches transformed palette input without claiming newer composer state", async () => {
+		const { ctx, editor, spies } = createContext();
+		const showCommandPalette = vi.fn();
+		const hookEntered = Promise.withResolvers<void>();
+		const hookRelease = Promise.withResolvers<void>();
+		const successorImage = { type: "image", data: "new-image" } as InteractiveModeContext["pendingImages"][number];
+		ctx.showCommandPalette = showCommandPalette;
+		(ctx.session as unknown as { extensionRunner: unknown }).extensionRunner = {
+			hasHandlers: () => true,
+			getShortcuts: () => [],
+			emitInput: vi.fn(async () => {
+				hookEntered.resolve();
+				await hookRelease.promise;
+				return { text: "transformed prompt", images: [] };
+			}),
+		};
+		const controller = new InputController(ctx);
+		controller.setupKeyHandlers();
+		controller.createAutocompleteProvider([{ name: "delayed" }] as SlashCommand[], "");
+		controller.openCommandPalette();
+		const executeSlashCommand = showCommandPalette.mock.calls[0]?.[2] as (name: string) => Promise<void>;
+
+		const execution = executeSlashCommand("delayed");
+		await hookEntered.promise;
+		editor.setText("new draft");
+		editor.setCursor(0, 4);
+		ctx.pendingImages = [successorImage];
+		hookRelease.resolve();
+		await execution;
+
+		expect(spies.startPendingSubmission.mock.calls[0]?.[0]).toEqual({
+			text: "transformed prompt",
+			images: undefined,
+		});
+		expect(spies.startPendingSubmission.mock.calls[0]?.[1]).toEqual({ ownsComposer: false, editor });
+		expect(editor.getText()).toBe("new draft");
+		expect(editor.getCursor()).toEqual({ line: 0, col: 4 });
+		expect(ctx.pendingImages).toEqual([successorImage]);
+		expect(editor.addToHistory).not.toHaveBeenCalled();
+	});
+	it("preserves successor composer state for transformed streaming and compaction paths", async () => {
+		for (const mode of ["streaming", "compacting"] as const) {
+			const { ctx, editor, spies } = createContext();
+			const showCommandPalette = vi.fn();
+			const hookEntered = Promise.withResolvers<void>();
+			const hookRelease = Promise.withResolvers<void>();
+			const queueCompactionMessage = vi.fn();
+			ctx.showCommandPalette = showCommandPalette;
+			ctx.withLocalSubmission = async (_text, submit) => submit();
+			ctx.queueCompactionMessage = queueCompactionMessage;
+			(ctx.session as { isStreaming: boolean; isCompacting: boolean }).isStreaming = mode === "streaming";
+			(ctx.session as { isStreaming: boolean; isCompacting: boolean }).isCompacting = mode === "compacting";
+			(ctx.session as unknown as { extensionRunner: unknown }).extensionRunner = {
+				hasHandlers: () => true,
+				getShortcuts: () => [],
+				emitInput: vi.fn(async () => {
+					hookEntered.resolve();
+					await hookRelease.promise;
+					return { text: "transformed prompt" };
+				}),
+			};
+			const controller = new InputController(ctx);
+			controller.setupKeyHandlers();
+			controller.createAutocompleteProvider([{ name: "delayed" }] as SlashCommand[], "");
+			controller.openCommandPalette();
+			const executeSlashCommand = showCommandPalette.mock.calls[0]?.[2] as (name: string) => Promise<void>;
+
+			const execution = executeSlashCommand("delayed");
+			await hookEntered.promise;
+			editor.setText(`${mode} successor`);
+			editor.setCursor(0, 5);
+			hookRelease.resolve();
+			await execution;
+
+			expect(editor.getText()).toBe(`${mode} successor`);
+			expect(editor.getCursor()).toEqual({ line: 0, col: 5 });
+			expect(editor.addToHistory).not.toHaveBeenCalled();
+			if (mode === "streaming") {
+				expect(spies.prompt).toHaveBeenCalledTimes(1);
+			} else {
+				expect(queueCompactionMessage).toHaveBeenCalledWith("transformed prompt", "steer", {
+					ownsComposer: false,
+					editor,
+				});
+			}
+		}
+	});
+	it("does not write through replacement editor or session state after the palette hook settles", async () => {
+		const { ctx, editor, spies } = createContext();
+		const showCommandPalette = vi.fn();
+		const hookEntered = Promise.withResolvers<void>();
+		const hookRelease = Promise.withResolvers<void>();
+		ctx.showCommandPalette = showCommandPalette;
+		(ctx.session as unknown as { extensionRunner: unknown }).extensionRunner = {
+			hasHandlers: () => true,
+			getShortcuts: () => [],
+			emitInput: vi.fn(async () => {
+				hookEntered.resolve();
+				await hookRelease.promise;
+				return { text: "replacement prompt" };
+			}),
+		};
+		const controller = new InputController(ctx);
+		controller.setupKeyHandlers();
+		controller.createAutocompleteProvider([{ name: "delayed" }] as SlashCommand[], "");
+		controller.openCommandPalette();
+		const executeSlashCommand = showCommandPalette.mock.calls[0]?.[2] as (name: string) => Promise<void>;
+
+		const execution = executeSlashCommand("delayed");
+		await hookEntered.promise;
+		const replacement = { ...editor, setText: vi.fn(), addToHistory: vi.fn() };
+		ctx.editor = replacement as unknown as InteractiveModeContext["editor"];
+		ctx.session = { ...ctx.session } as InteractiveModeContext["session"];
+		hookRelease.resolve();
+		await execution;
+		expect(spies.startPendingSubmission.mock.calls[0]?.[0]).toEqual({
+			text: "replacement prompt",
+			images: undefined,
+		});
+		expect(spies.startPendingSubmission.mock.calls[0]?.[1]).toEqual({ ownsComposer: false, editor });
+
+		expect(replacement.setText).not.toHaveBeenCalled();
+		expect(replacement.addToHistory).not.toHaveBeenCalled();
+	});
+	it("releases the palette latch after a cancelled input hook without mutating the composer", async () => {
+		const { ctx, editor } = createContext();
+		const showCommandPalette = vi.fn();
+		const hookEntered = Promise.withResolvers<void>();
+		const hookRelease = Promise.withResolvers<void>();
+		const successorImage = {
+			type: "image",
+			data: "cancelled-successor",
+		} as InteractiveModeContext["pendingImages"][number];
+		const emitInput = vi.fn(async (): Promise<{ handled?: boolean }> => {
+			hookEntered.resolve();
+			await hookRelease.promise;
+			throw Object.assign(new Error("input hook cancelled"), { name: "AbortError" });
+		});
+		ctx.showCommandPalette = showCommandPalette;
+		(ctx.session as unknown as { extensionRunner: unknown }).extensionRunner = {
+			hasHandlers: () => true,
+			getShortcuts: () => [],
+			emitInput,
+		};
+		const controller = new InputController(ctx);
+		controller.setupKeyHandlers();
+		controller.createAutocompleteProvider([{ name: "delayed" }] as SlashCommand[], "");
+		controller.openCommandPalette();
+		const executeSlashCommand = showCommandPalette.mock.calls[0]?.[2] as (name: string) => Promise<void>;
+
+		const first = executeSlashCommand("delayed");
+		await hookEntered.promise;
+		editor.setText("new draft");
+		editor.setCursor(0, 2);
+		ctx.pendingImages = [successorImage];
+		hookRelease.resolve();
+		await expect(first).rejects.toThrow("input hook cancelled");
+		expect(editor.getText()).toBe("new draft");
+		expect(editor.getCursor()).toEqual({ line: 0, col: 2 });
+		expect(ctx.pendingImages).toEqual([successorImage]);
+		editor.setText("");
+		ctx.pendingImages = [];
+
+		emitInput.mockResolvedValueOnce({ handled: true });
+		await executeSlashCommand("delayed");
+		expect(emitInput).toHaveBeenCalledTimes(2);
 	});
 	it("refuses a second palette command while the first is pending", async () => {
 		const { ctx, spies } = createContext();

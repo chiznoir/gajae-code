@@ -11,7 +11,11 @@ import { expandEmoticons } from "../../modes/emoji-autocomplete";
 import { createPromptActionAutocompleteProvider } from "../../modes/prompt-action-autocomplete";
 import { theme } from "../../modes/theme/theme";
 import { scrollTmuxToPreviousUserInput as scrollTmuxPaneToPreviousUserInput } from "../../modes/tmux-scroll";
-import type { InteractiveModeContext } from "../../modes/types";
+import {
+	type ComposerSubmissionOptions,
+	canApplyComposerSubmission,
+	type InteractiveModeContext,
+} from "../../modes/types";
 import type { AgentSessionEvent, QueuedMessageEditEntry } from "../../session/agent-session";
 import { SKILL_PROMPT_MESSAGE_TYPE, type SkillPromptDetails } from "../../session/messages";
 import { executeBuiltinSlashCommand } from "../../slash-commands/builtin-registry";
@@ -532,10 +536,10 @@ export class InputController {
 	}
 
 	setupEditorSubmitHandler(): void {
-		this.ctx.editor.onSubmit = text => this.submitText(text);
+		this.ctx.editor.onSubmit = text => this.submitText(text, { ownsComposer: true, editor: this.ctx.editor });
 	}
 
-	async submitText(text: string): Promise<void> {
+	async submitText(text: string, composer: ComposerSubmissionOptions): Promise<void> {
 		text = text.trim();
 		if ((!isSettingsInitialized() || settings.get("emojiAutocomplete")) && text) text = expandEmoticons(text);
 
@@ -565,8 +569,10 @@ export class InputController {
 		if (runner?.hasHandlers("input")) {
 			const result = await runner.emitInput(text, inputImages, "interactive");
 			if (result?.handled) {
-				this.ctx.editor.setText("");
-				this.#clearPendingImagesIfOwnedBy(pendingImages);
+				if (this.#canModifyComposer(composer)) {
+					this.ctx.editor.setText("");
+				}
+				this.#clearPendingImagesIfOwnedBy(pendingImages, composer);
 				return;
 			}
 			if (result?.text !== undefined) {
@@ -583,6 +589,7 @@ export class InputController {
 		const slashResult = await executeBuiltinSlashCommand(text, {
 			ctx: this.ctx,
 			handleBackgroundCommand: () => this.handleBackgroundCommand(),
+			composer,
 		});
 		if (slashResult === true) {
 			return;
@@ -597,7 +604,7 @@ export class InputController {
 		// runs after it completes (matches the free-text Enter semantics applied
 		// a few lines below at the streaming branch). Explicit queue shortcuts
 		// route through `handleFollowUp` and dispatch as `followUp`.
-		if (await this.#invokeSkillCommand(text, this.#busyStreamingBehavior())) {
+		if (await this.#invokeSkillCommand(text, this.#busyStreamingBehavior(), composer)) {
 			return;
 		}
 
@@ -608,10 +615,14 @@ export class InputController {
 			if (command) {
 				if (this.ctx.session.isBashRunning) {
 					this.ctx.showWarning("A bash command is already running. Press Esc to cancel it first.");
-					this.ctx.editor.setText(text);
+					if (this.#canModifyComposer(composer)) {
+						this.ctx.editor.setText(text);
+					}
 					return;
 				}
-				this.ctx.editor.addToHistory(text);
+				if (this.#canModifyComposer(composer)) {
+					this.ctx.editor.addToHistory(text);
+				}
 				await this.ctx.handleBashCommand(command, isExcluded);
 				this.ctx.isBashMode = false;
 				this.ctx.isBashNoContext = false;
@@ -627,10 +638,14 @@ export class InputController {
 			if (code) {
 				if (this.ctx.session.isEvalRunning) {
 					this.ctx.showWarning("A Python execution is already running. Press Esc to cancel it first.");
-					this.ctx.editor.setText(text);
+					if (this.#canModifyComposer(composer)) {
+						this.ctx.editor.setText(text);
+					}
 					return;
 				}
-				this.ctx.editor.addToHistory(text);
+				if (this.#canModifyComposer(composer)) {
+					this.ctx.editor.addToHistory(text);
+				}
 				await this.ctx.handlePythonCommand(code, isExcluded);
 				this.ctx.isPythonMode = false;
 				this.ctx.updateEditorBorderColor();
@@ -644,7 +659,7 @@ export class InputController {
 				this.ctx.showStatus("Compaction in progress. Retry after it completes to send images.");
 				return;
 			}
-			this.ctx.queueCompactionMessage(text, "steer");
+			this.ctx.queueCompactionMessage(text, "steer", composer);
 			return;
 		}
 
@@ -653,10 +668,12 @@ export class InputController {
 		// prompt to run after the active turn completes (in submission order).
 		// This handles extension commands (execute immediately), prompt template expansion, and queueing
 		if (this.ctx.session.isStreaming) {
-			this.ctx.editor.addToHistory(text);
-			this.ctx.editor.setText("");
+			if (this.#canModifyComposer(composer)) {
+				this.ctx.editor.addToHistory(text);
+				this.ctx.editor.setText("");
+			}
 			const images = inputImages && inputImages.length > 0 ? [...inputImages] : undefined;
-			this.#clearPendingImagesIfOwnedBy(pendingImages);
+			this.#clearPendingImagesIfOwnedBy(pendingImages, composer);
 			// Record the signature so the queued message's eventual delivery
 			// (a user-role `message_start` event) leaves any draft the user has
 			// typed since queuing intact. Same protection as #783, applied to
@@ -708,14 +725,16 @@ export class InputController {
 		if (this.ctx.onInputCallback) {
 			// Include any pending images from clipboard paste
 			const images = inputImages && inputImages.length > 0 ? [...inputImages] : undefined;
-			this.#clearPendingImagesIfOwnedBy(pendingImages);
+			this.#clearPendingImagesIfOwnedBy(pendingImages, composer);
 
 			// Render user message immediately, then let session events catch up
-			const submission = this.ctx.startPendingSubmission({ text, images });
+			const submission = this.ctx.startPendingSubmission({ text, images }, composer);
 
 			this.ctx.onInputCallback(submission);
 		}
-		this.ctx.editor.addToHistory(text);
+		if (this.#canModifyComposer(composer)) {
+			this.ctx.editor.addToHistory(text);
+		}
 	}
 
 	handleCtrlC(): void {
@@ -961,11 +980,17 @@ export class InputController {
 	 * while the agent is streaming; the idle path of `promptCustomMessage`
 	 * ignores it.
 	 */
-	async #invokeSkillCommand(text: string, streamingBehavior: "steer" | "followUp"): Promise<boolean> {
+	async #invokeSkillCommand(
+		text: string,
+		streamingBehavior: "steer" | "followUp",
+		options?: ComposerSubmissionOptions,
+	): Promise<boolean> {
 		const invocations = parseSkillInvocations(text, this.ctx.skillCommands ?? new Map());
 		if (invocations.length === 0) return false;
-		this.ctx.editor.addToHistory(text);
-		this.ctx.editor.setText("");
+		if (!options || this.#canModifyComposer(options)) {
+			this.ctx.editor.addToHistory(text);
+			this.ctx.editor.setText("");
+		}
 		try {
 			for (let index = 0; index < invocations.length; index += 1) {
 				const invocation = invocations[index];
@@ -1279,8 +1304,15 @@ export class InputController {
 		return images.length > 0 ? images : undefined;
 	}
 
-	#clearPendingImagesIfOwnedBy(pendingImages: InteractiveModeContext["pendingImages"]): void {
-		if (this.ctx.pendingImages === pendingImages) {
+	#canModifyComposer(options: ComposerSubmissionOptions): boolean {
+		return canApplyComposerSubmission(options, this.ctx.editor);
+	}
+
+	#clearPendingImagesIfOwnedBy(
+		pendingImages: InteractiveModeContext["pendingImages"],
+		options: ComposerSubmissionOptions,
+	): void {
+		if (this.#canModifyComposer(options) && this.ctx.pendingImages === pendingImages) {
 			this.ctx.pendingImages = [];
 		}
 	}
@@ -1432,7 +1464,7 @@ export class InputController {
 
 			this.#paletteCommandInFlight = true;
 			try {
-				await this.submitText(`/${name}`);
+				await this.submitText(`/${name}`, { ownsComposer: false, editor: this.ctx.editor });
 			} finally {
 				this.#paletteCommandInFlight = false;
 			}

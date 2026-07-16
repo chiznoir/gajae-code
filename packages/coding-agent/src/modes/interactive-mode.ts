@@ -134,14 +134,16 @@ import {
 	onThemeChange,
 	theme,
 } from "./theme/theme";
-import type {
-	CompactionQueuedMessage,
-	InteractiveModeContext,
-	IrcArrivalSnapshot,
-	SubmittedUserInput,
-	TodoItem,
-	TodoPhase,
-	TranscriptRebuildPolicy,
+import {
+	type CompactionQueuedMessage,
+	type ComposerSubmissionOptions,
+	canApplyComposerSubmission,
+	type InteractiveModeContext,
+	type IrcArrivalSnapshot,
+	type SubmittedUserInput,
+	type TodoItem,
+	type TodoPhase,
+	type TranscriptRebuildPolicy,
 } from "./types";
 import type { ParsedIrcMessage } from "./utils/irc-message";
 import { addChatChild, prepareTranscriptRebuild, UiHelpers } from "./utils/ui-helpers";
@@ -930,12 +932,15 @@ export class InteractiveMode implements InteractiveModeContext {
 		}
 	}
 
-	startPendingSubmission(input: {
-		text: string;
-		images?: ImageContent[];
-		customType?: string;
-		display?: boolean;
-	}): SubmittedUserInput {
+	startPendingSubmission(
+		input: {
+			text: string;
+			images?: ImageContent[];
+			customType?: string;
+			display?: boolean;
+		},
+		options?: ComposerSubmissionOptions,
+	): SubmittedUserInput {
 		const submission: SubmittedUserInput = {
 			text: input.text,
 			images: input.images,
@@ -960,7 +965,9 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.optimisticUserMessageSignature = undefined;
 			this.#pendingSubmissionDispose = undefined;
 		}
-		this.editor.setText("");
+		if (canApplyComposerSubmission(options, this.editor)) {
+			this.editor.setText("");
+		}
 		this.ensureLoadingAnimation();
 		this.ui.requestRender();
 		return submission;
@@ -2545,8 +2552,8 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#uiHelpers.updatePendingMessagesDisplay();
 	}
 
-	queueCompactionMessage(text: string, mode: "steer" | "followUp"): void {
-		this.#uiHelpers.queueCompactionMessage(text, mode);
+	queueCompactionMessage(text: string, mode: "steer" | "followUp", options?: ComposerSubmissionOptions): void {
+		this.#uiHelpers.queueCompactionMessage(text, mode, options);
 	}
 
 	flushCompactionQueue(options?: { willRetry?: boolean }): Promise<void> {
