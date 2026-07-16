@@ -1,8 +1,8 @@
-import type { Usage } from "@gajae-code/ai";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { Usage } from "@gajae-code/ai";
 import { classifyFallbackTrigger } from "@gajae-code/ai/utils/fallback-transport";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { resetSettingsForTest, Settings, settings } from "@gajae-code/coding-agent/config/settings";
