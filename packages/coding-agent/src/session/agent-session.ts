@@ -149,6 +149,7 @@ import type { Rule } from "../capability/rule";
 import {
 	GJC_MODEL_ASSIGNMENT_TARGETS,
 	isAuthenticated,
+	kNoAuth,
 	MODEL_ROLE_IDS,
 	type ModelRegistry,
 } from "../config/model-registry";
@@ -11373,7 +11374,7 @@ export class AgentSession {
 				continue;
 			}
 			const key = await this.#modelRegistry.getApiKey(resolved.model, this.sessionId);
-			if (!key) {
+			if (!isAuthenticated(key) && key !== kNoAuth) {
 				controller.onResolutionSkip("unauthenticated");
 				continue;
 			}
