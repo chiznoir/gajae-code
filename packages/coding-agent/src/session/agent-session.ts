@@ -311,6 +311,7 @@ import {
 	type DefaultModelSelectionRollbackStage,
 } from "./default-model-selection";
 import {
+	cappedExponentialWithFullJitter,
 	type ConfiguredFallbackChain,
 	effectiveFallbackDelay,
 	FallbackChainController,
@@ -11478,12 +11479,10 @@ export class AgentSession {
 		// fail-closed behavior for generic provider errors. Explicit retry
 		// settings opt into the resilient legacy retry path.
 		if (!managedFallback && (!retrySettings.enabled || !legacyRetryConfigured)) return false;
-		const legacyClassification = managedFallback ? undefined : this.#classifyErrorForRetry(message);
-		const legacyUnbounded = legacyClassification === "transient" || legacyClassification === "unknown";
 		const attemptsUsed = managedFallback ? controller.attemptsUsed || 1 : this.#retryAttempt + 1;
 		const outcome = managedFallback
 			? controller.onAttemptFailure(trigger.class, message.errorMessage || "Unknown error")
-			: !legacyUnbounded && attemptsUsed > retrySettings.maxRetries
+			: attemptsUsed > retrySettings.maxRetries
 				? "exhausted"
 				: "retry";
 		if (outcome === "exhausted") {
@@ -11506,20 +11505,15 @@ export class AgentSession {
 				? 0
 				: managedFallback
 					? effectiveFallbackDelay(retrySettings.baseDelayMs, retrySettings.maxDelayMs, attemptsUsed, retryAfterMs)
-					: retryAfterMs !== undefined
-						? Math.max(retrySettings.baseDelayMs * 2 ** Math.max(0, attemptsUsed - 1), retryAfterMs)
-						: retrySettings.baseDelayMs * 2 ** Math.max(0, attemptsUsed - 1);
-		if (!managedFallback && !legacyUnbounded && retrySettings.maxDelayMs > 0 && delayMs > retrySettings.maxDelayMs) {
-			this.#retryAttempt = 0;
-			await this.#emitSessionEvent({
-				type: "auto_retry_end",
-				success: false,
-				attempt: attemptsUsed,
-				finalError: `Provider requested ${delayMs}ms wait, exceeds retry.maxDelayMs (${retrySettings.maxDelayMs}ms). Original error: ${errorMessage}`,
-			});
-			this.#resolveRetry();
-			return false;
-		}
+					: Math.min(
+							cappedExponentialWithFullJitter(
+								retrySettings.baseDelayMs,
+								retrySettings.maxDelayMs,
+								attemptsUsed,
+							),
+							retryAfterMs ?? Number.POSITIVE_INFINITY,
+						);
+
 
 		const retry = async (ownership?: ManagedAttemptContinuationOwnership): Promise<void> => {
 			if (managedFallback) await this.#markFailedManagedCredential(trigger);
@@ -11567,7 +11561,7 @@ export class AgentSession {
 				maxAttempts: managedFallback ? controller.maxAttempts : retrySettings.maxRetries,
 				delayMs,
 				errorMessage,
-				unbounded: !managedFallback && legacyUnbounded,
+				unbounded: false,
 			});
 
 			const messages = this.agent.state.messages;
