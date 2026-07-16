@@ -332,6 +332,34 @@ describe("--matrix-json and --task CLI fan-out", () => {
 		expect(missingHead.stderr).toContain("is not available");
 	});
 
+	test("pull requests fall back to an exact base/head tree diff when hosted git reports no merge base", async () => {
+		const base = Bun.spawnSync(["git", "rev-parse", "HEAD"], { cwd: repoRoot }).stdout.toString().trim();
+		const tree = Bun.spawnSync(["git", "rev-parse", "HEAD^{tree}"], { cwd: repoRoot }).stdout.toString().trim();
+		const orphan = Bun.spawnSync(["git", "commit-tree", tree, "-m", "ci no-merge-base fixture"], {
+			cwd: repoRoot,
+			env: {
+				...process.env,
+				GIT_AUTHOR_NAME: "GJC CI Test",
+				GIT_AUTHOR_EMAIL: "ci-test@example.invalid",
+				GIT_COMMITTER_NAME: "GJC CI Test",
+				GIT_COMMITTER_EMAIL: "ci-test@example.invalid",
+			},
+		}).stdout.toString().trim();
+		expect(orphan).toHaveLength(40);
+
+		const result = await runScript(["--matrix-json"], "", {
+			GITHUB_EVENT_NAME: "pull_request",
+			GITHUB_BASE_REF: "",
+			GITHUB_BASE_SHA: base,
+			GITHUB_SHA: orphan,
+			CI_DEV_SOURCE_SHA: orphan,
+		});
+
+		expect(result.exitCode).toBe(0);
+		expect(result.stderr).toContain("using exact base/head tree diff");
+		expect(JSON.parse(result.stdout.trim())).toEqual([]);
+	});
+
 	test("Cargo selection includes transitive dependents and never emits vendored shards", async () => {
 		const sdk = await runScript(["--matrix-json"], "crates/gjc-sdk/src/lib.rs");
 		expect(sdk.exitCode).toBe(0);
