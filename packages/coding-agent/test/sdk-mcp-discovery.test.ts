@@ -700,7 +700,9 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 
 		expect(session.getActiveToolNames()).toContain("mcp__github_create_issue");
 		expect(session.getSelectedMCPToolNames()).toEqual(["mcp__github_create_issue"]);
-		expect(session.getDiscoverableTools({ source: "mcp" }).map(tool => tool.name)).toContain("mcp__slack_post_message");
+		expect(session.getDiscoverableTools({ source: "mcp" }).map(tool => tool.name)).toContain(
+			"mcp__slack_post_message",
+		);
 		expect(session.systemPrompt.join("\n")).toContain("mcp__github_create_issue");
 
 		await session.activateDiscoveredTools(["mcp__slack_post_message"]);
@@ -773,7 +775,9 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 			);
 			expect(session.getActiveToolNames()).not.toContain("mcp__github_create_issue");
 			expect(session.getSelectedMCPToolNames()).toEqual([]);
-			expect(session.getDiscoverableTools({ source: "mcp" }).map(tool => tool.name)).toEqual(["mcp__github_create_issue"]);
+			expect(session.getDiscoverableTools({ source: "mcp" }).map(tool => tool.name)).toEqual([
+				"mcp__github_create_issue",
+			]);
 		} finally {
 			await session.dispose();
 		}

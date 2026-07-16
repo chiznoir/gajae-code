@@ -129,7 +129,6 @@ describe("getDiscoverableTool", () => {
 	});
 });
 
-
 // ─── collectDiscoverableTools ─────────────────────────────────────────────────
 
 describe("collectDiscoverableTools", () => {
@@ -179,9 +178,33 @@ describe("filterBySource", () => {
 describe("summarizeDiscoverableTools", () => {
 	it("groups tools by server and counts them", () => {
 		const tools: DiscoverableTool[] = [
-			{ name: "mcp__gh_1", label: "gh/1", description: "x", summary: "x", source: "mcp", serverName: "github", schemaKeys: [] },
-			{ name: "mcp__gh_2", label: "gh/2", description: "x", summary: "x", source: "mcp", serverName: "github", schemaKeys: [] },
-			{ name: "mcp__sl_1", label: "sl/1", description: "x", summary: "x", source: "mcp", serverName: "slack", schemaKeys: [] },
+			{
+				name: "mcp__gh_1",
+				label: "gh/1",
+				description: "x",
+				summary: "x",
+				source: "mcp",
+				serverName: "github",
+				schemaKeys: [],
+			},
+			{
+				name: "mcp__gh_2",
+				label: "gh/2",
+				description: "x",
+				summary: "x",
+				source: "mcp",
+				serverName: "github",
+				schemaKeys: [],
+			},
+			{
+				name: "mcp__sl_1",
+				label: "sl/1",
+				description: "x",
+				summary: "x",
+				source: "mcp",
+				serverName: "slack",
+				schemaKeys: [],
+			},
 			{ name: "builtin_read", label: "read", description: "x", summary: "x", source: "builtin", schemaKeys: [] },
 		];
 		const summary = summarizeDiscoverableTools(tools);
@@ -217,8 +240,24 @@ describe("formatDiscoverableToolServerSummary", () => {
 
 describe("selectDiscoverableToolNamesByServer", () => {
 	const tools: DiscoverableTool[] = [
-		{ name: "mcp__gh_1", label: "gh/1", description: "x", summary: "x", source: "mcp", serverName: "github", schemaKeys: [] },
-		{ name: "mcp__sl_1", label: "sl/1", description: "x", summary: "x", source: "mcp", serverName: "slack", schemaKeys: [] },
+		{
+			name: "mcp__gh_1",
+			label: "gh/1",
+			description: "x",
+			summary: "x",
+			source: "mcp",
+			serverName: "github",
+			schemaKeys: [],
+		},
+		{
+			name: "mcp__sl_1",
+			label: "sl/1",
+			description: "x",
+			summary: "x",
+			source: "mcp",
+			serverName: "slack",
+			schemaKeys: [],
+		},
 		{ name: "read", label: "read", description: "x", summary: "x", source: "builtin", schemaKeys: [] },
 	];
 
@@ -316,4 +355,3 @@ describe("BM25 search", () => {
 		expect(results).toHaveLength(0);
 	});
 });
-

@@ -254,7 +254,6 @@ import ttsrInterruptTemplate from "../prompts/system/ttsr-interrupt.md" with { t
 import ttsrToolReminderTemplate from "../prompts/system/ttsr-tool-reminder.md" with { type: "text" };
 import { type AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
 import { MCPManager } from "../runtime-mcp/manager";
-import { MCPManager } from "../runtime-mcp/manager";
 import type { NotificationSessionController } from "../sdk/bus/session-control";
 import { deobfuscateSessionContext, type SecretObfuscator } from "../secrets/obfuscator";
 import { formatNoCredentialOnboardingError, formatNoModelOnboardingError } from "../setup/model-onboarding-guidance";
@@ -1938,11 +1937,7 @@ export class AgentSession {
 		const configuredDiscoveryMode = config.settings.get("tools.discoveryMode");
 		this.#discoveryMode =
 			config.discoveryMode ??
-			(configuredDiscoveryMode !== "off"
-				? configuredDiscoveryMode
-				: this.#mcpDiscoveryEnabled
-					? "mcp-only"
-					: "off");
+			(configuredDiscoveryMode !== "off" ? configuredDiscoveryMode : this.#mcpDiscoveryEnabled ? "mcp-only" : "off");
 		this.#discoverableToolAllowedNames = config.discoverableToolAllowedNames
 			? new Set(config.discoverableToolAllowedNames.map(name => name.toLowerCase()))
 			: undefined;
@@ -4599,7 +4594,9 @@ export class AgentSession {
 
 	#collectDiscoverableMCPToolsFromRegistry(): Map<string, DiscoverableTool> {
 		return new Map(
-			collectDiscoverableTools(Array.from(this.#toolRegistry.values()).filter(isMCPBridgeTool)).map(tool => [tool.name, tool] as const),
+			collectDiscoverableTools(Array.from(this.#toolRegistry.values()).filter(isMCPBridgeTool)).map(
+				tool => [tool.name, tool] as const,
+			),
 		);
 	}
 
@@ -4826,7 +4823,6 @@ export class AgentSession {
 			await this.refreshBaseSystemPrompt();
 		}
 	}
-
 
 	getSelectedMCPToolNames(): string[] {
 		if (!this.#mcpDiscoveryEnabled) {

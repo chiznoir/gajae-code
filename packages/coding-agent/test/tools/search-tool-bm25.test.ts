@@ -1,9 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { Settings } from "../../src/config/settings";
-import {
-	buildDiscoverableToolSearchIndex,
-	type DiscoverableTool,
-} from "../../src/tool-discovery/tool-index";
+import { buildDiscoverableToolSearchIndex, type DiscoverableTool } from "../../src/tool-discovery/tool-index";
 import type { ToolSession } from "../../src/tools/index";
 import { SearchToolBm25Tool } from "../../src/tools/search-tool-bm25";
 

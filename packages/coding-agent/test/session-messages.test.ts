@@ -104,7 +104,12 @@ describe("convertToLlm file mention framing", () => {
 			},
 		] as AgentMessage[]);
 		const message = converted[0];
-		const text = message?.role === "user" ? message.content[0]?.type === "text" ? message.content[0].text : undefined : undefined;
+		const text =
+			message?.role === "user"
+				? message.content[0]?.type === "text"
+					? message.content[0].text
+					: undefined
+				: undefined;
 		expect(text).toContain("&lt;/system-reminder>");
 		expect(text?.match(/<\/system-reminder>/g)).toHaveLength(1);
 	});

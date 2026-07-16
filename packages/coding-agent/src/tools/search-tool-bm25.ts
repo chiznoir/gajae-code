@@ -17,7 +17,6 @@ import type { ToolSession } from ".";
 import { formatCount, replaceTabs, TRUNCATE_LENGTHS } from "./render-utils";
 import { ToolError } from "./tool-errors";
 
-
 const DEFAULT_LIMIT = 8;
 const TOOL_DISCOVERY_TITLE = "Tool Discovery";
 const COLLAPSED_MATCH_LIMIT = 5;
