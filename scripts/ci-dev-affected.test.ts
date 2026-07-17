@@ -218,13 +218,13 @@ describe("describeTasks matrix emission", () => {
 		}
 	});
 
-	test("full-workspace root-check uses the bounded CI command without native artifacts", () => {
+	test("full-workspace root-check downloads the native artifact used by generated checks", () => {
 		const entries = describeTasks(planTasks(["tsconfig.json"], packages));
 		const nativeBuild = entries.find(entry => entry.key === "native-linux-x64");
 		const rootCheck = entries.find(entry => entry.key === "root-check");
 
 		expect(nativeBuild?.nativeBuild).toBe(true);
-		expect(rootCheck).toMatchObject({ command: ["bun", "run", "ci:check:full"], native: false, nativeBuild: false });
+		expect(rootCheck).toMatchObject({ command: ["bun", "run", "ci:check:full"], native: true, nativeBuild: false });
 	});
 
 	test("rust tasks are flagged rust and need no native addon", () => {
@@ -625,6 +625,10 @@ describe("planTargetedTasks PR-mode targeting", () => {
 		expect(keys).toContain("test:@gajae-code/coding-agent:shard-1-of-8");
 		expect(keys).not.toContain("test:packages/coding-agent/test/sdk/index.test.ts");
 		expect(keys).not.toContain("test:packages/coding-agent/test/other/index.test.ts");
+		expect(describeTasks(tasks).find(entry => entry.key === "check:@gajae-code/coding-agent")).toMatchObject({
+			native: true,
+			nativeBuild: false,
+		});
 	});
 
 	test("a deleted test path is not scheduled as a runnable test shard", () => {
@@ -746,14 +750,14 @@ describe("planTargetedTasks PR-mode targeting", () => {
 		expect(keys).toContain("wrapper-version");
 	});
 
-	test("root-level codeish fallback uses the bounded CI command without native artifacts", () => {
+	test("root-level codeish fallback plans the native artifact required by the bounded check", () => {
 		const tasks = targeted(["scripts/unmapped-tool.ts"]);
 		const keys = tasks.map(task => task.key);
 		expect(keys).toContain("root-check");
-		expect(keys.filter(key => key === "native-linux-x64" || key === "native-build")).toEqual([]);
+		expect(keys).toContain("native-linux-x64");
 
 		const rootCheck = describeTasks(tasks).find(entry => entry.key === "root-check");
-		expect(rootCheck).toMatchObject({ command: ["bun", "run", "ci:check:full"], native: false, nativeBuild: false });
+		expect(rootCheck).toMatchObject({ command: ["bun", "run", "ci:check:full"], native: true, nativeBuild: false });
 	});
 
 	test("docs/changelog-only changes plan nothing expensive", () => {
@@ -819,14 +823,14 @@ describe("push-mode broad planning still runs the fuller suite", () => {
 		expect(tasks.find(task => task.key === "test:scripts/release-evidence.test.ts")?.command).toEqual(["bun", "test", "scripts/release-evidence.test.ts"]);
 	});
 
-	test("tooling-script root-check uses the bounded CI command without native artifacts", () => {
+	test("tooling-script root-check marks the bounded check as a native consumer", () => {
 		const tasks = planTasks(["scripts/unmapped-tool.ts"], [codingAgent]);
 		const keys = tasks.map(task => task.key);
 		expect(keys).toContain("root-check");
 		expect(keys.filter(key => key === "native-linux-x64" || key === "native-build")).toEqual([]);
 
 		const rootCheck = describeTasks(tasks).find(entry => entry.key === "root-check");
-		expect(rootCheck).toMatchObject({ command: ["bun", "run", "ci:check:full"], native: false, nativeBuild: false });
+		expect(rootCheck).toMatchObject({ command: ["bun", "run", "ci:check:full"], native: true, nativeBuild: false });
 	});
 
 	test("push mode selects the bridge-client SDK package smoke exactly once for package and SDK client changes", () => {

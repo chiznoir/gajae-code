@@ -258,6 +258,8 @@ function isNativeBuildKey(key: string): boolean {
 function taskNeedsNative(key: string): boolean {
 	return (
 		key === "root-test" ||
+		key === "root-check" ||
+		key === "check:@gajae-code/coding-agent" ||
 		key === "cli-smoke" ||
 		key === "wrapper-version" ||
 		key === "deep-interview-definitions" ||

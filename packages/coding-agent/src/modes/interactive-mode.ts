@@ -55,12 +55,7 @@ import {
 import { type Goal, type GoalModeState, normalizeGoal } from "../goals/state";
 import { resolveLocalUrlToPath } from "../internal-urls";
 import { getLspStartupWarningMessage, LSP_STARTUP_EVENT_CHANNEL, type LspStartupEvent } from "../lsp/startup-events";
-import {
-	humanizePlanTitle,
-	type PlanApprovalDetails,
-	renameApprovedPlanFile,
-	resolvePlanTitle,
-} from "../plan-mode/approved-plan";
+import { humanizePlanTitle, type PlanApprovalDetails, resolvePlanTitle } from "../plan-mode/approved-plan";
 import planModeApprovedPrompt from "../prompts/system/plan-mode-approved.md" with { type: "text" };
 import planModeCompactInstructionsPrompt from "../prompts/system/plan-mode-compact-instructions.md" with {
 	type: "text",
@@ -74,7 +69,7 @@ import type { NotificationSessionReconcileResult, NotificationSessionStatus } fr
 import type { AgentSession, AgentSessionEvent, TemporaryProviderSessionScope } from "../session/agent-session";
 import { HistoryStorage } from "../session/history-storage";
 import type { SessionContext, SessionManager } from "../session/session-manager";
-import { getRecentSessions } from "../session/session-manager";
+import { getRecentSessions, getSessionMessageEntryId } from "../session/session-manager";
 import { formatDuration } from "../slash-commands/helpers/format";
 import { STTController, type SttState } from "../stt";
 import type { LspStartupServerInfo } from "../tools";
@@ -103,6 +98,7 @@ import {
 	isPetCapabilityProbePending,
 	warnWhenPetCapabilitySettled,
 } from "./components/pet-capability";
+import { planSnapshotHash, serializePlanReviewComments } from "./components/plan-preview-overlay";
 import type { ToolExecutionHandle } from "./components/tool-execution";
 import { StatusLineComponent } from "./components/tool-status-header";
 import {
@@ -124,6 +120,7 @@ import { OAuthManualInputManager } from "./oauth-manual-input";
 import { SessionObserverRegistry } from "./session-observer-registry";
 import { interruptHint } from "./shared";
 import { shouldShowExtensionCommand } from "./slash-command-visibility";
+import { TasksAggregator } from "./tasks-aggregator";
 import { type ShimmerPalette, shimmerSegments, shimmerText } from "./theme/shimmer";
 import type { Theme } from "./theme/theme";
 import {
@@ -134,6 +131,7 @@ import {
 	onThemeChange,
 	theme,
 } from "./theme/theme";
+import { type RegisterTranscriptItem, TranscriptItemRegistry, transcriptItemId } from "./transcript-item-registry";
 import {
 	type CompactionQueuedMessage,
 	type ComposerSubmissionOptions,
@@ -403,6 +401,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	oauthManualInput: OAuthManualInputManager = new OAuthManualInputManager();
 
 	#baseSlashCommands: SlashCommand[] = [];
+	#resolvedSlashCommands: SlashCommand[] = [];
 	#baseReservedSlashCommandNames: Set<string> = new Set();
 	#cleanupUnsubscribe?: () => void;
 	#subprocessTeardownUnsubscribe?: () => void;
@@ -429,6 +428,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	#planModeProviderSessionScope: TemporaryProviderSessionScope | undefined;
 	#planModeHasEntered = false;
 	#planReviewContainer: Container | undefined;
+	#planApprovalDispatchPending = false;
 	readonly lspServers: LspStartupServerInfo[] | undefined = undefined;
 	mcpManager?: import("../runtime-mcp").MCPManager;
 	readonly #toolUiContextSetter: (uiContext: ExtensionUIContext, hasUI: boolean) => void;
@@ -448,7 +448,10 @@ export class InteractiveMode implements InteractiveModeContext {
 	#voicePreviousUseTerminalCursor: boolean | null = null;
 	#resizeHandler?: () => void;
 	#observerRegistry: SessionObserverRegistry;
+	#transcriptRegistry = new TranscriptItemRegistry();
+
 	#jobsObserver?: JobsObserver;
+	#tasksAggregator?: TasksAggregator;
 	#eventBus?: EventBus;
 	#eventBusUnsubscribers: Array<() => void> = [];
 	#welcomeComponent?: WelcomeComponent;
@@ -467,6 +470,23 @@ export class InteractiveMode implements InteractiveModeContext {
 	) {
 		this.session = session;
 		this.sessionManager = session.sessionManager;
+		this.session.setSdkPlanModeHandler(async on => {
+			if (on) await this.#enterPlanMode();
+			else await this.#exitPlanMode();
+			const state = this.session.getPlanModeState();
+			const applied = on
+				? this.planModeEnabled && state?.enabled === true
+				: !this.planModeEnabled && !this.planModePaused && state === undefined;
+			if (!applied) {
+				throw Object.assign(
+					new Error(`mode.plan.set could not ${on ? "enter" : "exit"} plan mode in the current lifecycle state.`),
+					{
+						code: "conflict",
+					},
+				);
+			}
+			return state;
+		});
 		this.session.setRetainedMemorySampler(() => ({
 			tuiChatChildren: this.chatContainer.children.length,
 			tuiCachedRenderBytes: getRenderCacheRetainedBytes(),
@@ -488,7 +508,9 @@ export class InteractiveMode implements InteractiveModeContext {
 			);
 		}
 
-		this.ui = new TUI(new ProcessTerminal(), settings.get("showHardwareCursor"));
+		this.ui = new TUI(new ProcessTerminal(), settings.get("showHardwareCursor"), {
+			enableMouse: settings.get("mouse.enabled"),
+		});
 		this.ui.setClearOnShrink(settings.get("clearOnShrink"));
 		this.chatContainer = new Container();
 		this.#ircSplitView = new IrcSplitViewComponent(this.chatContainer, this.ircLedger, () => theme);
@@ -525,7 +547,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.hookWidgetContainerBelow = new Container();
 		this.editorContainer = new Container();
 		this.editorContainer.addChild(this.editor);
-		this.statusLine = new StatusLineComponent(session, { version: this.#version });
+		this.statusLine = new StatusLineComponent(session, { version: this.#version, focusDomain: "composer" });
 		this.statusLine.setAutoCompactEnabled(session.autoCompactionEnabled);
 
 		this.hideThinkingBlock = settings.get("hideThinkingBlock");
@@ -550,7 +572,7 @@ export class InteractiveMode implements InteractiveModeContext {
 
 		this.#baseSlashCommands = [...BUILTIN_SLASH_COMMANDS, ...hookCommands, ...customCommands];
 		this.#baseReservedSlashCommandNames = new Set(this.#baseSlashCommands.map(command => command.name));
-		this.#rebuildSkillSlashCommands();
+		this.#resolvedSlashCommands = [...this.#baseSlashCommands, ...this.#rebuildSkillSlashCommands()];
 
 		this.#uiHelpers = new UiHelpers(this);
 		this.#btwController = new BtwController(this);
@@ -560,6 +582,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#todoCommandController = new TodoCommandController(this);
 		this.#selectorController = new SelectorController(this);
 		this.#inputController = new InputController(this);
+		this.statusLine.setActionRegistry(this.#inputController.actionRegistry, () => this.keybindings);
 		this.#observerRegistry = new SessionObserverRegistry();
 	}
 
@@ -712,6 +735,12 @@ export class InteractiveMode implements InteractiveModeContext {
 				this.statusLine.setJobs(jobsObserver.getSnapshot());
 				this.ui.requestRender();
 			});
+			this.#tasksAggregator = new TasksAggregator(
+				jobManager,
+				jobsObserver,
+				this.#observerRegistry,
+				this.session.getAgentId(),
+			);
 		}
 
 		// Load initial todos
@@ -724,6 +753,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.updateEditorChrome();
 		this.#syncEditorMaxHeight();
 		this.isInitialized = true;
+		if (this.settings.get("tasksPane.defaultVisible")) this.showTasksPane();
 		this.#syncIrcSidebarAvailabilityFromSettings();
 		this.ui.requestRender(true);
 
@@ -802,6 +832,10 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.updateEditorChrome();
 	}
 
+	getSlashCommands(): readonly SlashCommand[] {
+		return this.#resolvedSlashCommands;
+	}
+
 	/** Reload slash commands and autocomplete for the provided working directory. */
 	async refreshSlashCommandState(cwd?: string): Promise<void> {
 		const basePath = cwd ?? this.sessionManager.getCwd();
@@ -813,9 +847,9 @@ export class InteractiveMode implements InteractiveModeContext {
 			description: cmd.description,
 		}));
 		const skillCommands = this.#rebuildSkillSlashCommands(fileCommandNames);
-		const slashCommands = [...this.#baseSlashCommands, ...skillCommands];
+		this.#resolvedSlashCommands = [...this.#baseSlashCommands, ...skillCommands, ...fileSlashCommands];
 		const autocompleteProvider = this.#inputController.createAutocompleteProvider(
-			[...slashCommands, ...fileSlashCommands],
+			this.#resolvedSlashCommands,
 			basePath,
 		);
 		this.editor.setAutocompleteProvider(autocompleteProvider);
@@ -1786,6 +1820,41 @@ export class InteractiveMode implements InteractiveModeContext {
 		}
 	}
 
+	async #finalizeApprovedPlan(planContent: string, planFilePath: string, finalPlanFilePath: string): Promise<void> {
+		if (!planFilePath.startsWith("local:") || !finalPlanFilePath.startsWith("local:")) {
+			throw new Error("Approved plan source and destination paths must use the local: scheme.");
+		}
+		const sourcePath = this.#resolvePlanFilePath(planFilePath);
+		const destinationPath = this.#resolvePlanFilePath(finalPlanFilePath);
+		const temporaryPath = `${destinationPath}.approval-${crypto.randomUUID()}`;
+		try {
+			await fs.writeFile(temporaryPath, planContent, { encoding: "utf8", flag: "wx" });
+			if (sourcePath === destinationPath) await fs.rename(temporaryPath, destinationPath);
+			else {
+				try {
+					await fs.link(temporaryPath, destinationPath);
+				} catch (error) {
+					if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+						throw new Error(
+							`Plan destination already exists at ${finalPlanFilePath}. Choose a different title and submit the plan for approval again.`,
+						);
+					}
+					throw error;
+				}
+				await fs.unlink(temporaryPath);
+				await fs.unlink(sourcePath);
+			}
+			const destinationContent = await Bun.file(destinationPath).text();
+			if (planSnapshotHash(destinationContent) !== planSnapshotHash(planContent)) {
+				throw new Error(
+					`Approved plan destination hash did not match the reviewed snapshot at ${finalPlanFilePath}.`,
+				);
+			}
+		} finally {
+			await fs.unlink(temporaryPath).catch(() => {});
+		}
+	}
+
 	#renderPlanPreview(planContent: string, options?: { append?: boolean }): void {
 		const existingContainer = this.#planReviewContainer;
 		// Only reuse the existing preview when it is still attached to the chat container;
@@ -1826,19 +1895,11 @@ export class InteractiveMode implements InteractiveModeContext {
 		}
 	}
 
-	#getPlanReviewHelpText(): string {
-		const externalEditorKey = this.keybindings.getDisplayString("app.editor.external");
-		if (!externalEditorKey) {
-			return "up/down navigate  enter select  esc cancel";
-		}
-		return `up/down navigate  enter select  ${externalEditorKey.toLowerCase()} open in editor  esc cancel`;
-	}
-
-	async #openPlanInExternalEditor(planFilePath: string): Promise<void> {
+	async #openPlanInExternalEditor(planFilePath: string): Promise<string | null> {
 		const editorCmd = getEditorCommand();
 		if (!editorCmd) {
 			this.showWarning("No editor configured. Set $VISUAL or $EDITOR environment variable.");
-			return;
+			return null;
 		}
 
 		const resolvedPath = this.#resolvePlanFilePath(planFilePath);
@@ -1848,10 +1909,10 @@ export class InteractiveMode implements InteractiveModeContext {
 		} catch (error) {
 			if (isEnoent(error)) {
 				this.showError(`Plan file not found at ${planFilePath}`);
-				return;
+				return null;
 			}
 			this.showWarning(`Failed to open external editor: ${error instanceof Error ? error.message : String(error)}`);
-			return;
+			return null;
 		}
 
 		let ttyHandle: fs.FileHandle | null = null;
@@ -1862,7 +1923,6 @@ export class InteractiveMode implements InteractiveModeContext {
 			const stdio: [number | "inherit", number | "inherit", number | "inherit"] = ttyHandle
 				? [ttyHandle.fd, ttyHandle.fd, ttyHandle.fd]
 				: ["inherit", "inherit", "inherit"];
-
 			const result = await openInEditor(editorCmd, currentText, {
 				extension: path.extname(resolvedPath) || ".md",
 				stdio,
@@ -1870,11 +1930,13 @@ export class InteractiveMode implements InteractiveModeContext {
 			});
 			if (result !== null) {
 				await Bun.write(resolvedPath, result);
-				this.#renderPlanPreview(result);
 				this.showStatus("Plan updated in external editor.");
+				return result;
 			}
+			return null;
 		} catch (error) {
 			this.showWarning(`Failed to open external editor: ${error instanceof Error ? error.message : String(error)}`);
+			return null;
 		} finally {
 			if (ttyHandle) {
 				await ttyHandle.close();
@@ -1892,14 +1954,10 @@ export class InteractiveMode implements InteractiveModeContext {
 			title: string;
 			preserveContext?: boolean;
 			compactBeforeExecute?: boolean;
+			reviewerComments?: string;
 		},
 	): Promise<void> {
-		await renameApprovedPlanFile({
-			planFilePath: options.planFilePath,
-			finalPlanFilePath: options.finalPlanFilePath,
-			getArtifactsDir: () => this.sessionManager.getArtifactsDir(),
-			getSessionId: () => this.sessionManager.getSessionId(),
-		});
+		await this.#finalizeApprovedPlan(planContent, options.planFilePath, options.finalPlanFilePath);
 		const previousTools = this.#planModePreviousTools ?? this.session.getActiveToolNames();
 
 		// Mark the pending abort caused by the plan-mode → compaction transition as
@@ -1938,14 +1996,15 @@ export class InteractiveMode implements InteractiveModeContext {
 				const compactionPrompt = prompt.render(planModeCompactInstructionsPrompt, {
 					planFilePath: options.finalPlanFilePath,
 				});
-				// Pin the plan reference path BEFORE compaction so any user messages
-				// queued during the compaction await (which `handleCompactCommand`
-				// flushes via `flushCompactionQueue` before returning) see the
-				// approved plan in `#buildPlanReferenceMessage`. Reassignment after
-				// the try/finally is idempotent and kept for the !compactBeforeExecute
-				// branch.
 				this.session.setPlanReferencePath(options.finalPlanFilePath);
-				compactOutcome = await this.handleCompactCommand(compactionPrompt);
+				this.#planApprovalDispatchPending = true;
+				try {
+					compactOutcome = await this.handleCompactCommand(compactionPrompt);
+				} catch (error) {
+					this.#planApprovalDispatchPending = false;
+					await this.flushCompactionQueue({ willRetry: false });
+					throw error;
+				}
 			}
 		} finally {
 			// Unconditional clear. Idempotent: a no-op when the flag was never set
@@ -1967,13 +2026,8 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.session.setPlanReferencePath(options.finalPlanFilePath);
 
 		if (compactOutcome === "cancelled") {
-			// Explicit abort: honor it. `executeCompaction` already surfaced
-			// `showError("Compaction cancelled")` to the operator; we add the
-			// deferred-dispatch warning and exit. `markPlanReferenceSent` is
-			// intentionally skipped here: `#planReferenceSent` stays false, so
-			// `AgentSession.#buildPlanReferenceMessage` will inject the plan
-			// reference on the operator's next `prompt()` call. If we marked it
-			// sent here, the executor's first turn would have no plan context.
+			this.#planApprovalDispatchPending = false;
+			await this.flushCompactionQueue({ willRetry: false });
 			this.showWarning(
 				"Plan approved, but compaction was cancelled — execution not dispatched. Submit a turn to continue.",
 			);
@@ -1994,16 +2048,22 @@ export class InteractiveMode implements InteractiveModeContext {
 			}
 		}
 
-		// markPlanReferenceSent fires only on the dispatch path so the synthetic
-		// plan-approved prompt is the source of the reference injection.
-		this.session.markPlanReferenceSent();
 		const planModePrompt = prompt.render(planModeApprovedPrompt, {
 			planContent,
 			finalPlanFilePath: options.finalPlanFilePath,
 			contextPreserved: options.preserveContext === true,
 			tools: this.session.getActiveToolNames(),
+			reviewerComments: options.reviewerComments,
 		});
-		await this.session.prompt(planModePrompt, { synthetic: true });
+		try {
+			await this.session.prompt(planModePrompt, { synthetic: true });
+			this.session.markPlanReferenceSent();
+		} finally {
+			if (this.#planApprovalDispatchPending) {
+				this.#planApprovalDispatchPending = false;
+				await this.flushCompactionQueue({ willRetry: false });
+			}
+		}
 	}
 
 	async handlePlanModeCommand(initialPrompt?: string): Promise<void> {
@@ -2224,46 +2284,59 @@ export class InteractiveMode implements InteractiveModeContext {
 		const planFilePath = details.planFilePath || this.planModePlanFilePath || (await this.#getPlanFilePath());
 		this.planModePlanFilePath = planFilePath;
 		const planContent = await this.#readPlanFile(planFilePath);
-		if (!planContent) {
+		const review = await this.#selectorController.showPlanPreview(planContent, {
+			externalEditorKey: this.keybindings.getDisplayString("app.editor.external"),
+			externalEditorKeys: this.keybindings.getKeys("app.editor.external"),
+			onExternalEditor: () => this.#openPlanInExternalEditor(planFilePath),
+		});
+		if (!review.action) return;
+
+		const latestPlanContent = await this.#readPlanFile(planFilePath);
+		// Every decision is bound to the reviewed bytes. Do this before serializing,
+		// auditing, or dispatching so neither comments nor notes leak across revisions.
+		if (review.snapshotHash !== planSnapshotHash(latestPlanContent ?? "")) {
+			this.showWarning(
+				"Plan changed while reviewing; comments and notes were discarded. Confirm the decision again.",
+			);
+			return this.handlePlanApproval(details);
+		}
+		const commentBlock = serializePlanReviewComments(
+			latestPlanContent ?? "",
+			review.snapshotHash,
+			review.comments,
+			review.notes,
+		);
+		// Audit is deliberately decision-time only: the overlay replaces pre-decision reading,
+		// while scrollback retains the exact snapshot, path, SHA-256, decision, and reviewer guidance.
+		this.#renderPlanPreview(
+			`## Plan approval audit\n\nDecision: ${review.action}\n\nPath: \`${planFilePath}\`\n\nSnapshot SHA-256: \`${review.snapshotHash}\`\n\n${latestPlanContent ?? "*(missing plan.md)*"}${commentBlock ? `\n\n${commentBlock}` : ""}`,
+			{ append: true },
+		);
+
+		if (review.action === "Refine plan") {
+			// Refine with no review material preserves the existing composer return path:
+			// no prompt is dispatched. Review material is instead sent as a plain, non-synthetic
+			// AgentSession prompt so the model can revise the plan from the operator's feedback.
+			if (!commentBlock) return;
+			await this.session.prompt(`${commentBlock}\n\nPlease refine the plan using these review comments.`);
+			return;
+		}
+		if (!latestPlanContent) {
 			this.showError(`Plan file not found at ${planFilePath}`);
 			return;
 		}
-
-		this.#renderPlanPreview(planContent, { append: true });
-		const choice = await this.showHookSelector(
-			"Plan mode - next step",
-			["Approve and execute", "Approve and compact context", "Approve and keep context", "Refine plan"],
-			{
-				helpText: this.#getPlanReviewHelpText(),
-				onExternalEditor: () => void this.#openPlanInExternalEditor(planFilePath),
-			},
-		);
-
-		if (
-			choice === "Approve and execute" ||
-			choice === "Approve and compact context" ||
-			choice === "Approve and keep context"
-		) {
-			const finalPlanFilePath = details.finalPlanFilePath || planFilePath;
-			try {
-				const latestPlanContent = await this.#readPlanFile(planFilePath);
-				if (!latestPlanContent) {
-					this.showError(`Plan file not found at ${planFilePath}`);
-					return;
-				}
-				await this.#approvePlan(latestPlanContent, {
-					planFilePath,
-					finalPlanFilePath,
-					title: details.title,
-					preserveContext: choice !== "Approve and execute",
-					compactBeforeExecute: choice === "Approve and compact context",
-				});
-			} catch (error) {
-				this.showError(
-					`Failed to finalize approved plan: ${error instanceof Error ? error.message : String(error)}`,
-				);
-			}
-			return;
+		const finalPlanFilePath = details.finalPlanFilePath || planFilePath;
+		try {
+			await this.#approvePlan(latestPlanContent, {
+				planFilePath,
+				finalPlanFilePath,
+				title: details.title,
+				preserveContext: review.action !== "Approve and execute",
+				compactBeforeExecute: review.action === "Approve and compact context",
+				reviewerComments: commentBlock,
+			});
+		} catch (error) {
+			this.showError(`Failed to finalize approved plan: ${error instanceof Error ? error.message : String(error)}`);
 		}
 	}
 
@@ -2292,6 +2365,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			unsubscribe();
 		}
 		this.#eventBusUnsubscribers = [];
+		this.#tasksAggregator?.dispose();
 		this.#observerRegistry.dispose();
 		this.#eventController.dispose();
 		this.statusLine.dispose();
@@ -2335,6 +2409,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#btwController.dispose();
 
 		// Emit shutdown event to hooks
+		this.session.setSdkPlanModeHandler(null);
 		await this.session.dispose();
 
 		if (this.isInitialized) {
@@ -2557,6 +2632,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	flushCompactionQueue(options?: { willRetry?: boolean }): Promise<void> {
+		if (this.#planApprovalDispatchPending) return Promise.resolve();
 		return this.#uiHelpers.flushCompactionQueue(options);
 	}
 
@@ -2807,12 +2883,117 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#selectorController.showSessionObserver(this.#observerRegistry);
 	}
 
+	showSessionsDashboard(): void {
+		void this.#selectorController.showSessionsDashboard();
+	}
+
+	isTranscriptViewerOpen(): boolean {
+		return this.#selectorController.isTranscriptViewerOpen();
+	}
+	refreshTranscriptViewer(): void {
+		if (!this.isTranscriptViewerOpen()) return;
+		const identityMap = this.#rebuildTranscriptRegistry();
+		this.#selectorController.refreshTranscriptViewer(identityMap);
+	}
+	showTranscriptViewer(): void {
+		this.#rebuildTranscriptRegistry();
+		this.#selectorController.showTranscriptViewer(this.#transcriptRegistry);
+	}
+	#rebuildTranscriptRegistry(): ReadonlyMap<string, string> {
+		const toolResults = new Map<string, Extract<AgentMessage, { role: "toolResult" }>>();
+		for (const message of this.session.messages) {
+			if (message.role === "toolResult") toolResults.set(message.toolCallId, message);
+		}
+		const items: RegisterTranscriptItem[] = [];
+		const identityMap = new Map<string, string>();
+		for (const [messageIndex, message] of this.session.messages.entries()) {
+			const provisionalEntryId = transcriptItemId.stream(this.session.transcriptPromptGeneration, messageIndex);
+			const durableEntryId = getSessionMessageEntryId(message);
+			const entryId = durableEntryId ?? provisionalEntryId;
+			if (durableEntryId) {
+				if (message.role === "user" || message.role === "developer") {
+					identityMap.set(transcriptItemId.entry(provisionalEntryId), transcriptItemId.entry(durableEntryId));
+				} else if (message.role === "assistant") {
+					for (const [contentIndex] of message.content.entries()) {
+						identityMap.set(
+							transcriptItemId.assistantContent(provisionalEntryId, contentIndex),
+							transcriptItemId.assistantContent(durableEntryId, contentIndex),
+						);
+					}
+				}
+			}
+			if (message.role === "user" || message.role === "developer") {
+				const text =
+					typeof message.content === "string"
+						? message.content
+						: message.content
+								.filter(part => part.type === "text")
+								.map(part => part.text)
+								.join("\n");
+				if (text.trim())
+					items.push({
+						kind: "user",
+						source: { entryId, message },
+						getPayload: () => ({ text, metadata: { role: message.role }, source: message }),
+					});
+				continue;
+			}
+			if (message.role !== "assistant") continue;
+			for (const [contentIndex, content] of message.content.entries()) {
+				if (content.type === "thinking" && content.thinking.trim())
+					items.push({
+						kind: "assistant-thinking",
+						source: { entryId, contentIndex, content },
+						getPayload: () => ({ text: content.thinking, metadata: { entryId, contentIndex }, source: content }),
+					});
+				if (content.type === "text" && content.text.trim())
+					items.push({
+						kind: "assistant-text",
+						source: { entryId, contentIndex, content },
+						getPayload: () => ({ text: content.text, metadata: { entryId, contentIndex }, source: content }),
+					});
+				if (content.type === "toolCall") {
+					const result = toolResults.get(content.id);
+					const resultText =
+						result?.content
+							.filter(part => part.type === "text")
+							.map(part => part.text)
+							.join("\n") ?? "";
+					items.push({
+						kind: "tool",
+						source: { toolCallId: content.id, content, result },
+						getPayload: () => ({
+							text: resultText || JSON.stringify(content.arguments, null, 2),
+							metadata: {
+								name: content.name,
+								arguments: content.arguments,
+								intent: content.intent,
+								isError: result?.isError ?? false,
+							},
+							source: { content, result },
+						}),
+					});
+				}
+			}
+		}
+		this.#transcriptRegistry.rebuild(items);
+		return identityMap;
+	}
+
 	showJobsOverlay(): void {
 		if (!this.#jobsObserver) {
 			this.showStatus("Background jobs are unavailable in this session");
 			return;
 		}
 		this.#selectorController.showJobsOverlay(this.#jobsObserver);
+	}
+
+	showTasksPane(): void {
+		if (!this.#tasksAggregator) {
+			this.showStatus("Tasks are unavailable in this session");
+			return;
+		}
+		this.#selectorController.showTasksPane(this.#tasksAggregator);
 	}
 
 	resetObserverRegistry(): void {

@@ -2164,14 +2164,14 @@ function sdkControlSurface(
 				throw Object.assign(new Error("skill.invoke args must be a string."), { code: "invalid_input" });
 			return ctx.invokeSkill(name, args);
 		},
-		setPlanMode: on => {
+		setPlanMode: async on => {
 			if (!bindings.has("setPlanMode") || !ctx.setPlanMode)
 				return unavailable("mode.plan.set", "no plan-mode seam is installed")();
 
 			if (typeof on !== "boolean")
 				throw Object.assign(new Error("mode.plan.set requires a boolean on value."), { code: "invalid_input" });
 
-			return { state: ctx.setPlanMode(on) };
+			return { state: await ctx.setPlanMode(on) };
 		},
 		operateGoal: (op, objective) => {
 			if (!bindings.has("operateGoal") || !ctx.operateGoal)
