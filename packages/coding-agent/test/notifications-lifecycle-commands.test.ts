@@ -32,6 +32,21 @@ describe("lifecycle command parser (G009)", () => {
 			kind: "create",
 			target: { kind: "plain_dir", path: "/new/dir" },
 		});
+		expect(
+			parseLifecycleCommand(String.raw`/session_create path C:\Users\alice\repo`, { platform: "win32" }),
+		).toEqual({
+			kind: "create",
+			target: { kind: "existing_path", path: String.raw`C:\Users\alice\repo` },
+		});
+		expect(
+			parseLifecycleCommand(String.raw`/session_create path \\server\share\repo`, { platform: "win32" }),
+		).toEqual({
+			kind: "create",
+			target: { kind: "existing_path", path: String.raw`\\server\share\repo` },
+		});
+		expect(
+			parseLifecycleCommand(String.raw`/session_create path C:\Users\alice\repo`, { platform: "linux" }).kind,
+		).toBe("reject");
 	});
 
 	it("expands own-home tilde paths for create targets", () => {
@@ -124,6 +139,7 @@ describe("lifecycle command parser (G009)", () => {
 
 	it("rejects injection-shaped paths / branches / ids", () => {
 		expect(parseLifecycleCommand("/session_create path /repo;rm").kind).toBe("reject");
+		expect(parseLifecycleCommand(String.raw`/session_create path C:\repo;rm`).kind).toBe("reject");
 		expect(parseLifecycleCommand("/session_create worktree /repo ../evil").kind).toBe("reject");
 		expect(parseLifecycleCommand("/session_close bad id with spaces").kind).toBe("usage");
 		expect(parseLifecycleCommand("/session_close a$(whoami)").kind).toBe("reject");

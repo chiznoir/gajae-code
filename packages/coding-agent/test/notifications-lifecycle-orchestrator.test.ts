@@ -39,7 +39,6 @@ function deps(overrides: Partial<OrchestratorDeps> = {}): {
 	const base: OrchestratorDeps = {
 		pairedChatId: PAIRED,
 		auditRedactionKey: new Uint8Array(32).fill(7),
-		isPsmuxProvider: () => false,
 		now: () => 1_000,
 		store,
 		audit: e => {
@@ -652,6 +651,40 @@ describe("lifecycle orchestrator", () => {
 		expect((await store.read()).entries[`${PAIRED}:302`]?.reason).toBe("close_refused");
 		expect(audit.at(-1)).toMatchObject({ event: "terminal_uncertain", reason: "close_refused" });
 	});
+	it("rejects psmux close before ledger or close effects", async () => {
+		let closes = 0;
+		const {
+			deps: d,
+			store,
+			audit,
+		} = deps({
+			isPsmuxProvider: () => true,
+			closeSession: async () => {
+				closes += 1;
+				return { processGone: true };
+			},
+		});
+		const out = await handleLifecycleRequest(
+			{
+				type: "session_close",
+				requestId: "lc_psmux_close",
+				updateId: 303,
+				chatId: PAIRED,
+				token: "control-token",
+				target: { sessionId: "sess-1" },
+				force: true,
+			},
+			d,
+		);
+		expect(out).toEqual({
+			status: "error",
+			reason: "unsupported_platform",
+			message: "session_close is unavailable with psmux",
+		});
+		expect(closes).toBe(0);
+		expect((await store.read()).entries).toEqual({});
+		expect(audit.at(-1)).toMatchObject({ event: "rejected", reason: "unsupported_platform" });
+	});
 
 	it("classifyDuplicate / requestHash / summarizeTarget are stable", () => {
 		const a = requestHash(createFrame());
@@ -671,109 +704,6 @@ describe("lifecycle orchestrator", () => {
 		expect(classifyDuplicate(undefined, a).kind).toBe("new");
 		expect(classifyDuplicate(entry, a).kind).toBe("reack_success");
 		expect(classifyDuplicate(entry, "different").kind).toBe("conflict");
-	});
-	it("rejects psmux create repeatedly before ledger, rate, prompt, or effects", async () => {
-		let providers = 0;
-		let reads = 0;
-		let rates = 0;
-		let prompts = 0;
-		let spawns = 0;
-		const { deps: d, audit } = deps({
-			isPsmuxProvider: () => {
-				providers++;
-				return true;
-			},
-			store: {
-				read: async () => {
-					reads++;
-					return { version: 1, entries: {} };
-				},
-				write: async () => {},
-			},
-			allowCreate: () => {
-				rates++;
-				return true;
-			},
-			writeStartupPrompt: async () => {
-				prompts++;
-				throw new Error("must not write prompt");
-			},
-			spawnCreate: async () => {
-				spawns++;
-				throw new Error("must not spawn");
-			},
-		});
-		await expect(handleLifecycleRequest(createFrame(), d)).resolves.toMatchObject({
-			status: "error",
-			reason: "unsupported_platform",
-		});
-		await expect(handleLifecycleRequest(createFrame(), d)).resolves.toMatchObject({
-			status: "error",
-			reason: "unsupported_platform",
-		});
-		expect([providers, reads, rates, prompts, spawns]).toEqual([2, 0, 0, 0, 0]);
-		expect(audit).toHaveLength(2);
-		expect(audit).toEqual(
-			audit.map(() =>
-				expect.objectContaining({ schemaVersion: 2, event: "rejected", reason: "unsupported_platform" }),
-			),
-		);
-	});
-	it("rejects psmux resume and forced close before ledger or lifecycle effects", async () => {
-		let reads = 0;
-		let resumes = 0;
-		let closes = 0;
-		let providers = 0;
-		const { deps: d } = deps({
-			isPsmuxProvider: () => {
-				providers++;
-				return true;
-			},
-			store: {
-				read: async () => {
-					reads++;
-					return { version: 1, entries: {} };
-				},
-				write: async () => {},
-			},
-			resumeSession: async () => {
-				resumes++;
-				throw new Error("must not resume");
-			},
-			closeSession: async () => {
-				closes++;
-				throw new Error("must not close");
-			},
-		});
-		const resume: SessionResumeFrame = {
-			type: "session_resume",
-			requestId: "psmux-resume",
-			updateId: 401,
-			chatId: PAIRED,
-			token: "control-token",
-			target: { sessionIdOrPrefix: "sess" },
-		};
-		const close: SessionCloseFrame = {
-			type: "session_close",
-			requestId: "psmux-close",
-			updateId: 402,
-			chatId: PAIRED,
-			token: "control-token",
-			target: { sessionId: "sess" },
-			force: true,
-		};
-		const nonForcedClose: SessionCloseFrame = {
-			...close,
-			requestId: "psmux-close-non-forced",
-			updateId: 403,
-			force: false,
-		};
-		await handleLifecycleRequest(resume, d);
-		await handleLifecycleRequest(close, d);
-		await handleLifecycleRequest(resume, d);
-		const nonForced = await handleLifecycleRequest(nonForcedClose, d);
-		expect(nonForced).toMatchObject({ status: "error", reason: "invalid_target" });
-		expect([providers, reads, resumes, closes]).toEqual([3, 0, 0, 0]);
 	});
 	it("rejects startup prompt content before audit, ledger, rate limit, writer, or spawn effects", async () => {
 		const calls = { audit: 0, read: 0, write: 0, rateLimit: 0, writer: 0, spawn: 0, resume: 0 };

@@ -84,7 +84,6 @@ function stubDeps(): OrchestratorDeps {
 	return {
 		pairedChatId: PAIRED,
 		auditRedactionKey: new Uint8Array(32).fill(7),
-		isPsmuxProvider: () => false,
 		now: () => 1000,
 		store: { read: async () => ({ version: 1, entries: {} }), write: async () => {} },
 		audit: () => {},
@@ -1701,55 +1700,72 @@ describe("lifecycle control runtime", () => {
 		},
 	);
 
-	posixTmuxIt("refuses psmux before create or cold-resume can mutate lifecycle state", async () => {
-		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-lifecycle-psmux-"));
-		const project = path.join(root, "project");
-		const psmux = path.join(root, "psmux");
-		const plain = path.join(root, "plain");
-		fs.mkdirSync(project, { recursive: true });
-		await writeManagedSession(root, project, "resume-123");
-		fs.writeFileSync(psmux, "#!/usr/bin/env bash\nexit 99\n");
-		fs.chmodSync(psmux, 0o755);
-		const env = { ...process.env, GJC_TMUX_COMMAND: psmux, GJC_PSMUX_COMMAND: psmux };
-		try {
-			await expect(
-				daemonSpawnCreate(env)(createFrame({ target: { kind: "plain_dir", path: plain } }), {
-					lifecycleRequestId: "psmux-create",
-					intendedSessionId: "psmux-create",
-				}),
-			).rejects.toThrow("gjc_lifecycle_psmux_unsupported");
-			let listSessionsCalled = false;
-			await expect(
-				daemonResumeSession(env, {
-					sessionsRoot: root,
-					listSessions: () => {
-						listSessionsCalled = true;
-						return [];
-					},
-				})({
-					sessionIdOrPrefix: "resume-123",
-					path: project,
-				}),
-			).rejects.toThrow("gjc_lifecycle_psmux_unsupported");
-			expect(listSessionsCalled).toBe(false);
-			await expect(
-				daemonResumeSession(env, {
-					sessionsRoot: root,
-					listSessions: () => {
-						listSessionsCalled = true;
-						return [];
-					},
-				})({
-					sessionIdOrPrefix: "resume-123",
-				}),
-			).rejects.toThrow("gjc_lifecycle_psmux_unsupported");
-			expect(listSessionsCalled).toBe(false);
-			expect(fs.existsSync(plain)).toBe(false);
-			expect(fs.existsSync(path.join(project, ".gjc"))).toBe(false);
-		} finally {
-			fs.rmSync(root, { recursive: true, force: true });
-		}
-	});
+	posixTmuxIt(
+		"creates psmux sessions in the lifecycle namespace and fails closed on an uncertain receipt",
+		async () => {
+			const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-lifecycle-psmux-"));
+			const psmux = path.join(root, "psmux");
+			const calls = path.join(root, "calls");
+			const state = path.join(root, "state");
+			const plain = path.join(root, "plain");
+			fs.writeFileSync(
+				psmux,
+				[
+					"#!/usr/bin/env bash",
+					'printf "%s\\n" "$*" >> "$PSMUX_CALLS"',
+					'if [ "$1" = "-V" ]; then echo "psmux 3"; exit 0; fi',
+					"shift 2",
+					'if [ "$1" = "list-sessions" ]; then [ "$PSMUX_FAIL" = 1 ] && { echo failure >&2; exit 9; }; [ -f "$PSMUX_STATE" ] && { [ "$PSMUX_NOISY" = 1 ] && echo other || cat "$PSMUX_STATE"; }; exit 0; fi',
+					'if [ "$1" = "new-session" ]; then while [ "$1" != "-s" ]; do shift; done; echo "$2" > "$PSMUX_STATE"; exit 0; fi',
+					"exit 99",
+				].join("\n"),
+			);
+			fs.chmodSync(psmux, 0o755);
+			const env = {
+				...process.env,
+				GJC_TMUX_COMMAND: psmux,
+				GJC_PSMUX_COMMAND: psmux,
+				PSMUX_CALLS: calls,
+				PSMUX_STATE: state,
+			};
+			try {
+				await expect(
+					daemonSpawnCreate(env)(createFrame({ target: { kind: "plain_dir", path: plain } }), {
+						lifecycleRequestId: "psmux-create",
+						intendedSessionId: "psmux-create",
+					}),
+				).resolves.toMatchObject({ tmuxSession: "gjc_lc_psmux-create" });
+				const commands = fs.readFileSync(calls, "utf8").split("\n");
+				const createCommand = commands.find(line => line.includes(" new-session "));
+				expect(createCommand).toContain("-L gjc-lifecycle new-session -d -s gjc_lc_psmux-create -c");
+				expect(createCommand).not.toMatch(/(?:sh -c|exec env|-P|-F)/);
+				await expect(daemonResumeSession(env)({ sessionIdOrPrefix: "psmux-create" })).resolves.toMatchObject({
+					mode: "reattached",
+					tmuxSession: "gjc_lc_psmux-create",
+				});
+				await expect(daemonResumeSession(env)({ sessionIdOrPrefix: "psmux" })).resolves.toMatchObject({
+					mode: "reattached",
+					sessionId: "psmux-create",
+				});
+				fs.writeFileSync(state, "gjc_lc_psmux-one\ngjc_lc_psmux-two\n");
+				await expect(daemonResumeSession(env)({ sessionIdOrPrefix: "psmux-" })).resolves.toMatchObject({
+					ambiguous: [{ sessionId: "psmux-one" }, { sessionId: "psmux-two" }],
+				});
+				await expect(
+					daemonResumeSession({ ...env, PSMUX_FAIL: "1" })({ sessionIdOrPrefix: "psmux-create" }),
+				).rejects.toThrow("gjc_lifecycle_psmux_inventory_uncertain");
+				fs.rmSync(state);
+				await expect(
+					daemonSpawnCreate({ ...env, PSMUX_NOISY: "1" })(
+						createFrame({ target: { kind: "plain_dir", path: path.join(root, "uncertain") } }),
+						{ lifecycleRequestId: "psmux-uncertain", intendedSessionId: "psmux-uncertain" },
+					),
+				).rejects.toThrow("gjc_lifecycle_psmux_spawn_uncertain");
+			} finally {
+				fs.rmSync(root, { recursive: true, force: true });
+			}
+		},
+	);
 
 	posixTmuxIt(
 		"rejects missing or noisy native receipts with cleanup uncertainty and no generation publication",

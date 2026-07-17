@@ -96,7 +96,7 @@ function extractModelPreset(args: string[]): { positional: string[]; modelPreset
  */
 export function parseLifecycleCommand(
 	text: string | undefined,
-	ctx: { chatType?: string; botUsername?: string } = {},
+	ctx: { chatType?: string; botUsername?: string; platform?: NodeJS.Platform } = {},
 ): ParsedLifecycleCommand {
 	const raw = (text ?? "").trim();
 	const [rawCommand, ...args] = raw.split(/\s+/);
@@ -146,19 +146,19 @@ export function parseLifecycleCommand(
 	const kind = positional[0];
 	if (kind === "path") {
 		if (positional.length !== 2) return { kind: "usage", message: USAGE };
-		const p = normalizeLifecyclePath(positional[1]!);
+		const p = normalizeLifecyclePath(positional[1]!, ctx.platform);
 		if (!p) return { kind: "reject", reason: "invalid_target", message: `Invalid path.\n\n${USAGE}` };
 		return { kind: "create", target: { kind: "existing_path", path: p }, modelPreset };
 	}
 	if (kind === "dir") {
 		if (positional.length !== 2) return { kind: "usage", message: USAGE };
-		const p = normalizeLifecyclePath(positional[1]!);
+		const p = normalizeLifecyclePath(positional[1]!, ctx.platform);
 		if (!p) return { kind: "reject", reason: "invalid_target", message: `Invalid dir.\n\n${USAGE}` };
 		return { kind: "create", target: { kind: "plain_dir", path: p }, modelPreset };
 	}
 	if (kind === "worktree") {
 		if (positional.length !== 3) return { kind: "usage", message: USAGE };
-		const repo = normalizeLifecyclePath(positional[1]!);
+		const repo = normalizeLifecyclePath(positional[1]!, ctx.platform);
 		const branch = positional[2]!;
 		if (!repo) return { kind: "reject", reason: "invalid_target", message: `Invalid repo path.\n\n${USAGE}` };
 		if (!isSafeBranch(branch)) {
@@ -207,8 +207,11 @@ export function validateLifecycleTarget(
 // --- Safety primitives (defensive; the full-trust paired chat is accepted, but
 // we still reject obviously malformed/injection-shaped inputs early). ---
 
-export function normalizeLifecyclePath(value: string): string | undefined {
-	if (!isSafePath(value)) return undefined;
+export function normalizeLifecyclePath(
+	value: string,
+	platform: NodeJS.Platform = process.platform,
+): string | undefined {
+	if (!isSafePath(value, platform)) return undefined;
 	if (value === "~") return os.homedir() || undefined;
 	if (value.startsWith("~/")) {
 		const home = os.homedir();
@@ -221,12 +224,13 @@ function isSafeIdentifier(value: string): boolean {
 	return /^[A-Za-z0-9._-]{1,128}$/.test(value);
 }
 
-function isSafePath(value: string): boolean {
-	// Reject empty, shell-metacharacter, or newline-bearing paths. Absolute or
-	// relative are both allowed (full-trust chat), but not injection shapes.
+function isSafePath(value: string, platform: NodeJS.Platform): boolean {
+	// Reject empty, shell-metacharacter, or newline-bearing paths. Backslashes
+	// are accepted only by native Windows, where they are path separators.
 	if (value.length === 0 || value.length > 4096) return false;
 	if (/[\n\r\0]/.test(value)) return false;
-	return !/[;&|`$(){}<>*?!\\"']/.test(value);
+	if (platform !== "win32" && value.includes("\\")) return false;
+	return !/[;&|`$(){}<>*?!"']/.test(value);
 }
 
 function isSafeBranch(value: string): boolean {

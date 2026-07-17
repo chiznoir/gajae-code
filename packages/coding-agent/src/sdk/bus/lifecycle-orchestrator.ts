@@ -97,8 +97,8 @@ export interface OrchestratorDeps {
 	now: () => number;
 	store: LedgerStore;
 	audit: (event: AuditEvent) => Promise<void> | void;
-	/** Resolves the returned tmux provider once per request for psmux preflight. */
-	isPsmuxProvider: () => boolean;
+	/** Provider probe used only to reject unsupported destructive psmux close before ledger mutation. */
+	isPsmuxProvider?: () => boolean;
 	/** Per-chat create rate limiter: returns true when allowed. */
 	allowCreate: (chatId: string, nowMs: number) => boolean;
 	/** Persist the once-consumed 0600 startup-prompt file after durably recording its ref. */
@@ -297,13 +297,12 @@ export async function handleLifecycleRequest(
 			message: "startup prompt capability transport is unavailable; retry without a startup prompt",
 		};
 	}
-	if (deps.isPsmuxProvider()) {
+	if (frame.type === "session_close" && deps.isPsmuxProvider?.()) {
 		await deps.audit({ ...baseAudit, event: "rejected", reason: "unsupported_platform" });
 		return {
 			status: "error",
 			reason: "unsupported_platform",
-			message:
-				"Remote session lifecycle is unavailable on this psmux host because GJC cannot prove immutable session identity. No lifecycle action was performed. Use a local GJC terminal with a supported tmux provider.",
+			message: "session_close is unavailable with psmux",
 		};
 	}
 

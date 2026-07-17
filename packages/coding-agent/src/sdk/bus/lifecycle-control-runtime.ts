@@ -36,6 +36,7 @@ import {
 import {
 	buildGjcTmuxProfileCommands,
 	buildGjcTmuxSessionSlug,
+	GJC_TMUX_ACTIVE_SESSION_ENV,
 	resolveGjcTmuxBinary,
 	resolveGjcTmuxCommand,
 } from "../../gjc-runtime/tmux-common";
@@ -75,6 +76,7 @@ import {
 	type OrchestratorDeps,
 	type ResumeEffectResult,
 } from "./lifecycle-orchestrator";
+import { createPsmuxLifecycleSession, listPsmuxLifecycleSessions } from "./psmux-lifecycle";
 import { listRecentSessions } from "./recent-activity";
 
 type NativeControlServerConstructor = new (
@@ -867,11 +869,38 @@ export function daemonSpawnCreate(
 		ids: { lifecycleRequestId: string; intendedSessionId: string; startupPromptRef?: string },
 	): Promise<CreateEffectResult> => {
 		const tmuxBinary = resolveGjcTmuxBinary({ env });
-		if (tmuxBinary.isPsmux) throw new Error("gjc_lifecycle_psmux_unsupported");
 		const tmux = tmuxBinary.command;
 		const name = tmuxSessionNameFor(ids.intendedSessionId);
 		const { cwd, args } = buildCreateArgv(frame, ids);
 		const sessionStateFile = lifecycleRuntimeStateFile(cwd, ids.intendedSessionId, name);
+		if (tmuxBinary.isPsmux) {
+			if (frame.target.kind === "plain_dir") fs.mkdirSync(cwd, { recursive: true });
+			createPsmuxLifecycleSession({
+				tmux: tmuxBinary.command,
+				env,
+				name,
+				cwd,
+				command: ["gjc"],
+				args,
+				environment: {
+					GJC_TMUX_LAUNCHED: "1",
+					GJC_NOTIFICATIONS: "1",
+					GJC_SESSION_ID: ids.intendedSessionId,
+					GJC_LIFECYCLE_REQUEST_ID: ids.lifecycleRequestId,
+					[GJC_COORDINATOR_SESSION_ID_ENV]: ids.intendedSessionId,
+					[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]: sessionStateFile,
+					[GJC_TMUX_ACTIVE_SESSION_ENV]: name,
+					...(ids.startupPromptRef ? { GJC_STARTUP_PROMPT_REF: ids.startupPromptRef } : {}),
+				},
+			});
+			return {
+				sessionId: ids.intendedSessionId,
+				tmuxSession: name,
+				sessionStateFile,
+				endpointUrl: "",
+				topicThreadId: "",
+			};
+		}
 		const stateDir = path.dirname(sessionStateFile);
 		const previousBaseline = await captureOwnerGenerationBaseline(stateDir, ids.intendedSessionId);
 		const predecessor = resolveManagedOwnerPredecessorSync(stateDir, ids.intendedSessionId, previousBaseline);
@@ -1001,6 +1030,7 @@ export function daemonCloseSession(
 	} = {},
 ) {
 	return async (target: { sessionId: string; tmuxSession?: string; sessionStateFile?: string }) => {
+		if (resolveGjcTmuxBinary({ env }).isPsmux) throw new Error("gjc_lifecycle_psmux_close_unsupported");
 		const name = target.tmuxSession ?? tmuxSessionNameFor(target.sessionId);
 		await (deps.forceClose ?? forceCloseGjcTmuxSession)(name, env, target.sessionId, target.sessionStateFile);
 		return { processGone: (deps.findSession ?? findGjcTmuxSessionByName)(name, env) === undefined };
@@ -1025,30 +1055,52 @@ export function daemonResumeSession(
 		path?: string;
 	}): Promise<ResumeEffectResult | { ambiguous: ResumeCandidate[] } | { notFound: true }> => {
 		const tmuxBinary = resolveGjcTmuxBinary({ env });
-		if (tmuxBinary.isPsmux) throw new Error("gjc_lifecycle_psmux_unsupported");
-		const live = (opts.listSessions?.(env) ?? listGjcTmuxSessions(env)).filter(
-			s => s.sessionId === target.sessionIdOrPrefix || s.sessionId?.startsWith(target.sessionIdOrPrefix),
-		);
-		if (live.length > 1) {
-			return {
-				ambiguous: live.map(s => ({ sessionId: s.sessionId ?? s.name, path: s.project })),
-			};
-		}
-		if (live.length === 1) {
-			const s = live[0]!;
-			await assertLifecycleTmuxServerSafe({
-				tmux: resolveGjcTmuxCommand(env),
-				env,
-				ownerIsolationProbe: opts.ownerIsolationProbe,
-			});
-			return {
-				sessionId: s.sessionId ?? s.name,
-				tmuxSession: s.name,
-				sessionStateFile: s.sessionStateFile,
-				endpointUrl: "",
-				topicThreadId: "",
-				mode: "reattached",
-			};
+		if (tmuxBinary.isPsmux) {
+			const names = listPsmuxLifecycleSessions(tmuxBinary.command, env);
+			if (names === undefined) throw new Error("gjc_lifecycle_psmux_inventory_uncertain");
+			const sessionNamePrefix = tmuxSessionNameFor("");
+			const requestedName = tmuxSessionNameFor(target.sessionIdOrPrefix);
+			const exact = names.filter(name => name === requestedName);
+			const matched = exact.length > 0 ? exact : names.filter(name => name.startsWith(requestedName));
+			if (matched.length > 1)
+				return {
+					ambiguous: matched.map(name => ({ sessionId: name.slice(sessionNamePrefix.length) })),
+				};
+			if (matched.length === 1) {
+				const name = matched[0]!;
+				return {
+					sessionId: name.slice(sessionNamePrefix.length),
+					tmuxSession: name,
+					endpointUrl: "",
+					topicThreadId: "",
+					mode: "reattached",
+				};
+			}
+		} else {
+			const live = (opts.listSessions?.(env) ?? listGjcTmuxSessions(env)).filter(
+				s => s.sessionId === target.sessionIdOrPrefix || s.sessionId?.startsWith(target.sessionIdOrPrefix),
+			);
+			if (live.length > 1) {
+				return {
+					ambiguous: live.map(s => ({ sessionId: s.sessionId ?? s.name, path: s.project })),
+				};
+			}
+			if (live.length === 1) {
+				const s = live[0]!;
+				await assertLifecycleTmuxServerSafe({
+					tmux: resolveGjcTmuxCommand(env),
+					env,
+					ownerIsolationProbe: opts.ownerIsolationProbe,
+				});
+				return {
+					sessionId: s.sessionId ?? s.name,
+					tmuxSession: s.name,
+					sessionStateFile: s.sessionStateFile,
+					endpointUrl: "",
+					topicThreadId: "",
+					mode: "reattached",
+				};
+			}
 		}
 		// Dead: resolve the id/prefix against saved session history BEFORE cold
 		// restart, so an unknown or ambiguous prefix fails closed instead of
@@ -1085,6 +1137,32 @@ export function daemonResumeSession(
 		const tmux = tmuxBinary.command;
 		const name = tmuxSessionNameFor(resumeId);
 		const sessionStateFile = lifecycleRuntimeStateFile(resolvedResumeCwd, resumeId, name);
+		if (tmuxBinary.isPsmux) {
+			createPsmuxLifecycleSession({
+				tmux,
+				env,
+				name,
+				cwd: resolvedResumeCwd,
+				command: ["gjc"],
+				args: ["--resume", resumeId],
+				environment: {
+					GJC_TMUX_LAUNCHED: "1",
+					GJC_NOTIFICATIONS: "1",
+					GJC_SESSION_ID: resumeId,
+					[GJC_COORDINATOR_SESSION_ID_ENV]: resumeId,
+					[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]: sessionStateFile,
+					[GJC_TMUX_ACTIVE_SESSION_ENV]: name,
+				},
+			});
+			return {
+				sessionId: resumeId,
+				tmuxSession: name,
+				sessionStateFile,
+				endpointUrl: "",
+				topicThreadId: "",
+				mode: "cold_restarted",
+			};
+		}
 		const stateDir = path.dirname(sessionStateFile);
 		const previousBaseline = await captureOwnerGenerationBaseline(stateDir, resumeId);
 		const predecessor = resolveManagedOwnerPredecessorSync(stateDir, resumeId, previousBaseline);
