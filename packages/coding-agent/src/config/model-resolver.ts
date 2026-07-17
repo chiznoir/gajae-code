@@ -520,15 +520,6 @@ function findGlobMatch(
 }
 
 /** @internal Exported for testing and legacy adapters. */
-function parseModelPatternWithContext(
-	pattern: string,
-	availableModels: Model<Api>[],
-	context: ModelPreferenceContext,
-	options?: { allowInvalidThinkingSelectorFallback?: boolean; modelRegistry?: CanonicalModelRegistry },
-): ParsedModelResult {
-	void context;
-	return resolveSelector(pattern, availableModels, options);
-}
 
 export function parseModelPattern(
 	pattern: string,
@@ -935,6 +926,15 @@ function resolveExactCanonicalScopePattern(
 	modelRegistry: Pick<ModelRegistry, "getCanonicalVariants">,
 	availableModels: Model<Api>[],
 ): { models: Model<Api>[]; thinkingLevel?: ThinkingLevel; explicitThinkingLevel: boolean } | undefined {
+	// Exact concrete selectors must win before a suffix is interpreted as thinking.
+	// This preserves canonical/OpenRouter model IDs that themselves contain colons.
+	if (
+		findExactModelReferenceMatch(pattern, availableModels) ||
+		(pattern.includes(":") && availableModels.some(model => model.id.toLowerCase() === pattern.trim().toLowerCase()))
+	) {
+		return undefined;
+	}
+
 	const suffix = splitSelectorThinkingSuffix(pattern);
 	const canonicalId = suffix.thinkingLevel ? suffix.selector : pattern;
 	const thinkingLevel = suffix.thinkingLevel;
@@ -951,23 +951,20 @@ function resolveExactCanonicalScopePattern(
 }
 
 /**
- * Resolve model patterns to actual Model objects with optional thinking levels
- * Format: "pattern:level" where :level is optional
- * For each pattern, finds all matching models and picks the best version:
- * 1. Prefer alias (e.g., Anthropic model-sonnet-4-5) over dated versions (Anthropic model-sonnet-4-5-20250929)
- * 2. If no alias, pick the latest dated version
- *
- * Supports models with colons in their IDs (e.g., OpenRouter's model:exacto).
- * The algorithm tries to match the full pattern first, then progressively
- * strips colon-suffixes to find a match.
+ * Resolve model patterns to actual Model objects with optional thinking levels.
+ * A `:level` suffix is interpreted only after the complete selector fails to
+ * resolve, preserving concrete model IDs that contain colon-bearing route suffixes.
+ * For each non-glob pattern, alias IDs are preferred over dated versions; otherwise
+ * the latest dated version is selected.
  */
+
 export async function resolveModelScope(
 	patterns: string[],
 	modelRegistry: Pick<ModelRegistry, "getAvailable" | "getCanonicalVariants">,
 	preferences?: ModelMatchPreferences,
 ): Promise<ScopedModel[]> {
 	const availableModels = modelRegistry.getAvailable();
-	const context = buildPreferenceContext(availableModels, preferences);
+
 	const scopedModels: ScopedModel[] = [];
 
 	for (const pattern of patterns) {
@@ -1023,12 +1020,10 @@ export async function resolveModelScope(
 			continue;
 		}
 
-		const { model, thinkingLevel, warning, explicitThinkingLevel } = parseModelPatternWithContext(
-			pattern,
-			availableModels,
-			context,
-			{ modelRegistry },
-		);
+		const { model, thinkingLevel, warning, explicitThinkingLevel } = resolveSelector(pattern, availableModels, {
+			modelRegistry,
+			preferences,
+		});
 
 		if (warning) {
 			logger.warn(warning);

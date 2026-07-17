@@ -1,6 +1,16 @@
 import { describe, expect, test } from "bun:test";
 import { Effort, type Model } from "@gajae-code/ai";
-import { resolveSelector, splitSelectorThinkingSuffix } from "@gajae-code/coding-agent/config/model-resolver";
+import {
+	resolveCliModel,
+	resolveModelFromSettings,
+	resolveModelOverride,
+	resolveModelRoleValue,
+	resolveModelScope,
+	resolveSelector,
+	restoreModelFromSession,
+	splitSelectorThinkingSuffix,
+} from "@gajae-code/coding-agent/config/model-resolver";
+import { Settings } from "@gajae-code/coding-agent/config/settings";
 
 const model = (provider: string, id: string): Model<"anthropic-messages"> => ({
 	id,
@@ -17,6 +27,15 @@ const model = (provider: string, id: string): Model<"anthropic-messages"> => ({
 });
 
 const candidates = [model("openai", "gpt"), model("openrouter", "z-ai/glm-4.7")];
+
+const registry = {
+	getAvailable: () => candidates,
+	getAll: () => candidates,
+	getCanonicalVariants: () => [],
+	find: (provider: string, id: string) =>
+		candidates.find(candidate => candidate.provider === provider && candidate.id === id),
+	getApiKey: async () => "test-key",
+};
 
 describe("staged selector golden table", () => {
 	test("documents case and suffix divergence", () => {
@@ -35,14 +54,76 @@ describe("staged selector golden table", () => {
 		}
 	});
 
+	test("routes every resolver adapter through the staged selector", async () => {
+		const settings = Settings.isolated({ modelRoles: { default: "openrouter/z-ai/glm-4.7" } });
+		const adapters = [
+			{
+				name: "role",
+				resolve: async () => resolveModelRoleValue("pi/default", candidates, { settings }).model,
+			},
+			{
+				name: "override",
+				resolve: async () => resolveModelOverride(["openrouter/z-ai/glm-4.7"], registry, settings).model,
+			},
+			{
+				name: "settings",
+				resolve: async () => resolveModelFromSettings({ settings, availableModels: candidates }),
+			},
+			{
+				name: "session",
+				resolve: async () =>
+					(await restoreModelFromSession("openrouter", "z-ai/glm-4.7", undefined, false, registry)).model,
+			},
+			{
+				name: "CLI provider",
+				resolve: async () =>
+					resolveCliModel({ cliProvider: "openrouter", cliModel: "z-ai/glm-4.7", modelRegistry: registry }).model,
+			},
+			{
+				name: "CLI no provider",
+				resolve: async () =>
+					resolveCliModel({ cliModel: "openrouter/z-ai/glm-4.7", modelRegistry: registry }).model,
+			},
+			{
+				name: "scope",
+				resolve: async () => (await resolveModelScope(["openrouter/z-ai/glm-4.7"], registry))[0]?.model,
+			},
+		] as const;
+
+		for (const adapter of adapters) {
+			await expect(adapter.resolve(), adapter.name).resolves.toMatchObject({
+				provider: "openrouter",
+				id: "z-ai/glm-4.7",
+			});
+		}
+	});
+
+	test("preserves scope preferences and concrete OpenRouter route selectors", async () => {
+		const openai = model("openai", "shared");
+		const openrouter = model("openrouter", "shared");
+		const routeBase = model("openrouter", "z-ai/glm-4.7");
+		const scopedCandidates = [openai, openrouter, routeBase];
+		const scopedRegistry = { getAvailable: () => scopedCandidates, getCanonicalVariants: () => [] };
+
+		const preferred = await resolveModelScope(["shared"], scopedRegistry, {
+			usageOrder: ["openrouter/shared"],
+		});
+		expect(preferred[0]?.model).toBe(openrouter);
+
+		const route = await resolveModelScope(["openrouter/z-ai/glm-4.7-20251222:nitro"], scopedRegistry);
+		expect(route[0]?.model).toMatchObject({ provider: "openrouter", id: "z-ai/glm-4.7-20251222:nitro" });
+	});
+
+	test("returns stable candidate identity across repeated memoized resolution", () => {
+		const first = resolveSelector("openai/gpt", candidates).model;
+		const second = resolveSelector("openai/gpt", candidates).model;
+		expect(first).toBe(candidates[0]);
+		expect(second).toBe(first);
+	});
+
 	test("case-only duplicate provider selectors fall through to bare-id ranking", () => {
 		const duplicates = [model("openai", "gpt"), model("openai", "GPT")];
 		expect(resolveSelector("openai/gpt", duplicates).model?.id).toBe("gpt");
-	});
-
-	test("preserves OpenRouter route and date suffix cloning", () => {
-		const resolved = resolveSelector("openrouter/z-ai/glm-4.7-20251222:nitro", candidates);
-		expect(resolved.model).toMatchObject({ provider: "openrouter", id: "z-ai/glm-4.7-20251222:nitro" });
 	});
 
 	test("splits only the final selector suffix", () => {
