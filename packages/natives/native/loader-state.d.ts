@@ -71,4 +71,12 @@ export interface LoadFromCandidatesResult<T> {
 
 export function loadFromCandidates<T>(input: LoadFromCandidatesInput<T>): LoadFromCandidatesResult<T>;
 
+export interface CachedEmbeddedExtractionIsFreshInput {
+	targetPath: string;
+	embeddedPath: string;
+	sizeOf: (path: string) => number | null;
+}
+
+export function cachedEmbeddedExtractionIsFresh(input: CachedEmbeddedExtractionIsFreshInput): boolean;
+
 export function loadNative(): Record<string, unknown>;

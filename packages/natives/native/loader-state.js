@@ -223,6 +223,23 @@ export function loadFromCandidates({ candidates, requireCandidate, validateCandi
 	return { bindings: null, errors };
 }
 
+/**
+ * Decide whether a previously extracted embedded addon may be reused. A cached
+ * extraction from an earlier build of the same version carries the same version
+ * sentinel yet can expose a different native surface, so it is fresh only when
+ * its byte size matches the embedded payload. `sizeOf` returns the byte size of
+ * a path, or `null` when it cannot be inspected.
+ * @param {{ targetPath: string; embeddedPath: string; sizeOf: (path: string) => number | null }} input
+ * @returns {boolean}
+ */
+export function cachedEmbeddedExtractionIsFresh({ targetPath, embeddedPath, sizeOf }) {
+	const cachedSize = sizeOf(targetPath);
+	if (cachedSize === null) return false;
+	const embeddedSize = sizeOf(embeddedPath);
+	if (embeddedSize === null) return false;
+	return cachedSize === embeddedSize;
+}
+
 // =========================================================================
 // Side-effectful loader. Everything below runs only when `loadNative()` is
 // called from `native/index.js` — tests that only import the pure helpers
@@ -310,7 +327,23 @@ function maybeExtractEmbeddedAddon(ctx, errors) {
 	const selectedEmbeddedFile = selectEmbeddedAddonFile(ctx.selectedVariant);
 	if (!selectedEmbeddedFile) return null;
 	const targetPath = path.join(ctx.versionedDir, selectedEmbeddedFile.filename);
-	if (fs.existsSync(targetPath)) return targetPath;
+	if (fs.existsSync(targetPath)) {
+		// Guard against intra-version drift: a cached extraction written by an earlier
+		// build of the same version carries the same version sentinel but can expose a
+		// different native surface (e.g. a symbol added mid-cycle). The embedded addon
+		// is the source of truth, so reuse the cached file only when it matches the
+		// embedded payload size and re-extract otherwise.
+		const sizeOf = candidate => {
+			try {
+				return fs.statSync(candidate).size;
+			} catch {
+				return null;
+			}
+		};
+		if (cachedEmbeddedExtractionIsFresh({ targetPath, embeddedPath: selectedEmbeddedFile.filePath, sizeOf })) {
+			return targetPath;
+		}
+	}
 
 	try {
 		fs.mkdirSync(ctx.versionedDir, { recursive: true });
