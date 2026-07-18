@@ -17,6 +17,8 @@ import { deliverRichWithFallback } from "../src/sdk/bus/rich-render";
 import {
 	acquireDaemonOwnership,
 	type BotApi,
+	BTW_QUESTION_MAX_UNICODE_SCALARS,
+	BTW_QUESTION_MAX_UTF8_BYTES,
 	DAEMON_GENERATION,
 	DAEMON_VERSION,
 	daemonPaths,
@@ -8671,6 +8673,94 @@ describe("telegram daemon /btw reservation and capability boundaries", () => {
 				),
 			),
 		);
+	});
+	test.each([
+		["exact scalar boundary", "x".repeat(BTW_QUESTION_MAX_UNICODE_SCALARS)],
+		["exact UTF-8 byte boundary with multibyte scalars", "😀".repeat(BTW_QUESTION_MAX_UTF8_BYTES / 4)],
+	])("accepts /btw at the %s", async (_name, question) => {
+		const { bot, daemon, threadId } = await daemonWithTopic();
+
+		await daemon.handleTelegramUpdate({
+			update_id: 1900,
+			message: { chat: { id: 42 }, message_thread_id: threadId, text: `/btw ${question}`, message_id: 1900 },
+		});
+
+		expect(FakeWs.instances[0]!.sent.map(frame => JSON.parse(frame))).toContainEqual(
+			expect.objectContaining({ type: "ephemeral_turn", question }),
+		);
+		expect(
+			bot.calls.some(
+				call =>
+					call.method === "sendMessage" &&
+					call.body.text === "Question must be at most 4096 Unicode scalar values and 16384 UTF-8 bytes.",
+			),
+		).toBe(false);
+	});
+
+	test.each([
+		["one-over scalar boundary", "x".repeat(BTW_QUESTION_MAX_UNICODE_SCALARS + 1)],
+		["one-over UTF-8 byte boundary", `${"😀".repeat(BTW_QUESTION_MAX_UTF8_BYTES / 4)}x`],
+	])("rejects /btw at the %s before creating pending state", async (_name, question) => {
+		const { bot, daemon, threadId } = await daemonWithTopic();
+
+		await daemon.handleTelegramUpdate({
+			update_id: 1901,
+			message: { chat: { id: 42 }, message_thread_id: threadId, text: `/btw ${question}`, message_id: 1901 },
+		});
+
+		expect(
+			FakeWs.instances[0]!.sent.map(frame => JSON.parse(frame)).some(frame => frame.type === "ephemeral_turn"),
+		).toBe(false);
+		expect(bot.calls.at(-1)).toMatchObject({
+			method: "sendMessage",
+			body: {
+				message_thread_id: threadId,
+				reply_parameters: { message_id: 1901 },
+				text: "Question must be at most 4096 Unicode scalar values and 16384 UTF-8 bytes.",
+			},
+			options: { noRetry: true, signal: expect.any(AbortSignal) },
+		});
+	});
+
+	test("reserves an oversized /btw update after an ambiguous reply so duplicate replay is exactly once", async () => {
+		const { bot, daemon, threadId } = await daemonWithTopic();
+		const call = bot.call.bind(bot);
+		bot.call = async (method, body, options) => {
+			if (method === "sendMessage") {
+				bot.calls.push({ method, body, options });
+				throw new Error("transport outcome unknown");
+			}
+			return call(method, body, options);
+		};
+		const update = {
+			update_id: 1902,
+			message: {
+				chat: { id: 42 },
+				message_thread_id: threadId,
+				text: `/btw ${"x".repeat(BTW_QUESTION_MAX_UNICODE_SCALARS + 1)}`,
+				message_id: 1902,
+			},
+		};
+
+		await daemon.handleTelegramUpdate(update);
+		await daemon.handleTelegramUpdate(update);
+
+		const replies = bot.calls.filter(
+			call =>
+				call.method === "sendMessage" &&
+				call.body.text === "Question must be at most 4096 Unicode scalar values and 16384 UTF-8 bytes.",
+		);
+		expect(replies).toHaveLength(1);
+		expect(replies[0]).toMatchObject({
+			body: {
+				reply_parameters: { message_id: 1902 },
+				text: "Question must be at most 4096 Unicode scalar values and 16384 UTF-8 bytes.",
+			},
+			options: { noRetry: true, signal: expect.any(AbortSignal) },
+		});
+		expect(
+			FakeWs.instances[0]!.sent.map(frame => JSON.parse(frame)).some(frame => frame.type === "ephemeral_turn"),
+		).toBe(false);
 	});
 
 	test.each([
