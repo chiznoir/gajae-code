@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import type { RenderResultOptions } from "@gajae-code/agent-core";
 import { LspTool } from "@gajae-code/coding-agent/lsp";
@@ -396,7 +397,7 @@ describe("lsp regressions", () => {
 	it("detects tlaplus files for LSP startup and language ids", async () => {
 		const tempDir = TempDir.createSync("@gjc-lsp-tlaplus-");
 		const cwd = path.join(tempDir.path(), "repo");
-		const externalBinDir = path.join(tempDir.path(), "bin");
+		const externalBinDir = path.join(os.homedir(), `.gjc-lsp-tlaplus-${process.pid}-${Date.now()}`);
 		const specPath = path.join(cwd, "Spec.tla");
 		const aliasPath = path.join(cwd, "Spec.tlaplus");
 		const tlapmLsp = path.join(externalBinDir, "tlapm_lsp");
@@ -418,13 +419,14 @@ describe("lsp regressions", () => {
 			expect(detectLanguageId(aliasPath)).toBe("tlaplus");
 		} finally {
 			tempDir.removeSync();
+			await fs.promises.rm(externalBinDir, { recursive: true, force: true });
 		}
 	});
 
 	it("detects csharp-ls as the preferred C# LSP when installed", async () => {
 		const tempDir = TempDir.createSync("@gjc-lsp-csharp-ls-");
 		const cwd = path.join(tempDir.path(), "repo");
-		const externalBinDir = path.join(tempDir.path(), "bin");
+		const externalBinDir = path.join(os.homedir(), `.gjc-lsp-csharp-${process.pid}-${Date.now()}`);
 		const csharpLs = path.join(externalBinDir, "csharp-ls");
 		const omnisharp = path.join(externalBinDir, "omnisharp");
 		try {
@@ -449,13 +451,14 @@ describe("lsp regressions", () => {
 			expect(whichSpy).toHaveBeenCalledWith("omnisharp");
 		} finally {
 			tempDir.removeSync();
+			await fs.promises.rm(externalBinDir, { recursive: true, force: true });
 		}
 	});
 
 	it("keeps omnisharp as the C# fallback when csharp-ls is unavailable", async () => {
 		const tempDir = TempDir.createSync("@gjc-lsp-omnisharp-fallback-");
 		const cwd = path.join(tempDir.path(), "repo");
-		const externalBinDir = path.join(tempDir.path(), "bin");
+		const externalBinDir = path.join(os.homedir(), `.gjc-lsp-omnisharp-${process.pid}-${Date.now()}`);
 		const omnisharp = path.join(externalBinDir, "omnisharp");
 		try {
 			await fs.promises.mkdir(cwd, { recursive: true });
@@ -472,6 +475,7 @@ describe("lsp regressions", () => {
 			expect(getServersForFile(config, path.join(cwd, "Program.cs")).map(([name]) => name)).toEqual(["omnisharp"]);
 		} finally {
 			tempDir.removeSync();
+			await fs.promises.rm(externalBinDir, { recursive: true, force: true });
 		}
 	});
 	it("rename_file applies LSP willRenameFiles edits and renames the file", async () => {
