@@ -7,12 +7,14 @@ import type { NotificationServiceFs } from "../src/sdk/bus/notification-service"
 import {
 	buildNotificationStatusReport,
 	checkNotificationHealth,
+	formatNotificationHealthReport,
 	formatNotificationRecoveryReport,
 	formatNotificationStatusReport,
 	recoverNotifications,
 	sanitizeDiagnostic,
 	sendNotificationTest,
 } from "../src/sdk/bus/notification-service";
+import { DAEMON_GENERATION } from "../src/sdk/bus/telegram-daemon-contract";
 
 const TOKEN = "1234567890:ABCDEFghijkLmnOpQrsTuvWxYz012345678";
 
@@ -137,14 +139,243 @@ describe("notification-service health", () => {
 	});
 
 	test("healthy daemon with fresh heartbeat and matching identity is ok", async () => {
-		const { fs } = mockFs({ [statePath]: daemonStateJson({ pid: 1000, heartbeatAt: 1_490 }) });
+		const { fs } = mockFs({
+			[statePath]: daemonStateJson({ pid: 1000, heartbeatAt: 1_490, generation: DAEMON_GENERATION }),
+			[path.join("/tmp/gjc-none", "notifications", "session-a.json")]: JSON.stringify({
+				sessionId: "session-a",
+				pid: 1000,
+			}),
+		});
 		const report = await checkNotificationHealth({
 			settings,
 			stateRoot: "/tmp/gjc-none",
 			deps: { fs, now: () => 1_500, pidAlive: pid => pid === 1000 },
 		});
 		expect(report.daemon.identityMatches).toBe(true);
+		expect(report.daemon.heartbeatAt).toBe(1_490);
+		expect(report.daemon.heartbeatAgeMs).toBe(10);
+		expect(report.daemon.generation).toBe(DAEMON_GENERATION);
+		expect(report.daemon.currentGeneration).toBe(DAEMON_GENERATION);
+		expect(report.daemon.generationRelation).toBe("current");
 		expect(report.overall).toBe("ok");
+		expect(report.checks.some(check => check.name === "local_endpoint")).toBe(false);
+		expect(formatNotificationHealthReport(report)).toBe(
+			[
+				"Notification health: OK",
+				"  [ok] config: enabled with at least one configured adapter",
+				"  [ok] daemon: daemon pid 1000 alive with a fresh heartbeat",
+				"  [ok] endpoints: 1 live, 0 unverified endpoint file(s)",
+			].join("\n"),
+		);
+	});
+
+	test("reports a current-root unavailable endpoint hint only for an active matching daemon", async () => {
+		const { fs } = mockFs({ [statePath]: daemonStateJson({ pid: 1000, heartbeatAt: 1_490 }) });
+		const report = await checkNotificationHealth({
+			settings,
+			stateRoot: "/tmp/gjc-none",
+			deps: { fs, now: () => 1_500, pidAlive: pid => pid === 1000 },
+		});
+		const hint = report.checks.find(check => check.name === "local_endpoint");
+		expect(report.endpoints.total).toBe(0);
+		expect(report.overall).toBe("warn");
+		expect(hint).toEqual({
+			name: "local_endpoint",
+			level: "warn",
+			detail:
+				"No local notification endpoint for this working directory. In this GJC terminal run /notify on; if it does not report notifications enabled, start a new local GJC session. Do not re-pair Telegram.",
+		});
+		expect(report.checks.indexOf(hint!)).toBe(report.checks.findIndex(check => check.name === "endpoints") + 1);
+	});
+
+	test("suppresses the unavailable endpoint hint for a stopped daemon", async () => {
+		const { fs } = mockFs({ [statePath]: daemonStateJson({ pid: 1000, heartbeatAt: 1_490, stoppedAt: 1_495 }) });
+		const report = await checkNotificationHealth({
+			settings,
+			stateRoot: "/tmp/gjc-none",
+			deps: { fs, now: () => 1_500, pidAlive: pid => pid === 1000 },
+		});
+		expect(report.checks.some(check => check.name === "local_endpoint")).toBe(false);
+	});
+
+	test.each([
+		["absent", undefined, undefined, true],
+		["dead", daemonStateJson({ pid: 999, heartbeatAt: 1_490 }), undefined, true],
+		["stale", daemonStateJson({ pid: 1000, heartbeatAt: 0 }), undefined, true],
+		["mismatched", daemonStateJson({ pid: 1000, chatId: "other", heartbeatAt: 1_490 }), undefined, true],
+		["stopped", daemonStateJson({ pid: 1000, heartbeatAt: 1_490, stoppedAt: 1_495 }), undefined, true],
+		["unconfigured", daemonStateJson({ pid: 1000, heartbeatAt: 1_490 }), undefined, false],
+		["live endpoint", daemonStateJson({ pid: 1000, heartbeatAt: 1_490 }), { sessionId: "s", pid: 1000 }, true],
+		["dead endpoint", daemonStateJson({ pid: 1000, heartbeatAt: 1_490 }), { sessionId: "s", pid: 999 }, true],
+		["unknown endpoint", daemonStateJson({ pid: 1000, heartbeatAt: 1_490 }), { sessionId: "s" }, true],
+		["unreadable endpoint", daemonStateJson({ pid: 1000, heartbeatAt: 1_490 }), "not-json", true],
+	])("suppresses the local endpoint hint for %s state", async (_name, state, endpoint, configured) => {
+		const rowSettings = Settings.isolated(
+			configured
+				? {
+						"notifications.enabled": true,
+						"notifications.telegram.botToken": TOKEN,
+						"notifications.telegram.chatId": "12345",
+					}
+				: { "notifications.enabled": false },
+		);
+		const rowStatePath = daemonPaths(rowSettings.getAgentDir()).state;
+		const endpointPath = path.join("/tmp/gjc-none", "notifications", "session-a.json");
+		const { fs } = mockFs({
+			...(state ? { [rowStatePath]: state } : {}),
+			...(endpoint ? { [endpointPath]: typeof endpoint === "string" ? endpoint : JSON.stringify(endpoint) } : {}),
+		});
+		const report = await checkNotificationHealth({
+			settings: rowSettings,
+			stateRoot: "/tmp/gjc-none",
+			deps: { fs, now: () => (_name === "stale" ? 1_000_000 : 1_500), pidAlive: pid => pid === 1000 },
+		});
+		expect(report.checks.some(check => check.name === "local_endpoint")).toBe(false);
+	});
+
+	test("reports normalized daemon generation relations and heartbeat age", async () => {
+		const cases = [
+			{ state: { generation: DAEMON_GENERATION }, generation: DAEMON_GENERATION, relation: "current" },
+			{ state: { generation: DAEMON_GENERATION - 1 }, generation: DAEMON_GENERATION - 1, relation: "older" },
+			{ state: {}, generation: undefined, relation: "pre_generation" },
+			{ state: { generation: DAEMON_GENERATION + 1 }, generation: DAEMON_GENERATION + 1, relation: "newer" },
+		] as const;
+
+		for (const testCase of cases) {
+			const { fs } = mockFs({
+				[statePath]: daemonStateJson({ pid: 1000, heartbeatAt: 1_490, ...testCase.state }),
+			});
+			const report = await checkNotificationHealth({
+				settings,
+				stateRoot: "/tmp/gjc-none",
+				deps: { fs, now: () => 1_500, pidAlive: pid => pid === 1000 },
+			});
+			expect(report.daemon.heartbeatAt).toBe(1_490);
+			expect(report.daemon.heartbeatAgeMs).toBe(10);
+			expect(report.daemon.heartbeatFresh).toBe(true);
+			expect(report.daemon.currentGeneration).toBe(DAEMON_GENERATION);
+			expect(report.daemon.generation).toBe(testCase.generation);
+			expect(report.daemon.generationRelation).toBe(testCase.relation);
+		}
+	});
+
+	test("normalizes malformed heartbeat and generation metadata without changing warning output", async () => {
+		const malformedHeartbeatValues: unknown[] = [undefined, -1, "1490", null];
+		const malformedGenerationValues: unknown[] = [-1, 1.5, "3", null, Number.MAX_SAFE_INTEGER + 1];
+		for (const heartbeatAt of malformedHeartbeatValues) {
+			const { fs } = mockFs({
+				[statePath]: daemonStateJson({ pid: 1000, heartbeatAt, generation: DAEMON_GENERATION }),
+			});
+			const report = await checkNotificationHealth({
+				settings,
+				stateRoot: "/tmp/gjc-none",
+				deps: { fs, now: () => 1_500, pidAlive: pid => pid === 1000 },
+			});
+			expect(report.daemon.heartbeatAt).toBeUndefined();
+			expect(report.daemon.heartbeatAgeMs).toBeUndefined();
+			expect(report.daemon.heartbeatFresh).toBe(false);
+			expect(report.overall).toBe("warn");
+			expect(formatNotificationHealthReport(report)).toBe(
+				[
+					"Notification health: WARN",
+					"  [ok] config: enabled with at least one configured adapter",
+					"  [warn] daemon: daemon pid 1000 heartbeat is stale",
+					"  [ok] endpoints: 0 live, 0 unverified endpoint file(s)",
+				].join("\n"),
+			);
+		}
+		for (const generation of malformedGenerationValues) {
+			const { fs } = mockFs({
+				[statePath]: daemonStateJson({ pid: 1000, heartbeatAt: 1_490, generation }),
+				[path.join("/tmp/gjc-none", "notifications", "session-a.json")]: JSON.stringify({
+					sessionId: "session-a",
+					pid: 1000,
+				}),
+			});
+			const report = await checkNotificationHealth({
+				settings,
+				stateRoot: "/tmp/gjc-none",
+				deps: { fs, now: () => 1_500, pidAlive: pid => pid === 1000 },
+			});
+			expect(report.daemon.generation).toBeUndefined();
+			expect(report.daemon.generationRelation).toBe("unknown");
+			expect(report.daemon.heartbeatFresh).toBe(true);
+			expect(report.overall).toBe("ok");
+		}
+	});
+
+	test("accepts finite timestamp floats and clamps future heartbeat age for display", async () => {
+		const { fs } = mockFs({
+			[statePath]: daemonStateJson({
+				pid: 1000,
+				startedAt: 0.5,
+				heartbeatAt: 1_500.5,
+				stoppedAt: 1.5,
+				generation: DAEMON_GENERATION,
+			}),
+		});
+		const report = await checkNotificationHealth({
+			settings,
+			stateRoot: "/tmp/gjc-none",
+			deps: { fs, now: () => 1_500, pidAlive: pid => pid === 1000 },
+		});
+		expect(report.daemon.heartbeatAt).toBe(1_500.5);
+		expect(report.daemon.heartbeatAgeMs).toBe(0);
+		expect(report.daemon.heartbeatFresh).toBe(true);
+		expect(report.daemon.stopped).toBe(true);
+	});
+
+	test("rejects malformed identity metadata before matching and keeps its warning semantics", async () => {
+		const { fs } = mockFs({
+			[statePath]: daemonStateJson({
+				pid: 1000,
+				heartbeatAt: 1_490,
+				tokenFingerprint: [tokenFingerprint(TOKEN)],
+				chatId: 12345,
+				roots: ["/safe", 1],
+				generation: DAEMON_GENERATION,
+			}),
+		});
+		const report = await checkNotificationHealth({
+			settings,
+			stateRoot: "/tmp/gjc-none",
+			deps: { fs, now: () => 1_500, pidAlive: pid => pid === 1000 },
+		});
+		expect(report.daemon.identityMatches).toBe(false);
+		expect(report.overall).toBe("warn");
+		expect(report.checks.find(check => check.name === "daemon")?.detail).toBe(
+			"a live daemon owns a different bot token or chat id",
+		);
+	});
+
+	test("rejects malformed required daemon ownership metadata before liveness checks", async () => {
+		const invalidStates: Record<string, unknown>[] = [
+			{ pid: 0 },
+			{ pid: -1 },
+			{ pid: 1.5 },
+			{ pid: "1000" },
+			{ ownerId: "" },
+		];
+		for (const state of invalidStates) {
+			let pidAliveCalls = 0;
+			const { fs } = mockFs({ [statePath]: daemonStateJson(state) });
+			const report = await checkNotificationHealth({
+				settings,
+				stateRoot: "/tmp/gjc-none",
+				deps: {
+					fs,
+					now: () => 1_500,
+					pidAlive: () => {
+						pidAliveCalls += 1;
+						return true;
+					},
+				},
+			});
+			expect(report.daemon.present).toBe(false);
+			expect(report.daemon.alive).toBe(false);
+			expect(report.daemon.generationRelation).toBe("unknown");
+			expect(pidAliveCalls).toBe(0);
+		}
 	});
 });
 
@@ -233,6 +464,20 @@ describe("notification-service recovery", () => {
 		});
 		expect(report.daemon.action).toBe("cleared-dead-owner-lock");
 		expect(unlinked).toContain(paths.lock);
+	});
+
+	test("leaves a lock untouched when required daemon ownership metadata is invalid", async () => {
+		const { fs, unlinked } = mockFs({
+			[paths.state]: daemonStateJson({ pid: 0 }),
+			[paths.lock]: "lock",
+		});
+		const report = await recoverNotifications({
+			settings,
+			stateRoot: "/tmp/gjc-empty",
+			deps: { fs, pidAlive: () => false },
+		});
+		expect(report.daemon.action).toBe("orphan-lock-left");
+		expect(unlinked).not.toContain(paths.lock);
 	});
 });
 describe("notification-service endpoint liveness (owner-proof)", () => {

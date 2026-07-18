@@ -19,6 +19,8 @@
  * generated), or `GJC_NOTIFICATIONS_TOKEN`.
  */
 
+import { AsyncLocalStorage } from "node:async_hooks";
+
 import { execFile } from "node:child_process";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
@@ -26,14 +28,15 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { promisify } from "node:util";
 import { ThinkingLevel } from "@gajae-code/agent-core";
-import type { ImageContent, TextContent } from "@gajae-code/ai";
-import { NotificationServer } from "@gajae-code/natives";
-import { logger, postmortem } from "@gajae-code/utils";
+import type { ImageContent, TextContent, Tool } from "@gajae-code/ai";
+import { NotificationServer, nativeBuildInfo } from "@gajae-code/natives";
+import { logger, postmortem, VERSION } from "@gajae-code/utils";
 import { Settings } from "../../config/settings";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "../../extensibility/extensions";
 import type {
 	WorkflowGateEmitter,
 	WorkflowGateTerminalController,
+	WorkflowGateTerminalProof,
 } from "../../modes/shared/agent-wire/workflow-gate-broker";
 import { parseThinkingLevel } from "../../thinking";
 import type {
@@ -52,7 +55,14 @@ import { SessionIndex } from "../broker/session-index";
 import { SessionSdkHost, shouldHostSdk } from "../host";
 import { type ControlSurface, dispatchControl } from "../host/control";
 import { CursorRegistry, QueryHandlers, RevisionStore, type SessionSurface } from "../host/query";
+import { projectQ10Models } from "../models.js";
 import { OPERATIONS } from "../protocol/operation-registry";
+import {
+	lifecycleStartupCapabilityForApi,
+	normalizeSdkStartupFailure,
+	type SdkStartupFailure,
+} from "../startup-capability";
+
 import { registerTelegramFileSink } from "./attachment-registry";
 import { ensureDiscordDaemon, ensureSlackDaemon } from "./chat-daemon-control";
 import {
@@ -62,10 +72,14 @@ import {
 	isSlackConfigured,
 	isTelegramConfigured,
 	type NotificationConfig,
+	type NotificationSettingsReader,
 	sessionTag,
 } from "./config";
-import { imageAttachmentsFromMessage, notificationActionPayload, summaryFromMessage } from "./helpers";
-import { ensureTelegramDaemonRunning } from "./telegram-daemon";
+import { telegramControlCommandUsage } from "./config-commands";
+import { imageAttachmentsFromMessage, notificationActionPayload, summaryFromMessage, truncate } from "./helpers";
+import { assertNativeRuntimeCompatibility } from "./native-runtime-compatibility";
+import { NotificationSessionController, type NotificationSessionRuntime } from "./session-control";
+import { type EnsureDaemonResult, ensureTelegramDaemonRunningDetailed } from "./telegram-daemon";
 
 // ===========================================================================
 // Session lifecycle control protocol (TypeScript mirror of the Rust wire
@@ -114,7 +128,7 @@ export interface SessionCreateFrame {
 	/** Control-endpoint token authorizing this frame. */
 	token: string;
 	target: SessionCreateTarget;
-	/** Reference to the daemon-written, once-consumed startup-prompt file. */
+	/** Reserved for a future capability transport; any supplied value is rejected before lifecycle acceptance. */
 	startupPromptRef?: string;
 	/** Model profile preset to activate for the spawned session (--mpreset). */
 	modelPreset?: string;
@@ -140,6 +154,7 @@ export interface SessionResumeFrame {
 	chatId: string;
 	token: string;
 	target: SessionResumeTarget;
+	/** Reserved for a future capability transport; any supplied value is rejected before lifecycle acceptance. */
 	startupPromptRef?: string;
 }
 
@@ -214,7 +229,8 @@ export type LifecycleErrorReason =
 	| "readiness_timeout"
 	| "close_refused"
 	| "not_found"
-	| "terminal_uncertain";
+	| "terminal_uncertain"
+	| "unsupported_platform";
 
 /** A candidate returned with an `ambiguous_target` resume error. */
 export interface ResumeCandidate {
@@ -363,7 +379,12 @@ interface PendingInteractiveAsk {
 	resolve: (result: AskAnswerSourceResult) => void;
 	options: string[];
 	controls: readonly AskRemoteControl[];
+	actionId?: string;
+	retireForDirectControl: () => RetireStatus;
 	reissue: () => boolean;
+	complete: (actionId: string) => void;
+	completeDirect: () => void;
+	fail: (actionId: string) => void;
 }
 
 interface UnattendedGatePresentation {
@@ -376,12 +397,203 @@ interface UnattendedGatePresentation {
 	allowEmpty: boolean;
 	navigationLabel?: "Next" | "Done";
 	selectedOptions: string[];
+	workflowGateId?: string;
+	onActivated?: (actionId: string, lease: { actionId: string; registrationEpoch: number }) => void;
+	onClosed?: () => void;
 }
 
-/** Keeps transport interaction ids separate from durable workflow gate ids. */
-class GatePresentationRegistry {
+type RetireStatus = "retired" | "already_terminal" | "claimed" | "stale";
+type DirectControlOutcome = "accepted" | "rejected" | "unknown";
+
+function parseRetireStatus(status: string): RetireStatus {
+	if (status === "retired" || status === "already_terminal" || status === "claimed" || status === "stale")
+		return status;
+	throw new Error(`Unexpected native retirement status: ${status}`);
+}
+
+function isTerminalProof(status: RetireStatus): status is "retired" | "already_terminal" {
+	return status === "retired" || status === "already_terminal";
+}
+
+export class PresentationArbiter {
 	private readonly presentations = new Map<string, UnattendedGatePresentation>();
 	private readonly routes = new Map<string, string>();
+	private active: { actionId: string; gateId: string; registrationEpoch: number } | undefined;
+	private readonly queue: string[] = [];
+	private readonly retries = new Map<string, { attempts: number; exhausted: boolean; nextAt: number }>();
+	private readonly retiredProofs = new Map<string, WorkflowGateTerminalProof>();
+	private readonly directControls = new Map<string, number>();
+	/** Explicit terminal proof for a direct control fenced before native publication. */
+	private readonly queuedDirectControls = new Set<string>();
+	private retryTimer: ReturnType<typeof setTimeout> | undefined;
+	private retryTimerGateId: string | undefined;
+	private retryTimerGeneration = 0;
+	private readonly terminalCancellationTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+	private headGeneration = 0;
+	private observedHead: string | undefined;
+	static readonly maxRegistrationAttempts = 3;
+	static readonly retryBaseDelayMs = 50;
+	static readonly retryMaxDelayMs = 1_000;
+	/** Bound an unavailable interactive answer source without discarding its head silently. */
+	static readonly terminalCancellationDelayMs = 250;
+
+	#observeHead(): number {
+		const head = this.queue[0];
+		if (head !== this.observedHead) {
+			this.observedHead = head;
+			this.headGeneration++;
+			if (this.retryTimer) {
+				clearTimeout(this.retryTimer);
+				this.retryTimer = undefined;
+				this.retryTimerGateId = undefined;
+			}
+		}
+		return this.headGeneration;
+	}
+
+	#clearTerminalCancellation(gateId: string): void {
+		const timer = this.terminalCancellationTimers.get(gateId);
+		if (timer) clearTimeout(timer);
+		this.terminalCancellationTimers.delete(gateId);
+	}
+
+	#scheduleTerminalCancellation(gateId: string): void {
+		const presentation = this.presentations.get(gateId);
+		if (presentation?.workflowGateId || this.terminalCancellationTimers.has(gateId)) return;
+		this.terminalCancellationTimers.set(
+			gateId,
+			setTimeout(() => {
+				this.terminalCancellationTimers.delete(gateId);
+				if (this.retries.get(gateId)?.exhausted && this.queue[0] === gateId) {
+					logger.warn("interactive_presentation_terminally_cancelled", { gateId });
+					this.cancel(gateId, "registration_exhausted");
+				}
+			}, PresentationArbiter.terminalCancellationDelayMs),
+		);
+	}
+
+	#promote(): void {
+		this.#observeHead();
+		const gateId = this.queue[0];
+		const retry = gateId ? this.retries.get(gateId) : undefined;
+		if (!this.active && gateId && !this.directControls.has(gateId) && !retry?.exhausted) {
+			if (retry && retry.nextAt > Date.now()) this.#scheduleRetry(gateId);
+			else this.reissue(gateId);
+		}
+	}
+
+	#scheduleRetry(gateId: string): void {
+		const retry = this.retries.get(gateId);
+		if (!retry || retry.exhausted || this.queue[0] !== gateId) return;
+		const generation = this.#observeHead();
+		if (this.retryTimer && this.retryTimerGateId === gateId && this.retryTimerGeneration === generation) return;
+		if (this.retryTimer) clearTimeout(this.retryTimer);
+		this.retryTimerGateId = gateId;
+		this.retryTimerGeneration = generation;
+		const delay = Math.max(0, retry.nextAt - Date.now());
+		this.retryTimer = setTimeout(() => {
+			this.retryTimer = undefined;
+			const matchesHead = this.queue[0] === gateId && this.#observeHead() === generation;
+			this.retryTimerGateId = undefined;
+			if (matchesHead) this.reconcile();
+		}, delay);
+	}
+
+	/** Revalidates the live endpoint queue head before bounded recovery. */
+	reconcile(): void {
+		this.#observeHead();
+		const gateId = this.queue[0];
+		const retry = gateId ? this.retries.get(gateId) : undefined;
+		if (
+			!gateId ||
+			!this.presentations.has(gateId) ||
+			this.active ||
+			this.directControls.has(gateId) ||
+			retry?.exhausted
+		)
+			return;
+		if (retry && retry.nextAt > Date.now()) {
+			this.#scheduleRetry(gateId);
+			return;
+		}
+		this.#promote();
+	}
+
+	/** Explicit production recovery for a previously exhausted endpoint queue head. */
+	recover(gateId = this.queue[0]): void {
+		if (!gateId || this.queue[0] !== gateId || !this.presentations.has(gateId)) return;
+		this.retries.delete(gateId);
+		this.#clearTerminalCancellation(gateId);
+
+		this.#observeHead();
+		this.reconcile();
+	}
+
+	hasActivePresentation(): boolean {
+		return this.active !== undefined;
+	}
+
+	retireForDirectControl(gateId: string): RetireStatus {
+		if (!this.active || this.active.gateId !== gateId) return "stale";
+		const active = this.active;
+		this.directControls.set(gateId, this.queue.indexOf(gateId));
+		const status = parseRetireStatus(this.server.retireIfUnclaimed(active).status);
+		if (isTerminalProof(status)) {
+			this.routes.delete(active.actionId);
+			this.active = undefined;
+			this.retiredProofs.set(gateId, status);
+			return status;
+		}
+		this.directControls.delete(gateId);
+		return status;
+	}
+
+	prepareDirectControl(
+		gateId: string,
+	): { status: "retired" | "queued"; ordinal: number } | { status: "claimed" | "stale" } {
+		const ordinal = this.queue.indexOf(gateId);
+		if (this.active?.gateId === gateId) {
+			const status = this.retireForDirectControl(gateId);
+			return status === "retired"
+				? { status, ordinal }
+				: { status: status === "already_terminal" ? "stale" : status };
+		}
+		if (!this.presentations.has(gateId) || ordinal < 0 || this.directControls.has(gateId)) return { status: "stale" };
+		// Fence the queued entry before awaiting durable resolution; promotion cannot
+		// republish it until the control has a known terminal outcome.
+		this.directControls.set(gateId, ordinal);
+		this.queuedDirectControls.add(gateId);
+		return { status: "queued", ordinal };
+	}
+
+	finishDirectControl(
+		gateId: string,
+		prepared: { status: "retired" | "queued"; ordinal: number },
+		outcome: DirectControlOutcome,
+	): void {
+		if (outcome === "accepted") {
+			this.directControls.delete(gateId);
+			this.complete(gateId);
+			return;
+		}
+		if (outcome === "unknown") {
+			// A durable/store/advance failure may have committed. Remove local authority
+			// rather than minting a fresh action against an uncertain durable state.
+			this.directControls.delete(gateId);
+			this.complete(gateId);
+			logger.warn("workflow_gate_direct_control_uncertain", { gateId });
+			return;
+		}
+		this.directControls.delete(gateId);
+		this.queuedDirectControls.delete(gateId);
+		this.retiredProofs.delete(gateId);
+		if (!this.presentations.has(gateId)) return;
+		const current = this.queue.indexOf(gateId);
+		if (current >= 0) this.queue.splice(current, 1);
+		this.queue.splice(Math.min(prepared.ordinal, this.queue.length), 0, gateId);
+		this.reconcile();
+	}
 
 	constructor(
 		private readonly server: NotificationServer,
@@ -390,7 +602,12 @@ class GatePresentationRegistry {
 	) {}
 
 	retain(presentation: UnattendedGatePresentation): void {
+		const alreadyPresent = this.presentations.has(presentation.gateId);
+		if (!alreadyPresent) this.queue.push(presentation.gateId);
 		this.presentations.set(presentation.gateId, presentation);
+		// A fresh durable replay is explicit production recovery after transient N-API exhaustion.
+		if (alreadyPresent) this.recover(presentation.gateId);
+		else this.#promote();
 	}
 
 	routeFor(actionId: string): string | undefined {
@@ -402,10 +619,12 @@ class GatePresentationRegistry {
 		return gateId ? this.presentations.get(gateId) : undefined;
 	}
 
+	/** The native generic claim has already resolved this old action. */
 	toggle(actionId: string, label: string): boolean {
 		const presentation = this.presentationFor(actionId);
 		if (!presentation?.multi || !presentation.options.includes(label)) return false;
-		this.closeInteraction(actionId, "toggle");
+		this.routes.delete(actionId);
+		if (this.active?.actionId === actionId) this.active = undefined;
 		const selected = new Set(presentation.selectedOptions);
 		if (selected.has(label)) selected.delete(label);
 		else selected.add(label);
@@ -414,19 +633,99 @@ class GatePresentationRegistry {
 		return true;
 	}
 
+	/** Clears an interactive route only when it is still the route that settled. */
+	completeInteractive(gateId: string, actionId: string): void {
+		if (this.routes.get(actionId) !== gateId) return;
+		this.routes.delete(actionId);
+		if (this.active?.actionId === actionId) this.active = undefined;
+		for (const routeGateId of this.routes.values()) {
+			if (routeGateId === gateId) return;
+		}
+		const presentation = this.presentations.get(gateId);
+		if (!presentation) return;
+		this.presentations.delete(gateId);
+		this.directControls.delete(gateId);
+		this.queuedDirectControls.delete(gateId);
+		this.retiredProofs.delete(gateId);
+		this.retries.delete(gateId);
+		this.#clearTerminalCancellation(gateId);
+
+		const index = this.queue.indexOf(gateId);
+		if (index >= 0) this.queue.splice(index, 1);
+		presentation.onClosed?.();
+		this.#promote();
+	}
+
+	/** Clears an interactive presentation after its route was retired for direct control. */
+	completeDirect(gateId: string): void {
+		const presentation = this.presentations.get(gateId);
+		if (!presentation) return;
+		this.presentations.delete(gateId);
+		this.directControls.delete(gateId);
+		this.queuedDirectControls.delete(gateId);
+		this.retiredProofs.delete(gateId);
+		this.retries.delete(gateId);
+		this.#clearTerminalCancellation(gateId);
+
+		const index = this.queue.indexOf(gateId);
+		if (index >= 0) this.queue.splice(index, 1);
+		presentation.onClosed?.();
+		this.#promote();
+	}
+
+	/** Cancelling the source revokes every interactive route for its presentation. */
+	#discardInteractive(gateId: string): void {
+		const active = this.active;
+		if (active?.gateId === gateId) {
+			try {
+				this.server.retireIfUnclaimed(active);
+			} catch (error) {
+				logger.warn(`notifications: interactive route retirement failed: ${String(error)}`);
+			}
+		}
+		for (const [actionId, routeGateId] of this.routes) {
+			if (routeGateId !== gateId) continue;
+			this.routes.delete(actionId);
+			if (this.active?.actionId === actionId) this.active = undefined;
+		}
+		const presentation = this.presentations.get(gateId);
+		if (!presentation) return;
+		this.presentations.delete(gateId);
+		this.directControls.delete(gateId);
+		this.queuedDirectControls.delete(gateId);
+		this.retiredProofs.delete(gateId);
+		this.retries.delete(gateId);
+		this.#clearTerminalCancellation(gateId);
+
+		const index = this.queue.indexOf(gateId);
+		if (index >= 0) this.queue.splice(index, 1);
+		presentation.onClosed?.();
+		this.#promote();
+	}
+
+	reissueAfterFailure(actionId: string): void {
+		const gateId = this.routes.get(actionId);
+		if (!gateId) return;
+		this.routes.delete(actionId);
+		if (this.active?.actionId === actionId) this.active = undefined;
+		this.reconcile();
+	}
+
 	reissue(gateId: string): string | undefined {
 		const presentation = this.presentations.get(gateId);
-		if (!presentation) return undefined;
-		const actionId = `gate-interaction:${crypto.randomUUID()}`;
+		if (!presentation || this.directControls.has(gateId) || this.active) return undefined;
+		const actionId = `${presentation.workflowGateId ? "gate-interaction" : "ask"}:${crypto.randomUUID()}`;
 		this.routes.set(actionId, gateId);
 		try {
-			this.server.registerAsk(
+			const lease = this.server.registerArbitratedAsk(
 				JSON.stringify(
 					notificationActionPayload(
 						{
+							type: "action_needed",
 							id: actionId,
 							kind: "ask",
 							sessionId: presentation.sessionId,
+							...(presentation.workflowGateId ? { workflowGateId: presentation.workflowGateId } : {}),
 							question:
 								presentation.selectedOptions.length > 0
 									? `(${presentation.selectedOptions.length} selected) ${presentation.question}`
@@ -441,41 +740,98 @@ class GatePresentationRegistry {
 											enabled: presentation.allowEmpty || presentation.selectedOptions.length > 0,
 										},
 									]
-								: [],
+								: presentation.controls,
 						},
 						{ redact: this.redact(), sessionTag: this.tag },
 					),
 				),
 				true,
 			);
+			if (lease.actionId !== actionId) throw new Error("native arbitrated action id mismatch");
+			this.active = { actionId, gateId, registrationEpoch: lease.registrationEpoch };
+			this.retries.delete(gateId);
+			presentation.onActivated?.(actionId, lease);
 			return actionId;
-		} catch (error) {
+		} catch {
 			this.routes.delete(actionId);
-			logger.warn(`notifications: registerAsk (gate interaction) failed: ${String(error)}`);
+			const previous = this.retries.get(gateId);
+			const attempts = (previous?.attempts ?? 0) + 1;
+			const exhausted = attempts >= PresentationArbiter.maxRegistrationAttempts;
+			const delay = Math.min(
+				PresentationArbiter.retryMaxDelayMs,
+				PresentationArbiter.retryBaseDelayMs * 2 ** (attempts - 1),
+			);
+			this.retries.set(gateId, { attempts, exhausted, nextAt: Date.now() + delay });
+			logger.warn("workflow_gate_presentation_retry", {
+				gateId,
+				attempts,
+				maxAttempts: PresentationArbiter.maxRegistrationAttempts,
+				exhausted,
+				delayMs: exhausted ? undefined : delay,
+			});
+			// Exhaustion fences this queue head. Ordinary asks then terminally cancel
+			// through the same cancellation path so their caller cannot wait forever;
+			// durable workflow gates remain fenced for explicit recovery or cancellation.
+			if (exhausted) this.#scheduleTerminalCancellation(gateId);
+			else this.#scheduleRetry(gateId);
 			return undefined;
 		}
 	}
 
-	closeInteraction(actionId: string, reason: string): void {
-		this.routes.delete(actionId);
-		try {
-			this.server.resolveLocal(actionId, undefined);
-		} catch {
-			// The native claim close already terminalizes this action when applicable.
+	closeInteraction(actionId: string, reason: string): boolean {
+		const gateId = this.routes.get(actionId);
+		const active = this.active;
+		if (!gateId || !active || active.actionId !== actionId) {
+			if (gateId) this.directControls.set(gateId, this.queue.indexOf(gateId));
+			logger.error(`notifications: terminalize ${actionId} lacks an exact active lease`);
+			return false;
 		}
-		void reason;
+		const status = parseRetireStatus(this.server.retireIfUnclaimed(active).status);
+		if (isTerminalProof(status)) {
+			this.routes.delete(actionId);
+			this.active = undefined;
+			void reason;
+			return true;
+		}
+		this.directControls.set(gateId, this.queue.indexOf(gateId));
+		logger.error(`notifications: terminalize ${actionId} returned ${status}`);
+		return false;
 	}
 
-	complete(gateId: string): void {
+	complete(gateId: string): WorkflowGateTerminalProof {
+		let proof = this.retiredProofs.get(gateId);
 		for (const [actionId, routeGateId] of this.routes) {
 			if (routeGateId !== gateId) continue;
-			this.closeInteraction(actionId, "gate_complete");
+			if (!this.closeInteraction(actionId, "gate_complete"))
+				throw new Error(`workflow gate ${gateId} presentation lacks exact terminal proof`);
+			proof = "retired";
 		}
+		const presentation = this.presentations.get(gateId);
+		if (!proof && this.queuedDirectControls.has(gateId)) proof = "not_published";
+		if (!proof && presentation)
+			throw new Error(`workflow gate ${gateId} presentation lacks an active terminal lease`);
 		this.presentations.delete(gateId);
+		this.directControls.delete(gateId);
+		this.queuedDirectControls.delete(gateId);
+		this.retiredProofs.delete(gateId);
+		this.retries.delete(gateId);
+		this.#clearTerminalCancellation(gateId);
+
+		const index = this.queue.indexOf(gateId);
+		if (index >= 0) this.queue.splice(index, 1);
+		presentation?.onClosed?.();
+		this.#promote();
+		return proof ?? "already_terminal";
+	}
+
+	cancelInteractive(): void {
+		for (const [gateId, presentation] of this.presentations) {
+			if (!presentation.workflowGateId) this.#discardInteractive(gateId);
+		}
 	}
 
 	cancel(gateId: string, reason: string): void {
-		this.complete(gateId);
+		this.#discardInteractive(gateId);
 		void reason;
 	}
 
@@ -504,15 +860,25 @@ interface SessionRuntime {
 	disposeGateListener: () => void;
 	/** Whether notification-only delivery and answer resources are active. */
 	notificationsActive: boolean;
+	/** Set as soon as terminal teardown is requested, before startup settles. */
+	stopping: boolean;
 	/** Recreates notification-only resources after `/notify on`. */
 	enableNotifications: () => void;
 	/** Deregisters canonical workflow-gate terminal cleanup. */
 	disposeGateTerminalController: () => void;
 	disposeAckRecoveryParticipant: () => void;
 	disposeGateEmitterListener: () => void;
+	waitForGateResolutionQuiescence: () => Promise<void>;
+	trackGateResolution: <T>(resolution: Promise<T>) => Promise<T>;
 	workflowGate?: WorkflowGateEmitter;
-	gatePresentations?: GatePresentationRegistry;
+	gatePresentations?: PresentationArbiter;
 	redact: boolean;
+	/** True only after the exact host generation was registered with the broker index. */
+	brokerRegistrationActive: boolean;
+	/** Terminal cleanup proof retained across retries; each owner is released at most once after proof. */
+	hostStopped: boolean;
+	serverStopped: boolean;
+	brokerRegistrationReleased: boolean;
 	verbosity: "lean" | "verbose";
 	sessionTag: string;
 	/** Whether the agent loop is currently running (drives the typing indicator). */
@@ -522,7 +888,21 @@ interface SessionRuntime {
 	/** Identity bound to the agent lifecycle currently in flight. */
 	activePromptCorrelation?: { commandId: string; turnId: string };
 	/** Records a correlated prompt terminal boundary after agent unwind. */
-	recordPromptTerminal: (correlation: { commandId: string; turnId: string } | undefined) => void;
+	/** Atomically claims a correlated prompt terminal boundary after agent unwind. */
+	recordPromptTerminal: (correlation: { commandId: string; turnId: string } | undefined) => boolean;
+	/** Records correlated lifecycle frames for replay and delivers them only to the accepted requester after acknowledgement. */
+	emitPromptLifecycle: (
+		correlation: { commandId: string; turnId: string } | undefined,
+		frame:
+			| { type: "agent_start" | "agent_end"; sessionId: string; commandId?: string; turnId?: string }
+			| {
+					type: "agent_failed";
+					sessionId: string;
+					commandId: string;
+					turnId: string;
+					error: { code: string; message: string };
+			  },
+	) => void;
 	/** Inbound Telegram update ids injected but not yet consumed by a turn. */
 	pendingInbound: Set<number>;
 	/** Latest assistant text of the in-flight turn (from message_update). */
@@ -539,42 +919,97 @@ interface SessionRuntime {
 	/** True between turn_end and the next turn_start: drops late async message_update
 	 * frames so a stale live edit can never be emitted after the finalized turn. */
 	turnClosed?: boolean;
+	/** Started tool calls awaiting a terminal activity frame, keyed by tool call id. */
+	inFlightTools: Map<string, { toolName: string; args: unknown }>;
 	/** Cancels the postmortem cleanup that emits `session_closed` on process teardown. */
 	cancelPostmortemCleanup: () => void;
-	/** Stops optional broker presence heartbeats. */
-	stopBrokerHeartbeat: () => void;
 }
+
+const SENSITIVE_MODEL_LABEL =
+	/(?:\b(?:https?|wss?):\/\/|\b[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}\b|\b(?:api[-_ ]?key|access[-_ ]?token|bearer|secret|password|account(?:\s*id)?|email|exception|stack trace)\b|\b(?:sk|pk|rk)-[A-Za-z0-9_-]{12,}\b)/i;
+const TOOL_SUMMARY_MAX = 280;
+const EMPTY_CAPABILITIES: ReadonlySet<string> = new Set();
+
+/** Stable projection of the tool-owned safe-display seam (never the full Tool surface). */
+type SafeSummaryTool = Pick<Tool, "safeSummary" | "safeSummaryFields">;
+
+export function projectToolSummary(
+	tool: SafeSummaryTool | undefined,
+	kind: "args" | "result",
+	value: unknown,
+): string | undefined {
+	let summary: string | undefined;
+	try {
+		if (tool?.safeSummary) {
+			summary = tool.safeSummary(kind, value);
+		} else {
+			const fields = tool?.safeSummaryFields?.[kind];
+			if (fields) {
+				const source =
+					value && typeof value === "object" && !Array.isArray(value)
+						? (value as Record<string, unknown>)
+						: undefined;
+				if (source) {
+					const projected: Record<string, unknown> = {};
+					for (const field of fields) if (Object.hasOwn(source, field)) projected[field] = source[field];
+					summary = JSON.stringify(projected);
+				}
+			}
+		}
+	} catch {
+		return undefined;
+	}
+	if (typeof summary !== "string") return undefined;
+	const normalized = summary.replace(/[\u0000-\u001F\u007F-\u009F\u202A-\u202E\u2066-\u2069]/g, " ").trim();
+	if (!normalized || SENSITIVE_MODEL_LABEL.test(normalized)) return undefined;
+	return truncate(normalized, TOOL_SUMMARY_MAX);
+}
+
+/** Request-local requester authority for stable ControlSurface dispatches. */
+const controlRequesterContext = new AsyncLocalStorage<string>();
+type SessionStartStatus = "started" | "already" | "disabled" | "failed";
+type SessionStartResult = {
+	status: SessionStartStatus;
+	runtime?: SessionRuntime;
+	failure?: SdkStartupFailure;
+};
 
 function pushSessionFrame(
 	runtime: Pick<SessionRuntime, "server" | "host">,
 	frame: { type: string; [key: string]: unknown },
 ): void {
-	runtime.server.pushFrame(JSON.stringify(frame));
 	runtime.host.emitEvent({ kind: frame.type, payload: frame });
+	if (frame.type === "turn_stream") {
+		runtime.server.pushTurnStreamUnchecked(
+			String(frame.sessionId),
+			frame.phase === "live" ? "live" : "finalized",
+			String(frame.text),
+			typeof frame.finalAnswer === "boolean" ? frame.finalAnswer : undefined,
+			typeof frame.messageRef === "string" ? frame.messageRef : undefined,
+		);
+		return;
+	}
+	runtime.server.pushFrame(JSON.stringify(frame));
+}
+
+function pushFileAttachment(
+	runtime: Pick<SessionRuntime, "server" | "host">,
+	frame: { type: "file_attachment"; sessionId: string; name: string; mime?: string; caption?: string },
+	data: Buffer,
+): void {
+	runtime.host.emitEvent({ kind: frame.type, payload: { ...frame, data: data.toString("base64") } });
+	runtime.server.pushFileAttachmentUnchecked(frame.sessionId, frame.name, frame.mime, data, frame.caption);
 }
 
 /** Agent lifecycle is SDK session truth, independent of optional chat delivery. */
 function emitAgentLifecycle(
 	runtime: Pick<SessionRuntime, "server" | "host">,
-	frame:
-		| { type: "agent_start" | "agent_end"; sessionId: string; commandId?: string; turnId?: string }
-		| {
-				type: "agent_failed";
-				sessionId: string;
-				commandId: string;
-				turnId: string;
-				error: { code: string; message: string };
-		  },
-	connectionId?: string,
+	frame: { type: "agent_start" | "agent_end"; sessionId: string; commandId?: string; turnId?: string },
 ): void {
-	// Lifecycle terminals remain replayable and are also sent directly to the
-	// requester. ACP/MCP/daemon prompt trackers cannot rely on a later replay to
-	// close an already acknowledged submission.
-	runtime.host.emitEvent({ kind: frame.type, payload: frame });
 	try {
 		const json = JSON.stringify(frame);
-		if (connectionId) runtime.server.sendTo(connectionId, json);
-		else runtime.server.pushFrame(json);
+		runtime.host.emitEvent({ kind: frame.type, payload: frame });
+		runtime.server.pushFrame(json);
 	} catch (error) {
 		logger.warn(`sdk: lifecycle delivery failed: ${String(error)}`);
 	}
@@ -637,9 +1072,16 @@ function turnTextMax(): number {
 	if (!Number.isFinite(raw) || raw <= 0) return TURN_TEXT_MAX_CEILING;
 	return Math.min(TURN_TEXT_MAX_CEILING, Math.max(280, raw));
 }
+function resolveNotificationConfig(settings: Settings): NotificationConfig {
+	const reader = settings as Partial<NotificationSettingsReader>;
+	return typeof reader.getNotificationSettingsSnapshot === "function"
+		? getNotificationConfig(reader as NotificationSettingsReader)
+		: defaultConfig;
+}
+
 function resolveSettings(settingsOverride?: Settings): ResolvedSettings {
 	if (settingsOverride)
-		return { settings: settingsOverride, cfg: getNotificationConfig(settingsOverride), settingsAvailable: true };
+		return { settings: settingsOverride, cfg: resolveNotificationConfig(settingsOverride), settingsAvailable: true };
 	try {
 		const settings = Settings.instance;
 		return { settings, cfg: getNotificationConfig(settings), settingsAvailable: true };
@@ -730,7 +1172,15 @@ interface NotificationControlCommandPayload {
 	name?: unknown;
 	action?: unknown;
 	level?: unknown;
+	global?: unknown;
+	selector?: unknown;
 	instructions?: unknown;
+}
+
+export interface NotificationControlCommandResult {
+	status: "ok" | "error" | "unavailable";
+	message: string;
+	modelChoices?: Array<{ selector: string; label: string }>;
 }
 
 function parseControlCommandPayload(json: string | undefined): NotificationControlCommandPayload | undefined {
@@ -772,62 +1222,209 @@ function formatLocalUsage(ctx: ExtensionContext): string {
 	].join("\n");
 }
 
-function cycleTelegramThinking(api: ExtensionAPI): ThinkingLevel | undefined {
-	const levels = [
-		ThinkingLevel.Off,
-		ThinkingLevel.Minimal,
-		ThinkingLevel.Low,
-		ThinkingLevel.Medium,
-		ThinkingLevel.High,
-		ThinkingLevel.XHigh,
-		ThinkingLevel.Max,
-	];
-	const current = api.getThinkingLevel() ?? ThinkingLevel.Off;
-	const currentIndex = levels.indexOf(current as (typeof levels)[number]);
-	const next = levels[(currentIndex + 1) % levels.length];
-	if (!next) return undefined;
-	api.setThinkingLevel(next);
-	return api.getThinkingLevel() ?? next;
+interface SafeUsageWindow {
+	kind: "5h" | "7d";
+	usedFraction?: number;
+	resetsAt?: number;
 }
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function classifyUsageWindow(limit: Record<string, unknown>): "5h" | "7d" | undefined {
+	const window = isRecord(limit.window) ? limit.window : undefined;
+	const scope = isRecord(limit.scope) ? limit.scope : undefined;
+	const ids = [window?.id, scope?.windowId, limit.id];
+	for (const id of ids) {
+		if (typeof id !== "string") continue;
+		const normalized = id.toLowerCase();
+		if (normalized === "5h" || normalized === "7d") return normalized;
+	}
+	const durationMs = window?.durationMs;
+	if (typeof durationMs !== "number" || !Number.isFinite(durationMs)) return undefined;
+	if (Math.abs(durationMs - 5 * 60 * 60_000) <= 30 * 60_000) return "5h";
+	if (Math.abs(durationMs - 7 * 24 * 60 * 60_000) <= 12 * 60 * 60_000) return "7d";
+	return undefined;
+}
+
+function getUsageUsedFraction(amount: Record<string, unknown> | undefined): number | undefined {
+	if (!amount) return undefined;
+	const usedFraction = amount.usedFraction;
+	if (typeof usedFraction === "number" && Number.isFinite(usedFraction)) return usedFraction;
+	const used = amount.used;
+	if (typeof used !== "number" || !Number.isFinite(used)) return undefined;
+	if (amount.unit === "percent") return used / 100;
+	const limit = amount.limit;
+	return typeof limit === "number" && Number.isFinite(limit) && limit !== 0 ? used / limit : undefined;
+}
+
+function formatStableResetTime(value: number): string | undefined {
+	if (!Number.isFinite(value)) return undefined;
+	try {
+		return new Date(value)
+			.toISOString()
+			.replace("T", " ")
+			.replace(/\.\d{3}Z$/, " UTC");
+	} catch {
+		return undefined;
+	}
+}
+
+function shouldReplaceUsageWindow(current: SafeUsageWindow, candidate: SafeUsageWindow): boolean {
+	if (candidate.usedFraction !== undefined) {
+		if (current.usedFraction === undefined || candidate.usedFraction > current.usedFraction) return true;
+		if (candidate.usedFraction < current.usedFraction) return false;
+	}
+	if (current.usedFraction !== undefined && candidate.usedFraction === undefined) return false;
+	if (candidate.resetsAt === undefined) return false;
+	return current.resetsAt === undefined || candidate.resetsAt < current.resetsAt;
+}
+
+function formatRemoteUsageWindows(reports: unknown): string[] {
+	if (!Array.isArray(reports)) return [];
+	const windows = new Map<SafeUsageWindow["kind"], SafeUsageWindow>();
+	for (const report of reports) {
+		if (!isRecord(report) || !Array.isArray(report.limits)) continue;
+		for (const value of report.limits) {
+			if (!isRecord(value)) continue;
+			const kind = classifyUsageWindow(value);
+			if (!kind) continue;
+			const window = isRecord(value.window) ? value.window : undefined;
+			const amount = isRecord(value.amount) ? value.amount : undefined;
+			const usedFraction = getUsageUsedFraction(amount);
+			const resetsAt = window?.resetsAt;
+			const candidate: SafeUsageWindow = {
+				kind,
+				...(typeof usedFraction === "number" && Number.isFinite(usedFraction) ? { usedFraction } : {}),
+				...(typeof resetsAt === "number" && Number.isFinite(resetsAt) ? { resetsAt } : {}),
+			};
+			const current = windows.get(kind);
+			if (!current || shouldReplaceUsageWindow(current, candidate)) windows.set(kind, candidate);
+		}
+	}
+	return (["5h", "7d"] as const).flatMap(kind => {
+		const window = windows.get(kind);
+		if (!window) return [];
+		const details = [kind === "5h" ? "5-hour limit" : "Weekly limit"];
+		if (window.usedFraction !== undefined) details.push(`${Number((window.usedFraction * 100).toFixed(1))}% used`);
+		const resetTime = window.resetsAt === undefined ? undefined : formatStableResetTime(window.resetsAt);
+		if (resetTime) details.push(`resets ${resetTime}`);
+		return [details.join(" — ")];
+	});
+}
+
+async function formatUsage(ctx: ExtensionContext, api: ExtensionAPI): Promise<string> {
+	const local = formatLocalUsage(ctx);
+	try {
+		const windows = formatRemoteUsageWindows(await api.fetchUsageReportsForControl());
+		return windows.length > 0 ? `${local}\n\nUsage windows\n${windows.join("\n")}` : local;
+	} catch {
+		logger.warn("notifications: usage report fetch failed");
+		return local;
+	}
+}
+
+function formatReasoningSettings(api: ExtensionAPI): string {
+	const level = api.getThinkingLevel() ?? ThinkingLevel.Off;
+	const display = api.getThinkingVisibility() === "visible" ? "on" : "off";
+	return [
+		"🧠 Reasoning Settings",
+		`Effort: ${level}`,
+		`Scope: ${api.getThinkingScopeForControl()}`,
+		`Display: ${display}`,
+		telegramControlCommandUsage("reasoning"),
+	].join("\n");
+}
+
+const TELEGRAM_MODEL_CHOICE_LIMIT = 40;
+
+function getModelChoices(ctx: ExtensionContext): Array<{ selector: string; label: string }> {
+	const choices = new Map<string, { selector: string; label: string }>();
+	for (const model of ctx.modelRegistry.getAvailable()) {
+		const selector = `${model.provider}/${model.id}`;
+		if (!choices.has(selector)) {
+			choices.set(selector, { selector, label: selector.replace(/[\u0000-\u001F\u007F]/g, " ") });
+		}
+	}
+	return [...choices.values()]
+		.sort((left, right) => left.selector.localeCompare(right.selector))
+		.slice(0, TELEGRAM_MODEL_CHOICE_LIMIT);
+}
+
+const CONTROL_COMMAND_FAILURE_MESSAGE = "Control command failed.";
+const STALE_MODEL_BUTTON_MESSAGE = "Button is stale. Run /model again.";
 
 export async function executeNotificationControlCommand(
 	command: NotificationControlCommandPayload | undefined,
 	ctx: ExtensionContext,
 	api: ExtensionAPI,
-): Promise<{ status: "ok" | "error" | "unavailable"; message: string }> {
+	expectedSessionId?: string,
+): Promise<NotificationControlCommandResult> {
+	try {
+		return await executeNotificationControlCommandUnchecked(command, ctx, api, expectedSessionId);
+	} catch {
+		logger.warn("notifications: control command failed");
+		return { status: "error", message: CONTROL_COMMAND_FAILURE_MESSAGE };
+	}
+}
+
+async function executeNotificationControlCommandUnchecked(
+	command: NotificationControlCommandPayload | undefined,
+	ctx: ExtensionContext,
+	api: ExtensionAPI,
+	expectedSessionId?: string,
+): Promise<NotificationControlCommandResult> {
 	if (!command || typeof command.name !== "string") return { status: "error", message: "Invalid control command." };
 	switch (command.name) {
 		case "reasoning": {
-			const current = api.getThinkingLevel() ?? ThinkingLevel.Off;
-			if (command.action === "status") return { status: "ok", message: `Reasoning effort: ${current}` };
+			const global = command.global === true;
+			if (command.action === "status") return { status: "ok", message: formatReasoningSettings(api) };
 			if (command.action === "cycle") {
-				const next = cycleTelegramThinking(api);
+				const next = api.cycleThinkingLevel();
 				return next
-					? { status: "ok", message: `Reasoning effort set to ${next}.` }
+					? { status: "ok", message: formatReasoningSettings(api) }
 					: { status: "unavailable", message: "Reasoning effort unavailable for this session." };
 			}
 			if (command.action === "set" && typeof command.level === "string") {
-				const parsed = parseThinkingLevel(command.level);
+				const requestedLevel = command.level.toLowerCase();
+				const level = requestedLevel === "none" ? "off" : requestedLevel === "reset" ? "inherit" : requestedLevel;
+				const parsed = parseThinkingLevel(level);
 				if (!parsed) return { status: "error", message: "Invalid reasoning effort." };
-				api.setThinkingLevel(parsed);
-				return { status: "ok", message: `Reasoning effort set to ${api.getThinkingLevel() ?? ThinkingLevel.Off}.` };
+				await api.setThinkingLevelForControl(parsed, global);
+				return { status: "ok", message: formatReasoningSettings(api) };
+			}
+			if (command.action === "show" || command.action === "hide") {
+				await api.setThinkingVisibilityForControl(command.action === "show" ? "visible" : "hidden", global);
+				return { status: "ok", message: formatReasoningSettings(api) };
 			}
 			return { status: "error", message: "Invalid reasoning command." };
 		}
 		case "usage":
-			return { status: "ok", message: formatLocalUsage(ctx) };
+			return { status: "ok", message: await formatUsage(ctx, api) };
 		case "context":
 			return { status: "ok", message: formatContextUsageLine(ctx) };
+		case "model": {
+			const choices = getModelChoices(ctx);
+			if (command.action === "list") {
+				return choices.length > 0
+					? { status: "ok", message: "Select a model.", modelChoices: choices }
+					: { status: "unavailable", message: "No models are available for this session." };
+			}
+			if (command.action !== "set" || typeof command.selector !== "string") {
+				return { status: "error", message: "Invalid model selection." };
+			}
+			const model = ctx.modelRegistry
+				.getAvailable()
+				.find(candidate => `${candidate.provider}/${candidate.id}` === command.selector);
+			if (!model) return { status: "error", message: "Invalid model selection." };
+			if (!(await api.setModelTemporaryForControl(model, expectedSessionId)))
+				return { status: "unavailable", message: "Model unavailable for this session." };
+			return { status: "ok", message: `Model set to ${command.selector}.` };
+		}
 		case "compact": {
 			const before = ctx.getContextUsage()?.tokens;
-			try {
-				await ctx.compact(typeof command.instructions === "string" ? command.instructions : undefined);
-			} catch (err) {
-				return {
-					status: "error",
-					message: `Compaction failed: ${err instanceof Error ? err.message : String(err)}`,
-				};
-			}
+			await ctx.compact(typeof command.instructions === "string" ? command.instructions : undefined);
 			const after = ctx.getContextUsage()?.tokens;
 			if (before != null && after != null)
 				return {
@@ -931,10 +1528,8 @@ async function requestRecoveredSelectedAck(
  * races the local UI against a remote reply). Returns the deregister disposer. */
 function registerInteractiveAnswerSource(
 	id: string,
-	server: NotificationServer,
 	pendingInteractive: Map<string, PendingInteractiveAsk>,
-	getRedact: () => boolean,
-	tag: string,
+	presentationArbiter: PresentationArbiter,
 ): () => void {
 	return registerAskAnswerSource(id, {
 		awaitAnswer(question, options, signal) {
@@ -947,52 +1542,52 @@ function registerInteractiveAnswerSource(
 		},
 		awaitAnswerRequest(request: AskAnswerRequest, signal?: AbortSignal): Promise<AskAnswerSourceResult> {
 			if (signal?.aborted) return Promise.resolve(undefined);
-			const register = (askId: string): boolean => {
-				try {
-					server.registerAsk(
-						JSON.stringify(
-							notificationActionPayload(
-								{
-									id: askId,
-									kind: "ask",
-									sessionId: id,
-									question: request.question,
-									options: request.options,
-									controls: request.controls,
-								},
-								{ redact: getRedact(), sessionTag: tag },
-							),
-						),
-						true,
-					);
-					return true;
-				} catch (error) {
-					logger.warn(`notifications: registerAsk failed: ${String(error)}`);
-					return false;
-				}
-			};
-			let activeAskId = `ask:${crypto.randomUUID()}`;
-			if (!register(activeAskId)) return Promise.resolve(undefined);
+			const presentationId = `interactive:${crypto.randomUUID()}`;
 			return new Promise<AskAnswerSourceResult>(resolve => {
+				let settled = false;
+				const settle = (result: AskAnswerSourceResult) => {
+					if (settled) return;
+					settled = true;
+					resolve(result);
+				};
 				const pending: PendingInteractiveAsk = {
-					resolve,
+					resolve: settle,
 					options: request.options,
 					controls: request.controls,
+					retireForDirectControl: () => presentationArbiter.retireForDirectControl(presentationId),
 					reissue: () => {
-						const nextAskId = `ask:${crypto.randomUUID()}`;
-						if (!register(nextAskId)) return false;
-						activeAskId = nextAskId;
-						pendingInteractive.set(nextAskId, pending);
+						if (!pending.actionId) return false;
+						presentationArbiter.reissueAfterFailure(pending.actionId);
 						return true;
 					},
+					complete: actionId => presentationArbiter.completeInteractive(presentationId, actionId),
+					completeDirect: () => presentationArbiter.completeDirect(presentationId),
+					fail: actionId => presentationArbiter.completeInteractive(presentationId, actionId),
 				};
-				pendingInteractive.set(activeAskId, pending);
+				presentationArbiter.retain({
+					gateId: presentationId,
+					sessionId: id,
+					question: request.question,
+					options: request.options,
+					controls: request.controls,
+					multi: false,
+					allowEmpty: false,
+					selectedOptions: [],
+					onActivated: (actionId, lease) => {
+						if (pending.actionId && pendingInteractive.get(pending.actionId) === pending)
+							pendingInteractive.delete(pending.actionId);
+						pending.actionId = actionId;
+						pendingInteractive.set(actionId, pending);
+						void lease;
+					},
+					onClosed: () => {
+						if (pending.actionId && pendingInteractive.get(pending.actionId) === pending)
+							pendingInteractive.delete(pending.actionId);
+						settle(undefined);
+					},
+				});
 				signal?.addEventListener("abort", () => {
-					if (!pendingInteractive.delete(activeAskId)) return;
-					try {
-						server.resolveLocal(activeAskId, undefined);
-					} catch {}
-					resolve(undefined);
+					presentationArbiter.cancel(presentationId, "interactive_abort");
 				});
 			});
 		},
@@ -1005,6 +1600,10 @@ function sessionIdFromFile(file: string | undefined): string | undefined {
 	const base = path.basename(file).replace(/\.jsonl$/, "");
 	const underscore = base.indexOf("_");
 	return underscore >= 0 ? base.slice(underscore + 1) : undefined;
+}
+
+function safeLifecycleRequestId(value: string | undefined): string | undefined {
+	return value && /^[A-Za-z0-9._-]{1,128}$/.test(value) ? value : undefined;
 }
 
 function validateProviderDefinitions(capability: string, definitions: unknown): void {
@@ -1083,6 +1682,30 @@ const QUERY_BINDINGS: Readonly<Record<string, string | undefined>> = {
 	"runtime.jobs.list": "getJobs",
 };
 
+function hasTerminalArbitrationCapability(
+	workflowGate: WorkflowGateEmitter | undefined,
+): workflowGate is WorkflowGateEmitter &
+	Required<
+		Pick<
+			WorkflowGateEmitter,
+			| "resolveGate"
+			| "recoverAcceptedGates"
+			| "lookupCompletedResolution"
+			| "prepareTerminalization"
+			| "clearPreparedTerminalization"
+			| "registerGateTerminalController"
+		>
+	> {
+	return (
+		typeof workflowGate?.resolveGate === "function" &&
+		typeof workflowGate.recoverAcceptedGates === "function" &&
+		typeof workflowGate.lookupCompletedResolution === "function" &&
+		typeof workflowGate.prepareTerminalization === "function" &&
+		typeof workflowGate.clearPreparedTerminalization === "function" &&
+		typeof workflowGate.registerGateTerminalController === "function"
+	);
+}
+
 function installedOperations(ctx: ExtensionContext, kind: "control" | "query"): Set<string> {
 	const bindings = new Set(ctx.sdkBindings?.() ?? []);
 	const required = kind === "control" ? CONTROL_BINDINGS : QUERY_BINDINGS;
@@ -1092,7 +1715,7 @@ function installedOperations(ctx: ExtensionContext, kind: "control" | "query"): 
 			(kind !== "control" ||
 				(!UNINSTALLED_CONTROL_OPERATIONS.has(operation.sdkId) &&
 					((operation.sdkId !== "workflow.gate_answer" && operation.sdkId !== "workflow.plan_approve") ||
-						ctx.workflowGate !== undefined) &&
+						hasTerminalArbitrationCapability(ctx.workflowGate)) &&
 					(!required[operation.sdkId] || bindings.has(required[operation.sdkId]!)))),
 	);
 	return new Set(candidates.map(operation => operation.sdkId));
@@ -1101,6 +1724,7 @@ function installedOperations(ctx: ExtensionContext, kind: "control" | "query"): 
 function sdkQuerySurface(
 	ctx: ExtensionContext,
 	id: string,
+	api: ExtensionAPI,
 	getInstalledDefinitions: (capability: string) => unknown | undefined = () => undefined,
 	getLiveState: () => { isStreaming: boolean; steeringQueueDepth: number; followupQueueDepth: number } = () => ({
 		isStreaming: false,
@@ -1115,9 +1739,21 @@ function sdkQuerySurface(
 		cwd: ctx.cwd,
 		kind: ctx.sessionMetadata?.kind ?? "main",
 	});
-	const sessionManager = ctx.sessionManager as typeof ctx.sessionManager & {
-		getLastAssistantText?: () => string | undefined;
-		getLastAssistantMessage?: () => unknown;
+	const lastAssistantText = () => {
+		for (const entry of ctx.sessionManager.getBranch().toReversed()) {
+			if (entry.type !== "message" || entry.message.role !== "assistant") continue;
+			const { content } = entry.message;
+			if (typeof content === "string") return content;
+			if (Array.isArray(content))
+				return content
+					.filter(
+						(block): block is { type: "text"; text: string } =>
+							block.type === "text" && typeof block.text === "string",
+					)
+					.map(block => block.text)
+					.join("");
+		}
+		return undefined;
 	};
 	const getDiff = async () => {
 		try {
@@ -1157,16 +1793,26 @@ function sdkQuerySurface(
 			typeof (ctx as Partial<ExtensionContext>).getTodoState === "function" ? ctx.getTodoState() : [],
 		getDiff,
 		getUsage: () => ctx.sessionManager.getUsageStatistics(),
-		getModels: () =>
-			ctx.modelRegistry.getAll().map(model => ({
-				provider: model.provider,
-				id: model.id,
-				name: model.name,
-				contextWindow: model.contextWindow,
-				maxTokens: model.maxTokens,
-			})),
+		getModels: () => {
+			const models = ctx.modelRegistry.getAll();
+			const currentModel = ctx.model;
+			const currentThinkingLevel = api.getThinkingLevel();
+			return projectQ10Models({ models, currentModel, currentThinkingLevel });
+		},
 		getSkillState: () => ctx.getSkillState(),
-		getGates: () => ctx.workflowGate?.listPendingGates?.() ?? [],
+		getGates: () => {
+			const workflowGate = ctx.workflowGate;
+			if (!workflowGate) return [];
+			return (
+				workflowGate.listWorkflowGateQueryRecords?.() ??
+				workflowGate.listPendingGates?.().map(gate => ({
+					...gate,
+					id: `pending:${gate.gate_id}`,
+					tag: "pending" as const,
+				})) ??
+				[]
+			);
+		},
 		getConfigItems: () => {
 			const items = ctx.getConfigItems();
 			return items && typeof items === "object" && !Array.isArray(items)
@@ -1177,7 +1823,8 @@ function sdkQuerySurface(
 		getSessionMetadata: metadata,
 		getStats: () => ctx.sessionManager.getUsageStatistics(),
 		getBranchCandidates: () => ctx.getBranchCandidates(),
-		getLastAssistant: () => sessionManager.getLastAssistantText?.() ?? sessionManager.getLastAssistantMessage?.(),
+		getLastAssistant: lastAssistantText,
+
 		getCapabilities: () => ({
 			operations: [...installedOperations(ctx, "control"), ...installedOperations(ctx, "query")],
 			hostTools: getInstalledDefinitions("host_tools") !== undefined,
@@ -1210,10 +1857,16 @@ function containsSecretConfigKey(value: unknown, seen = new Set<object>()): bool
 function sdkControlSurface(
 	ctx: ExtensionContext,
 	pendingInteractive: Map<string, PendingInteractiveAsk>,
+	gatePresentations: PresentationArbiter | undefined,
 	api: ExtensionAPI,
 	isBusy: () => boolean,
-	onPromptAccepted: (correlation: { commandId: string; turnId: string }) => void = () => {},
+	onPromptAccepted: (
+		correlation: { commandId: string; turnId: string },
+		requesterConnectionId?: string,
+	) => void = () => {},
 	onPromptFailed: (correlation: { commandId: string; turnId: string }, error: unknown) => void = () => {},
+	acceptGateResolution: () => boolean,
+	trackGateResolution: <T>(resolution: Promise<T>) => Promise<T>,
 	settings?: Settings,
 	configOverrides: Map<string, unknown> = new Map(),
 	configRevision: { current: number } = { current: 0 },
@@ -1222,8 +1875,35 @@ function sdkControlSurface(
 		throw Object.assign(new Error(`${operation} is unavailable: ${reason}`), { code: "unavailable" });
 	};
 	const bindings = new Set(ctx.sdkBindings?.() ?? []);
-	const send = (text: string, deliverAs?: "steer" | "followUp") => {
-		api.sendUserMessage(text, deliverAs ? { deliverAs } : undefined);
+	const missingExpectedSessionAudits = new Set<"workflow.gate_answer" | "workflow.plan_approve">();
+	const auditMissingExpectedSessionId = (operation: "workflow.gate_answer" | "workflow.plan_approve") => {
+		if (missingExpectedSessionAudits.has(operation)) return;
+		missingExpectedSessionAudits.add(operation);
+		logger.warn("workflow_control_missing_expected_session_id", { operation });
+	};
+	const reconcileUnknownGateFailure = (gateId: string): "pending" | "terminal" | "unavailable" => {
+		const pending = ctx.workflowGate?.listPendingGates;
+		if (!pending) return "unavailable";
+		try {
+			return pending().some(gate => gate.gate_id === gateId) ? "pending" : "terminal";
+		} catch {
+			logger.warn("workflow_gate_reconciliation_unavailable", { gateId });
+			return "unavailable";
+		}
+	};
+	const reconcileDirectControlFailure = (gateId: string): DirectControlOutcome => {
+		const durable = reconcileUnknownGateFailure(gateId);
+		if (durable === "pending") return "rejected";
+		if (durable === "terminal") return "accepted";
+		try {
+			ctx.workflowGate?.quarantineGate?.(gateId);
+		} catch {
+			// The local arbiter still fails closed when the durable fence is unavailable.
+		}
+		return "unknown";
+	};
+	const sendSteer = (text: string) => {
+		api.sendUserMessage(text, { deliverAs: "steer" });
 		return { commandId: crypto.randomUUID(), accepted: true };
 	};
 	const resolveModel = (id: string) => {
@@ -1246,18 +1926,34 @@ function sdkControlSurface(
 	const cancelPendingPreflights = () => {
 		for (const cancel of pendingPreflightCancellations) cancel();
 	};
+	const isSessionBusy = () => isBusy() || ctx.isIdle?.() === false;
 	const awaitAbortReady = async () => {
+		cancelPendingPreflights();
 		await (ctx.abort as () => unknown)();
-		while (isBusy() || !ctx.isIdle()) {
+		while (isSessionBusy()) {
 			await Bun.sleep(10);
 		}
 	};
-	const submitPrompt = async (text: string, images: unknown, forceFresh = false) => {
-		if (forceFresh && (isBusy() || !ctx.isIdle())) {
+	const submitPrompt = async (
+		text: string,
+		images: unknown,
+		forceFresh = false,
+		deliverAs?: "steer" | "followUp",
+		rejectWhenBusy = false,
+		requesterConnectionId?: string,
+	) => {
+		if (forceFresh && isSessionBusy()) {
 			throw Object.assign(new Error("Previous turn did not finish aborting before replacement prompt submission."), {
 				code: "busy",
 			});
 		}
+		if (rejectWhenBusy && isSessionBusy())
+			throw Object.assign(
+				new Error("turn.prompt is unavailable while the agent is busy; use turn.steer explicitly."),
+				{
+					code: "busy",
+				},
+			);
 		const promptImages = Array.isArray(images) ? (images as { data: string; mimeType?: string }[]) : [];
 		const content: string | (TextContent | ImageContent)[] =
 			promptImages.length > 0
@@ -1289,7 +1985,7 @@ function sdkControlSurface(
 		const onPreflightAccepted = () => {
 			if (preflightSettled) return;
 			accepted = true;
-			onPromptAccepted(correlation);
+			onPromptAccepted(correlation, requesterConnectionId);
 			settlePreflight({ status: "accepted" });
 		};
 		// Do not acknowledge the prompt until AgentSession's async preflight
@@ -1298,7 +1994,7 @@ function sdkControlSurface(
 		try {
 			submission = Promise.resolve(
 				api.sendUserMessage(content, {
-					...(!forceFresh && isBusy() ? { deliverAs: "steer" as const } : {}),
+					...(deliverAs ? { deliverAs } : !forceFresh && isBusy() ? { deliverAs: "steer" as const } : {}),
 					onPreflightAccepted,
 				}),
 			);
@@ -1331,33 +2027,180 @@ function sdkControlSurface(
 			pendingPreflightCancellations.delete(cancelPreflight);
 		}
 	};
-	const surface: ControlSurface = {
-		prompt: (text, images) => submitPrompt(text, images),
-		steer: text => send(text, "steer"),
-		followUp: text => send(text, "followUp"),
+	const surface: ControlSurface & { cancelPendingPreflights(): void } = {
+		prompt: (text, images) => submitPrompt(text, images, false, undefined, true, controlRequesterContext.getStore()),
+		steer: text => sendSteer(text),
+		followUp: text => submitPrompt(text, undefined, false, "followUp", false, controlRequesterContext.getStore()),
 		abort: () => {
 			cancelPendingPreflights();
 			ctx.abort();
 			return { aborted: true };
 		},
 		abortAndPrompt: async text => {
-			cancelPendingPreflights();
 			await awaitAbortReady();
-			return await submitPrompt(text, undefined, true);
+			return await submitPrompt(text, undefined, true, undefined, false, controlRequesterContext.getStore());
 		},
+		cancelPendingPreflights,
 		answerAsk: (id, answer) => {
 			const pending = pendingInteractive.get(id);
 			if (!pending) throw Object.assign(new Error(`Ask ${id} was not found.`), { code: "resource_gone" });
-			pendingInteractive.delete(id);
+			const outcome = pending.retireForDirectControl();
+			if (outcome === "claimed")
+				throw Object.assign(new Error("The active action is already being answered."), { code: "action_claimed" });
+			if (outcome === "stale") throw Object.assign(new Error(`Ask ${id} was not found.`), { code: "resource_gone" });
+			if (pendingInteractive.get(id) === pending) pendingInteractive.delete(id);
 			pending.resolve(mapAnswerToLabel(JSON.stringify(answer), pending.options));
+			pending.completeDirect();
 			return { resolved: true };
 		},
-		answerGate: (id, response) =>
-			ctx.workflowGate?.resolveGate?.({ gate_id: id, answer: response, idempotency_key: id }) ??
-			unavailable("workflow.gate_answer", "workflow gates are unavailable for this session")(),
-		approvePlan: (id, choice) =>
-			ctx.workflowGate?.resolveGate?.({ gate_id: id, answer: choice, idempotency_key: id }) ??
-			unavailable("workflow.plan_approve", "workflow gates are unavailable for this session")(),
+		answerGate: async (id, response, expectedSessionId, idempotencyKey) => {
+			if (!acceptGateResolution())
+				throw Object.assign(new Error("Workflow gate is no longer answerable."), { code: "resource_gone" });
+			if (expectedSessionId === undefined) auditMissingExpectedSessionId("workflow.gate_answer");
+			if (expectedSessionId !== undefined && expectedSessionId !== ctx.sessionManager.getSessionId())
+				throw Object.assign(new Error("Workflow gate session does not match this endpoint."), {
+					code: "resource_gone",
+				});
+			const presentations = gatePresentations;
+			if (!presentations)
+				throw Object.assign(new Error("Workflow gates are unavailable for this session."), {
+					code: "resource_gone",
+				});
+			const workflowGate = ctx.workflowGate;
+			if (!hasTerminalArbitrationCapability(workflowGate))
+				throw Object.assign(new Error("Workflow gates are unavailable for this session."), {
+					code: "resource_gone",
+				});
+			const gateResponse = {
+				gate_id: id,
+				answer: response,
+				idempotency_key: idempotencyKey ?? id,
+			};
+			const completed = workflowGate.lookupCompletedResolution(gateResponse);
+			if (completed.kind === "completed") return completed.resolution;
+			if (completed.kind === "accepted_incomplete") {
+				await trackGateResolution(workflowGate.recoverAcceptedGates());
+				const recovered = workflowGate.lookupCompletedResolution(gateResponse);
+				if (recovered.kind === "completed") return recovered.resolution;
+				throw Object.assign(new Error("Workflow gate resolution outcome is uncertain."), {
+					code: "terminal_uncertain",
+				});
+			}
+			const prepared = presentations.prepareDirectControl(id);
+			if (!prepared || prepared.status === "stale")
+				throw Object.assign(new Error("Workflow gate is no longer answerable."), { code: "resource_gone" });
+			if (prepared.status === "claimed")
+				throw Object.assign(new Error("The active action is already being answered."), { code: "action_claimed" });
+			if (prepared.status !== "queued" && prepared.status !== "retired")
+				throw new Error(`Unexpected direct control preparation: ${prepared.status}`);
+			if (
+				workflowGate.prepareTerminalization(id, prepared.status === "queued" ? "not_published" : "retired") !== true
+			) {
+				presentations.finishDirectControl(id, prepared, "rejected");
+				throw Object.assign(new Error("Workflow gate lacks a terminalization proof."), { code: "resource_gone" });
+			}
+			try {
+				const resolution = await trackGateResolution(workflowGate.resolveGate(gateResponse));
+				const status = (resolution as { status?: unknown }).status;
+				if (status === "accepted" || status === "rejected") {
+					if (status === "rejected") workflowGate.clearPreparedTerminalization(id);
+					presentations.finishDirectControl(id, prepared, status);
+					return resolution;
+				}
+			} catch (error) {
+				const outcome = reconcileDirectControlFailure(id);
+				if (outcome === "rejected") workflowGate.clearPreparedTerminalization(id);
+				presentations.finishDirectControl(id, prepared, outcome);
+				if (outcome === "unknown")
+					throw Object.assign(new Error("Workflow gate resolution outcome is uncertain."), {
+						code: "terminal_uncertain",
+					});
+				throw error;
+			}
+			const outcome = reconcileDirectControlFailure(id);
+			if (outcome === "rejected") workflowGate.clearPreparedTerminalization(id);
+			presentations.finishDirectControl(id, prepared, outcome);
+			logger.warn("workflow_gate_direct_control_uncertain_outcome", {
+				operation: "workflow.gate_answer",
+				gateId: id,
+				outcome,
+			});
+			throw Object.assign(new Error("Workflow gate resolution outcome is uncertain."), {
+				code: "terminal_uncertain",
+			});
+		},
+		approvePlan: async (id, choice, expectedSessionId) => {
+			if (!acceptGateResolution())
+				throw Object.assign(new Error("Workflow plan is no longer answerable."), { code: "resource_gone" });
+			if (expectedSessionId === undefined) auditMissingExpectedSessionId("workflow.plan_approve");
+			if (expectedSessionId !== undefined && expectedSessionId !== ctx.sessionManager.getSessionId())
+				throw Object.assign(new Error("Workflow plan session does not match this endpoint."), {
+					code: "resource_gone",
+				});
+			const presentations = gatePresentations;
+			if (!presentations)
+				throw Object.assign(new Error("Workflow gates are unavailable for this session."), {
+					code: "resource_gone",
+				});
+			const workflowGate = ctx.workflowGate;
+			if (!hasTerminalArbitrationCapability(workflowGate))
+				throw Object.assign(new Error("Workflow gates are unavailable for this session."), {
+					code: "resource_gone",
+				});
+			const gateResponse = { gate_id: id, answer: choice, idempotency_key: id };
+			const completed = workflowGate.lookupCompletedResolution(gateResponse);
+			if (completed.kind === "completed") return completed.resolution;
+			if (completed.kind === "accepted_incomplete") {
+				await trackGateResolution(workflowGate.recoverAcceptedGates());
+				const recovered = workflowGate.lookupCompletedResolution(gateResponse);
+				if (recovered.kind === "completed") return recovered.resolution;
+				throw Object.assign(new Error("Workflow plan resolution outcome is uncertain."), {
+					code: "terminal_uncertain",
+				});
+			}
+			const prepared = presentations.prepareDirectControl(id);
+			if (!prepared || prepared.status === "stale")
+				throw Object.assign(new Error("Workflow plan is no longer answerable."), { code: "resource_gone" });
+			if (prepared.status === "claimed")
+				throw Object.assign(new Error("The active action is already being answered."), { code: "action_claimed" });
+			if (prepared.status !== "queued" && prepared.status !== "retired")
+				throw new Error(`Unexpected direct control preparation: ${prepared.status}`);
+			if (
+				workflowGate.prepareTerminalization(id, prepared.status === "queued" ? "not_published" : "retired") !== true
+			) {
+				presentations.finishDirectControl(id, prepared, "rejected");
+				throw Object.assign(new Error("Workflow plan lacks a terminalization proof."), { code: "resource_gone" });
+			}
+			try {
+				const resolution = await trackGateResolution(workflowGate.resolveGate(gateResponse));
+				const status = (resolution as { status?: unknown }).status;
+				if (status === "accepted" || status === "rejected") {
+					if (status === "rejected") workflowGate.clearPreparedTerminalization(id);
+					presentations.finishDirectControl(id, prepared, status);
+					return resolution;
+				}
+			} catch (error) {
+				const outcome = reconcileDirectControlFailure(id);
+				if (outcome === "rejected") workflowGate.clearPreparedTerminalization(id);
+				presentations.finishDirectControl(id, prepared, outcome);
+				if (outcome === "unknown")
+					throw Object.assign(new Error("Workflow plan resolution outcome is uncertain."), {
+						code: "terminal_uncertain",
+					});
+				throw error;
+			}
+			const outcome = reconcileDirectControlFailure(id);
+			if (outcome === "rejected") workflowGate.clearPreparedTerminalization(id);
+			presentations.finishDirectControl(id, prepared, outcome);
+			logger.warn("workflow_gate_direct_control_uncertain_outcome", {
+				operation: "workflow.plan_approve",
+				gateId: id,
+				outcome,
+			});
+			throw Object.assign(new Error("Workflow plan resolution outcome is uncertain."), {
+				code: "terminal_uncertain",
+			});
+		},
 		invokeSkill: (name, args) => {
 			if (!bindings.has("invokeSkill") || !ctx.invokeSkill)
 				return unavailable("skill.invoke", "no skill invocation seam is installed")();
@@ -1366,14 +2209,14 @@ function sdkControlSurface(
 				throw Object.assign(new Error("skill.invoke args must be a string."), { code: "invalid_input" });
 			return ctx.invokeSkill(name, args);
 		},
-		setPlanMode: on => {
+		setPlanMode: async on => {
 			if (!bindings.has("setPlanMode") || !ctx.setPlanMode)
 				return unavailable("mode.plan.set", "no plan-mode seam is installed")();
 
 			if (typeof on !== "boolean")
 				throw Object.assign(new Error("mode.plan.set requires a boolean on value."), { code: "invalid_input" });
 
-			return { state: ctx.setPlanMode(on) };
+			return { state: await ctx.setPlanMode(on) };
 		},
 		operateGoal: (op, objective) => {
 			if (!bindings.has("operateGoal") || !ctx.operateGoal)
@@ -1519,16 +2362,62 @@ export function createNotificationsExtension(
 	api: ExtensionAPI,
 	options: {
 		settings?: Settings;
+		ensureTelegramDaemon?: (input: {
+			settings: Settings;
+			cwd: string;
+			sessionId: string;
+		}) => Promise<EnsureDaemonResult>;
 		/** Suppress auto-delivery for a GJC-spawned child under `sessionScope=primary`. */
 		spawnedByGjc?: boolean;
+		controller?: NotificationSessionController;
+
 		onSdkRequest?: (kind: "control" | "query", connectionId: string, frame: Record<string, unknown>) => void;
 	} = {},
 ): void {
+	const lifecycleStartupCapability = lifecycleStartupCapabilityForApi(api);
 	const runtimes = new Map<string, SessionRuntime>();
-	const disabledSessions = new Set<string>();
+	const controller =
+		options.controller ??
+		new NotificationSessionController({
+			eligible: true,
+			getConfig: () => resolveSettings(options.settings).cfg,
+		});
+
+	// Failed terminal teardown remains fenced from normal runtime lookup while the
+	// exact runtime object retains authority for an explicit idempotent retry.
+	const cleanupRetries = new Map<string, SessionRuntime>();
+	const sessionStartPromises = new Map<string, Promise<SessionStartResult>>();
 	let activeRuntimeId: string | undefined;
 	let identityControlInFlight = false;
 	let deferredIdentityRotation: { event: { previousSessionFile?: string }; ctx: ExtensionContext } | undefined;
+
+	async function ensureTelegramOwner(
+		settings: Settings,
+		cwd: string,
+		id: string,
+	): Promise<"ready" | "blocked_identity"> {
+		if (options.ensureTelegramDaemon) {
+			return (await options.ensureTelegramDaemon({ settings, cwd, sessionId: id })) === "blocked"
+				? "blocked_identity"
+				: "ready";
+		}
+		return (await ensureTelegramDaemonRunningDetailed({ settings, cwd, sessionId: id })) === "blocked_identity"
+			? "blocked_identity"
+			: "ready";
+	}
+	async function ensureConfiguredDaemons(
+		settings: Settings,
+		cfg: NotificationConfig,
+		cwd: string,
+		id: string,
+	): Promise<boolean> {
+		if (isTelegramConfigured(cfg)) {
+			if ((await ensureTelegramOwner(settings, cwd, id)) === "blocked_identity") return false;
+		}
+		if (isDiscordConfigured(cfg)) await ensureDiscordDaemon(settings);
+		if (isSlackConfigured(cfg)) await ensureSlackDaemon(settings);
+		return true;
+	}
 	const identityControlOperations = new Set([
 		"session.new",
 		"session.fork",
@@ -1539,8 +2428,34 @@ export function createNotificationsExtension(
 	const sessionId = (ctx: ExtensionContext): string => ctx.sessionManager.getSessionId();
 	const sleep = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms));
 
-	async function stopSession(id: string, reason: "session" | "notifications" = "session"): Promise<boolean> {
-		const rt = runtimes.get(id);
+	async function stopSession(
+		id: string,
+		reason: "session" | "notifications" = "session",
+		expectedRuntime?: SessionRuntime,
+	): Promise<boolean> {
+		const retryRuntime = cleanupRetries.get(id);
+		const activeRuntime = runtimes.get(id);
+		const requestedRuntime = retryRuntime ?? activeRuntime;
+		if (expectedRuntime && requestedRuntime !== expectedRuntime) return false;
+		if (reason === "session" && requestedRuntime) requestedRuntime.stopping = true;
+		if (reason === "session" && requestedRuntime) {
+			// Fence the exact runtime before awaiting its startup promise: a late start
+			// must observe removal and clean itself up rather than becoming reachable.
+			if (runtimes.get(id) === requestedRuntime) runtimes.delete(id);
+			if (activeRuntimeId === id) activeRuntimeId = undefined;
+		}
+		const pendingStart = sessionStartPromises.get(id);
+		if (pendingStart)
+			void pendingStart
+				.catch(() => {})
+				.then(() => {
+					if (runtimes.get(id) === requestedRuntime || cleanupRetries.get(id) === requestedRuntime)
+						void stopSession(id, reason, requestedRuntime);
+				});
+		const rt = requestedRuntime;
+
+		if (expectedRuntime && rt !== expectedRuntime) return false;
+
 		if (!rt) {
 			if (activeRuntimeId === id) activeRuntimeId = undefined;
 			return false;
@@ -1553,17 +2468,17 @@ export function createNotificationsExtension(
 			try {
 				rt.disposeFileSink();
 			} catch {}
+			rt.gatePresentations?.cancelInteractive();
 			for (const pending of rt.pendingInteractive.values()) pending.resolve(undefined);
 			rt.pendingInteractive.clear();
 			return true;
 		}
-		runtimes.delete(id);
-		if (activeRuntimeId === id) activeRuntimeId = undefined;
+		// Keep this exact object authoritative for the full terminal release, including
+		// the interval before a failed owner can be recorded for a later retry.
+		cleanupRetries.set(id, rt);
+
 		try {
 			rt.cancelPostmortemCleanup();
-		} catch {}
-		try {
-			rt.stopBrokerHeartbeat();
 		} catch {}
 		try {
 			rt.disposeAnswerSource();
@@ -1575,8 +2490,9 @@ export function createNotificationsExtension(
 			rt.disposeGateListener();
 		} catch {}
 		try {
-			rt.disposeGateTerminalController();
+			rt.workflowGate?.setRuntimeTurnProvider?.(null);
 		} catch {}
+		await rt.waitForGateResolutionQuiescence();
 		try {
 			rt.disposeAckRecoveryParticipant();
 		} catch {}
@@ -1585,10 +2501,28 @@ export function createNotificationsExtension(
 		} catch {}
 		rt.gatePresentations?.dispose();
 		try {
-			await rt.host.stop();
-		} catch (e) {
-			logger.warn(`sdk host: stop failed: ${String(e)}`);
+			rt.disposeGateTerminalController();
+		} catch {}
+		let hostStopped = rt.hostStopped;
+		let brokerRegistrationReleased = rt.brokerRegistrationReleased;
+		const ownerReleaseFailures: unknown[] = [];
+
+		if (!hostStopped) {
+			try {
+				const stopped = await rt.host.stop();
+				hostStopped = stopped === "stopped";
+				brokerRegistrationReleased = !rt.brokerRegistrationActive || hostStopped;
+				if (rt.brokerRegistrationActive && hostStopped) rt.brokerRegistrationActive = false;
+				if (hostStopped) {
+					rt.hostStopped = true;
+					rt.brokerRegistrationReleased = brokerRegistrationReleased;
+				}
+			} catch (e) {
+				ownerReleaseFailures.push(e);
+				logger.warn(`sdk host: stop failed: ${String(e)}`);
+			}
 		}
+		rt.host.reverse.dispose();
 		// Resolve any still-pending interactive asks so the ask tool is not left hanging.
 		for (const pending of rt.pendingInteractive.values()) pending.resolve(undefined);
 		rt.pendingInteractive.clear();
@@ -1596,6 +2530,7 @@ export function createNotificationsExtension(
 			rt.cursors.close();
 			await rt.revisions.close();
 		} catch (e) {
+			ownerReleaseFailures.push(e);
 			logger.warn(`sdk query snapshots: close failed: ${String(e)}`);
 		}
 		let closeFrameSent = false;
@@ -1606,40 +2541,81 @@ export function createNotificationsExtension(
 			logger.warn(`notifications: session_closed failed: ${String(e)}`);
 		}
 		if (closeFrameSent) await sleep(100);
-		try {
-			rt.server.stop();
-		} catch (e) {
-			logger.warn(`notifications: stop failed: ${String(e)}`);
+		let serverStopped = rt.serverStopped;
+		if (!serverStopped) {
+			try {
+				await rt.server.stopAndWait();
+				serverStopped = true;
+				rt.serverStopped = true;
+			} catch (e) {
+				ownerReleaseFailures.push(e);
+				logger.warn(`notifications: stop failed: ${String(e)}`);
+			}
 		}
-		return true;
-	}
-
-	function isEnabledForSession(id: string, cfg: NotificationConfig): boolean {
-		return isSessionNotificationsEnabled({
-			cfg,
-			env: process.env,
-			sessionDisabled: disabledSessions.has(id),
-			spawnedByGjc: options.spawnedByGjc,
+		lifecycleStartupCapability?.rollback?.recordStop(rt.host.generation, {
+			runtimeRemoved: true,
+			hostStopped: rt.hostStopped && rt.serverStopped,
+			brokerRegistrationReleased: rt.brokerRegistrationReleased,
 		});
+		if (ownerReleaseFailures.length > 0) {
+			cleanupRetries.set(id, rt);
+			throw new AggregateError(ownerReleaseFailures, `SDK notification runtime ${id} owner release failed.`);
+		}
+		if (cleanupRetries.get(id) === rt) cleanupRetries.delete(id);
+		return true;
 	}
 
 	function isNotificationEligibleContext(ctx: ExtensionContext): boolean {
 		return ctx.sessionMetadata?.kind !== "sub";
 	}
 
-	async function startSession(ctx: ExtensionContext): Promise<"started" | "already" | "disabled" | "failed"> {
+	async function startSession(ctx: ExtensionContext): Promise<SessionStartResult> {
 		const id = sessionId(ctx);
+		const lifecycleRequestId = safeLifecycleRequestId(process.env.GJC_LIFECYCLE_REQUEST_ID);
 		const { settings, cfg, settingsAvailable } = resolveSettings(options.settings);
-		const notificationsEnabledForSession = isEnabledForSession(id, cfg);
+		const notificationsEnabledForSession = controller.query(ctx).effectiveEnabled;
 		const sdkEnabledForSession = shouldHostSdk(settings, isNotificationEligibleContext(ctx));
-		if (!isNotificationEligibleContext(ctx) || (!notificationsEnabledForSession && !sdkEnabledForSession))
-			return "disabled";
-		if (runtimes.has(id)) {
+		const lifecycleRequired = lifecycleStartupCapability !== undefined;
+		const failLifecycleStartup = (
+			reason: "disabled" | "ineligible" | "failed",
+			error?: unknown,
+		): SessionStartResult => {
+			const failure =
+				lifecycleStartupCapability?.normalizeFailure("startup", reason, error) ??
+				normalizeSdkStartupFailure("startup", reason, error);
+
+			lifecycleStartupCapability?.settleFailure(failure);
+			return { status: reason === "disabled" ? "disabled" : "failed", failure };
+		};
+		const throwIfLifecycleStopped = (): void => {
+			if (lifecycleStartupCapability?.cancelled || runtime?.stopping || runtimes.get(id) !== runtime)
+				throw new Error("Lifecycle SDK startup was cancelled.");
+		};
+
+		if (
+			!lifecycleRequired &&
+			(!isNotificationEligibleContext(ctx) || (!notificationsEnabledForSession && !sdkEnabledForSession))
+		)
+			return { status: "disabled" };
+		if (lifecycleRequired && !isNotificationEligibleContext(ctx)) return failLifecycleStartup("ineligible");
+		const pendingStart = sessionStartPromises.get(id);
+		if (pendingStart) return pendingStart;
+		const retainedCleanup = cleanupRetries.get(id);
+		if (retainedCleanup) return failLifecycleStartup("failed", "SDK notification runtime cleanup is still pending.");
+		const existingRuntime = runtimes.get(id);
+		if (existingRuntime) {
 			activeRuntimeId = id;
-			return "already";
+			if (lifecycleRequired) {
+				if (existingRuntime.host.started) lifecycleStartupCapability?.settleStarted();
+				else return failLifecycleStartup("failed", "SDK host is not started.");
+			}
+			return { status: "already", runtime: existingRuntime };
 		}
 
 		const stateRoot = path.join(ctx.cwd, ".gjc", "state");
+		const lifecycleAgentDir = lifecycleRequired ? settings?.getAgentDir?.() : undefined;
+		if (lifecycleRequired && !lifecycleAgentDir)
+			return failLifecycleStartup("failed", "Lifecycle SDK startup requires an agent directory.");
 
 		const gateOptions = new Map<string, string[]>();
 		const pendingInteractive = new Map<string, PendingInteractiveAsk>();
@@ -1650,12 +2626,34 @@ export function createNotificationsExtension(
 		let runtime: SessionRuntime | undefined;
 
 		// The SDK can always answer now (interactive via the answer source, or the
-		// workflow gate), so the endpoint advertises a resolver.
+		// workflow gate), so the endpoint advertises a resolver. Validate the native
+		// build information and required capability while lifecycle startup can settle
+		// a structured failure instead of leaving the lifecycle caller pending.
 		const token = resolveToken();
-		const server = new NotificationServer(id, token, stateRoot, true);
-		const gatePresentations = new GatePresentationRegistry(server, () => runtime?.redact ?? redact, tag);
+		let server: NotificationServer;
+		try {
+			assertNativeRuntimeCompatibility({
+				runtimeVersion: VERSION,
+				nativeVersion: nativeBuildInfo().version,
+				notificationServer: NotificationServer.prototype,
+			});
+			server = new NotificationServer(id, token, stateRoot, true);
+		} catch (error) {
+			if (lifecycleRequired) return failLifecycleStartup("failed", error);
+			throw error;
+		}
+		const gatePresentations = new PresentationArbiter(server, () => runtime?.redact ?? redact, tag);
 		let inboundSdkFrame: ((connectionId: string, frame: Record<string, unknown>) => void) | undefined;
-		let stopBrokerHeartbeat = () => {};
+		const inFlightGateResolutions = new Set<Promise<void>>();
+		const trackGateResolution = <T>(resolution: Promise<T>): Promise<T> => {
+			const quiesced = resolution.then(
+				() => {},
+				() => {},
+			);
+			inFlightGateResolutions.add(quiesced);
+			void quiesced.finally(() => inFlightGateResolutions.delete(quiesced));
+			return resolution;
+		};
 
 		const revisions = new RevisionStore(id, Date.now, { storageDir: stateRoot });
 		let host: SessionSdkHost | undefined;
@@ -1687,71 +2685,158 @@ export function createNotificationsExtension(
 			if (capability === "permission") ctx.setSdkPermissionProvider?.(undefined);
 		};
 
+		const hostCapCache = new Map<string, ReadonlySet<string>>();
+
 		const configOverrides = new Map<string, unknown>();
 		const configRevision = { current: 0 };
+		const PROMPT_SUBMISSION_CAPACITY = 128;
+		const PROMPT_SUBMISSION_TTL_MS = 5 * 60_000;
+		const PROMPT_TERMINAL_TOMBSTONE_CAPACITY = 256;
+		const PROMPT_TERMINAL_TOMBSTONE_TTL_MS = 15 * 60_000;
 		const promptSubmissionKey = (correlation: { commandId: string; turnId: string }) =>
 			`${correlation.commandId}:${correlation.turnId}`;
-		const promptSubmissions = new Map<
-			string,
-			{
-				acknowledged: boolean;
-				connectionId?: string;
-				failed: boolean;
-				error: unknown;
-				terminal: boolean;
-			}
-		>();
+		type PromptLifecycleFrame =
+			| { type: "agent_start" | "agent_end"; sessionId: string; commandId?: string; turnId?: string }
+			| {
+					type: "agent_failed";
+					sessionId: string;
+					commandId: string;
+					turnId: string;
+					error: { code: string; message: string };
+			  };
+		type PromptSubmission = {
+			acknowledged: boolean;
+			connectionId: string;
+			abandoned: boolean;
+			failed: boolean;
+			error: unknown;
+			terminal: boolean;
+			createdAt: number;
+			bufferedLifecycle: PromptLifecycleFrame[];
+		};
+		const promptSubmissions = new Map<string, PromptSubmission>();
+		const promptTerminalTombstones = new Map<string, number>();
 		const removePendingPromptCorrelation = (correlation: { commandId: string; turnId: string }) => {
 			const pendingIndex = pendingPromptCorrelations.findIndex(
 				candidate => candidate.commandId === correlation.commandId && candidate.turnId === correlation.turnId,
 			);
 			if (pendingIndex !== -1) pendingPromptCorrelations.splice(pendingIndex, 1);
 		};
-		const emitPromptFailure = (correlation: { commandId: string; turnId: string }, error: unknown) => {
-			const submissionKey = promptSubmissionKey(correlation);
-			const submission = promptSubmissions.get(submissionKey);
-			if (!submission?.acknowledged || !runtime) return;
-			promptSubmissions.delete(submissionKey);
-			const candidate = error as { code?: unknown; message?: unknown };
-			emitAgentLifecycle(
-				runtime,
-				{
-					type: "agent_failed",
-					sessionId: runtime.id,
-					...correlation,
-					error: {
-						code: typeof candidate.code === "string" ? candidate.code : "internal",
-						message: typeof candidate.message === "string" ? candidate.message : "Prompt submission failed.",
-					},
-				},
-				submission.connectionId,
-			);
-			// A submission can fail after preflight without ever reaching agent_start.
-			// Deliver idle directly after agent_failed so all prompt trackers receive a
-			// recognized terminal transition even though no normal agent_end will fire.
-			if (!runtime.busy && submission.connectionId) {
-				const terminal = {
-					type: "activity",
-					sessionId: runtime.id,
-					...correlation,
-					state: "idle",
-				};
-				runtime.host.emitEvent({ kind: terminal.type, payload: terminal });
+		const addTerminalTombstone = (key: string, now = Date.now()) => {
+			promptTerminalTombstones.delete(key);
+			promptTerminalTombstones.set(key, now + PROMPT_TERMINAL_TOMBSTONE_TTL_MS);
+			while (promptTerminalTombstones.size > PROMPT_TERMINAL_TOMBSTONE_CAPACITY)
+				promptTerminalTombstones.delete(promptTerminalTombstones.keys().next().value!);
+		};
+		const finalizePrompt = (key: string, correlation: { commandId: string; turnId: string }) => {
+			promptSubmissions.delete(key);
+			removePendingPromptCorrelation(correlation);
+			addTerminalTombstone(key);
+		};
+		const cleanupPromptRecords = (now = Date.now()) => {
+			for (const [key, expiresAt] of promptTerminalTombstones)
+				if (expiresAt <= now) promptTerminalTombstones.delete(key);
+			for (const [key, submission] of promptSubmissions)
+				if (submission.createdAt + PROMPT_SUBMISSION_TTL_MS <= now) {
+					const [commandId, turnId] = key.split(":", 2);
+					if (commandId && turnId) finalizePrompt(key, { commandId, turnId });
+				}
+		};
+		const abandonPrompt = (submission: PromptSubmission) => {
+			submission.abandoned = true;
+			submission.bufferedLifecycle.length = 0;
+		};
+		const emitPromptLifecycle = (
+			correlation: { commandId: string; turnId: string } | undefined,
+			frame: PromptLifecycleFrame,
+		) => {
+			cleanupPromptRecords();
+			if (!correlation || !runtime) {
+				emitAgentLifecycle(runtime!, frame as Extract<PromptLifecycleFrame, { type: "agent_start" | "agent_end" }>);
+				return;
+			}
+			const key = promptSubmissionKey(correlation);
+			const submission = promptSubmissions.get(key);
+			if (!submission) return;
+			runtime.host.emitEvent({ kind: frame.type, payload: frame });
+			if (submission.abandoned) {
+				if (submission.terminal) finalizePrompt(key, correlation);
+				return;
+			}
+			if (!submission.acknowledged) {
+				submission.bufferedLifecycle.push(frame);
+				return;
+			}
+			try {
+				runtime.server.sendTo(submission.connectionId, JSON.stringify(frame));
+			} catch (error) {
+				logger.warn(`sdk: correlated lifecycle delivery failed: ${String(error)}`);
+				abandonPrompt(submission);
+			}
+			if (submission.terminal) finalizePrompt(key, correlation);
+		};
+		const flushPromptLifecycle = (key: string, submission: PromptSubmission) => {
+			for (const frame of submission.bufferedLifecycle.splice(0)) {
 				try {
-					runtime.server.sendTo(submission.connectionId, JSON.stringify(terminal));
-				} catch (deliveryError) {
-					logger.warn(`sdk: prompt failure terminal delivery failed: ${String(deliveryError)}`);
+					server.sendTo(submission.connectionId, JSON.stringify(frame));
+				} catch (error) {
+					logger.warn(`sdk: buffered correlated lifecycle delivery failed: ${String(error)}`);
+					abandonPrompt(submission);
+					break;
 				}
 			}
+			if (submission.terminal) {
+				const [commandId, turnId] = key.split(":", 2);
+				if (commandId && turnId) finalizePrompt(key, { commandId, turnId });
+			}
 		};
-
-		const recordPromptAccepted = (correlation: { commandId: string; turnId: string }) => {
+		const recordPromptAccepted = (
+			correlation: { commandId: string; turnId: string },
+			requesterConnectionId?: string,
+		) => {
+			if (!requesterConnectionId) return;
+			cleanupPromptRecords();
+			while (promptSubmissions.size >= PROMPT_SUBMISSION_CAPACITY) {
+				const oldest = promptSubmissions.entries().next().value as [string, PromptSubmission] | undefined;
+				if (!oldest) break;
+				const [key] = oldest;
+				const [commandId, turnId] = key.split(":", 2);
+				if (commandId && turnId) finalizePrompt(key, { commandId, turnId });
+			}
 			pendingPromptCorrelations.push(correlation);
 			promptSubmissions.set(promptSubmissionKey(correlation), {
 				acknowledged: false,
+				connectionId: requesterConnectionId,
+				abandoned: false,
 				failed: false,
 				error: undefined,
 				terminal: false,
+				createdAt: Date.now(),
+				bufferedLifecycle: [],
+			});
+		};
+		const recordPromptTerminal = (correlation: { commandId: string; turnId: string } | undefined) => {
+			if (!correlation) return false;
+			cleanupPromptRecords();
+			const key = promptSubmissionKey(correlation);
+			if (promptTerminalTombstones.has(key)) return false;
+			const submission = promptSubmissions.get(key);
+			if (!submission || submission.terminal) return false;
+			submission.terminal = true;
+			return true;
+		};
+		const emitPromptFailure = (correlation: { commandId: string; turnId: string }, error: unknown) => {
+			const submission = promptSubmissions.get(promptSubmissionKey(correlation));
+			if (!submission || !runtime || !recordPromptTerminal(correlation)) return;
+			const candidate = error as { code?: unknown; message?: unknown };
+			emitPromptLifecycle(correlation, {
+				type: "agent_failed",
+				sessionId: runtime.id,
+				...correlation,
+				error: {
+					code: typeof candidate.code === "string" ? candidate.code : "internal",
+					message: typeof candidate.message === "string" ? candidate.message : "Prompt submission failed.",
+				},
 			});
 		};
 		const recordPromptFailure = (correlation: { commandId: string; turnId: string }, error: unknown) => {
@@ -1760,26 +2845,19 @@ export function createNotificationsExtension(
 			submission.failed = true;
 			submission.error = error;
 			removePendingPromptCorrelation(correlation);
+			if (
+				runtime?.activePromptCorrelation?.commandId === correlation.commandId &&
+				runtime.activePromptCorrelation.turnId === correlation.turnId
+			)
+				runtime.activePromptCorrelation = undefined;
 			emitPromptFailure(correlation, error);
 		};
 		const acknowledgePrompt = (connectionId: string, correlation: { commandId: string; turnId: string }) => {
-			const submission = promptSubmissions.get(promptSubmissionKey(correlation));
-			if (!submission) return;
-			submission.connectionId = connectionId;
+			const key = promptSubmissionKey(correlation);
+			const submission = promptSubmissions.get(key);
+			if (!submission || submission.abandoned || submission.connectionId !== connectionId) return;
 			submission.acknowledged = true;
-			if (submission.failed) {
-				emitPromptFailure(correlation, submission.error);
-			} else if (submission.terminal) {
-				promptSubmissions.delete(promptSubmissionKey(correlation));
-			}
-		};
-
-		const recordPromptTerminal = (correlation: { commandId: string; turnId: string } | undefined) => {
-			if (!correlation) return;
-			const submission = promptSubmissions.get(promptSubmissionKey(correlation));
-			if (!submission) return;
-			submission.terminal = true;
-			if (submission.acknowledged && !submission.failed) promptSubmissions.delete(promptSubmissionKey(correlation));
+			flushPromptLifecycle(key, submission);
 		};
 
 		const cursors = new CursorRegistry(token, revisions);
@@ -1787,6 +2865,7 @@ export function createNotificationsExtension(
 			sdkQuerySurface(
 				ctx,
 				id,
+				api,
 				capability => host?.reverse.getInstalledDefinitions(capability),
 				() => {
 					// Live session truth: the agent loop drives rt.busy on
@@ -1808,14 +2887,35 @@ export function createNotificationsExtension(
 		const controlSurface = sdkControlSurface(
 			ctx,
 			pendingInteractive,
+			gatePresentations,
 			api,
-			() => runtime?.busy === true,
+			() => runtime?.busy === true || pendingPromptCorrelations.length > 0,
 			recordPromptAccepted,
 			recordPromptFailure,
+			() => runtime?.stopping !== true,
+			trackGateResolution,
 			settings,
 			configOverrides,
 			configRevision,
 		);
+		const abandonPromptResponse = (connectionId: string, frame: Record<string, unknown>) => {
+			if (
+				frame.type !== "control_response" ||
+				frame.ok !== true ||
+				!frame.result ||
+				typeof frame.result !== "object"
+			)
+				return;
+			const result = frame.result as { accepted?: unknown; commandId?: unknown; turnId?: unknown };
+			if (result.accepted !== true || typeof result.commandId !== "string" || typeof result.turnId !== "string")
+				return;
+			const submission = promptSubmissions.get(
+				promptSubmissionKey({ commandId: result.commandId, turnId: result.turnId }),
+			);
+			if (!submission || submission.acknowledged || submission.connectionId !== connectionId) return;
+			abandonPrompt(submission);
+		};
+
 		const sendSdkFrame = (connectionId: string, frame: Record<string, unknown>) => {
 			const json = JSON.stringify(frame);
 			if (connectionId.startsWith("seam:")) {
@@ -1829,6 +2929,7 @@ export function createNotificationsExtension(
 					});
 				} catch (error) {
 					logger.warn(`sdk: seam response delivery failed for ${connectionId}: ${String(error)}`);
+					abandonPromptResponse(connectionId, frame);
 					throw error;
 				}
 				return;
@@ -1837,6 +2938,7 @@ export function createNotificationsExtension(
 				server.sendTo(connectionId, json);
 			} catch (error) {
 				logger.warn(`sdk: directed response delivery failed for ${connectionId}: ${String(error)}`);
+				abandonPromptResponse(connectionId, frame);
 				throw error;
 			}
 		};
@@ -1846,6 +2948,7 @@ export function createNotificationsExtension(
 			stateRoot,
 			token,
 			sendFrame: (connectionId, frame) => sendSdkFrame(connectionId, frame),
+			connectionCapabilities: connectionId => hostCapCache.get(connectionId) ?? EMPTY_CAPABILITIES,
 			installProviderDefinitions,
 			onProviderDefinitionsRemoved: removeProviderDefinitions,
 			onFrame: handler => {
@@ -1857,7 +2960,9 @@ export function createNotificationsExtension(
 			onRequest: options.onSdkRequest,
 			afterControlResponse: async (connectionId, request, response) => {
 				if (
-					(request.operation === "turn.prompt" || request.operation === "turn.abort_and_prompt") &&
+					(request.operation === "turn.prompt" ||
+						request.operation === "turn.follow_up" ||
+						request.operation === "turn.abort_and_prompt") &&
 					response.ok === true &&
 					response.result &&
 					typeof response.result === "object" &&
@@ -1880,7 +2985,7 @@ export function createNotificationsExtension(
 					if (response.ok === true && pending) await rotateSessionAuthority(pending.event, pending.ctx);
 				}
 			},
-			control: async (_connectionId, frame) => {
+			control: async (connectionId, frame) => {
 				const request = frame as {
 					id?: unknown;
 					operation?: unknown;
@@ -1899,17 +3004,20 @@ export function createNotificationsExtension(
 						error: { code: "conflict", message: "session identity mutation is already active" },
 					};
 				if (rotatesIdentity) identityControlInFlight = true;
-				const response = await dispatchControl(
-					controlSurface,
-					OPERATIONS.find(row => row.kind === "control" && row.sdkId === operation),
-					{
-						id: requestId,
-						operation,
-						input: request.input,
-						expectedRevision: typeof request.expectedRevision === "string" ? request.expectedRevision : undefined,
-						idempotencyKey: typeof request.idempotencyKey === "string" ? request.idempotencyKey : undefined,
-						confirm: request.confirm === true,
-					},
+				const response = await controlRequesterContext.run(connectionId, () =>
+					dispatchControl(
+						controlSurface,
+						OPERATIONS.find(row => row.kind === "control" && row.sdkId === operation),
+						{
+							id: requestId,
+							operation,
+							input: request.input,
+							expectedRevision:
+								typeof request.expectedRevision === "string" ? request.expectedRevision : undefined,
+							idempotencyKey: typeof request.idempotencyKey === "string" ? request.idempotencyKey : undefined,
+							confirm: request.confirm === true,
+						},
+					),
 				);
 				if (rotatesIdentity && response.ok !== true) {
 					identityControlInFlight = false;
@@ -1933,277 +3041,489 @@ export function createNotificationsExtension(
 			},
 		});
 
-		server.onSdkFrame((err, inbound) => {
-			if (err || !inbound) return;
+		// Install the runtime before either transport can expose the host. session_start
+		// is deliberately fire-and-forget, so agent lifecycle events and direct v3
+		// seam replies can otherwise arrive between server.start() and the old
+		// registration below. Keeping this state live first makes those frames
+		// replayable rather than dropping them (or dereferencing an absent runtime).
+		runtime = {
+			server,
+			host,
+			revisions,
+			cursors,
+			id,
+			idleSeq: 0,
+			pendingInteractive,
+			brokerRegistrationActive: false,
+			hostStopped: false,
+			serverStopped: false,
+			brokerRegistrationReleased: false,
+			disposeAnswerSource: () => {},
+			disposeFileSink: () => {},
+			disposeGateListener: () => {},
+			notificationsActive: false,
+			enableNotifications: () => {},
+			disposeGateTerminalController: () => {},
+			disposeAckRecoveryParticipant: () => {},
+			disposeGateEmitterListener: () => {},
+			trackGateResolution,
+			waitForGateResolutionQuiescence: async () => {
+				await Promise.allSettled(inFlightGateResolutions);
+			},
+			workflowGate: undefined,
+			gatePresentations,
+			stopping: false,
+			cancelPostmortemCleanup: () => {},
+
+			redact,
+			verbosity,
+			stream: streamingEnabled(),
+			sessionTag: tag,
+			busy: false,
+			pendingPromptCorrelations,
+			activePromptCorrelation: undefined,
+			recordPromptTerminal,
+			emitPromptLifecycle,
+			pendingInbound: new Set<number>(),
+			inFlightTools: new Map<string, { toolName: string; args: unknown }>(),
+		};
+		runtimes.set(id, runtime);
+		activeRuntimeId = id;
+		const startSettled = Promise.withResolvers<SessionStartResult>();
+		sessionStartPromises.set(id, startSettled.promise);
+		const finishStartup = (result: SessionStartResult): void => {
+			if (lifecycleRequired) {
+				if (result.status === "started") lifecycleStartupCapability?.settleStarted();
+				else
+					lifecycleStartupCapability?.settleFailure(
+						result.failure ??
+							lifecycleStartupCapability?.normalizeFailure(
+								"startup",
+								result.status === "disabled" ? "disabled" : "failed",
+							) ??
+							normalizeSdkStartupFailure("startup", result.status === "disabled" ? "disabled" : "failed"),
+					);
+			}
+			if (sessionStartPromises.get(id) === startSettled.promise) sessionStartPromises.delete(id);
+			startSettled.resolve(result);
+		};
+		const cleanupAbandonedStartup = async (): Promise<void> => {
 			try {
-				inboundSdkFrame?.(inbound.connectionId, JSON.parse(inbound.json) as Record<string, unknown>);
+				await server.stopAndWait();
 			} catch {}
-		});
-		server.onConnectionClose((err, connectionId) => {
-			if (!err && connectionId) host.handleDisconnect(connectionId);
-		});
-
-		server.onReply((err, reply) => {
-			if (err || !reply) return;
-			const native = server as unknown as {
-				resolveClaim(receiptId: string, answerJson?: string, idempotencyKey?: string): void;
-				closeClaimInvalid(receiptId: string, reason: string): void;
-				requestAskSelectedAck(
-					receiptId: string,
-					requestJson: string,
-				): Promise<{ status: string; messageId?: number; reason?: string }>;
-			};
-			const pending = pendingInteractive.get(reply.id);
-			if (pending) {
-				pendingInteractive.delete(reply.id);
-				let interaction: AskRemoteInteraction | undefined;
-				try {
-					const answer = JSON.parse(reply.answerJson) as unknown;
-					if (typeof answer === "object" && answer && "controlId" in answer) {
-						const controlId = (answer as { controlId?: unknown }).controlId;
-						if (
-							controlId === "navigation_forward" &&
-							pending.controls.some(control => control.id === controlId && control.enabled)
-						) {
-							interaction = { kind: "control", controlId };
-						}
-					} else {
-						const value = mapAnswerToLabel(reply.answerJson, pending.options);
-						if (value !== undefined) interaction = { kind: "value", value };
-					}
-				} catch {}
-				if (!interaction) {
-					try {
-						native.closeClaimInvalid(reply.replyReceiptId, "invalid_answer");
-					} catch {}
-					if (!pending.reissue()) pending.resolve(undefined);
-					return;
-				}
-				let settled: Promise<AskSettlementResult> | undefined;
-				const receipt: AskRemoteReceipt = {
-					source: "remote",
-					interaction,
-					settle(settlement: AskSettlement): Promise<AskSettlementResult> {
-						if (settled) return settled;
-						settled = Promise.resolve().then(async () => {
-							if (settlement.kind === "invalid") {
-								native.closeClaimInvalid(reply.replyReceiptId, settlement.reason);
-								return { kind: "invalid_closed" };
-							}
-							if (settlement.kind === "resolve_without_commit") {
-								native.resolveClaim(reply.replyReceiptId, reply.answerJson, reply.idempotencyKey ?? undefined);
-								return { kind: "resolved_without_commit" };
-							}
-							const ack = await requestLiveSelectedAck(native, {
-								replyReceiptId: reply.replyReceiptId,
-								actionId: reply.id,
-								commitKey: `${reply.id}:${reply.idempotencyKey ?? reply.replyReceiptId}`,
-								deadlineAt: Date.now() + 8_000,
-							});
-							native.resolveClaim(reply.replyReceiptId, reply.answerJson, reply.idempotencyKey ?? undefined);
-							return { kind: "committed", ack };
-						});
-						return settled;
-					},
-				};
-				pending.resolve(receipt);
-				return;
-			}
-			const gate = runtime?.workflowGate;
-			const workflowGateActive =
-				gate?.isUnattended?.() === true &&
-				typeof gate.onGateEmitted === "function" &&
-				typeof gate.resolveGateFromNotification === "function";
-			const gateId = gatePresentations.routeFor(reply.id);
-			if (gate && workflowGateActive && gateId && gate.resolveGateFromNotification) {
-				const presentation = gatePresentations.presentationFor(reply.id);
-				const rawAnswer = parseAnswer(reply.answerJson);
-				if (presentation?.multi) {
-					const option =
-						typeof rawAnswer === "number"
-							? presentation.options[rawAnswer]
-							: typeof rawAnswer === "string" && presentation.options.includes(rawAnswer)
-								? rawAnswer
-								: undefined;
-					if (option !== undefined) {
-						native.resolveClaim(reply.replyReceiptId, reply.answerJson, reply.idempotencyKey ?? undefined);
-						if (!gatePresentations.toggle(reply.id, option)) gatePresentations.reissue(gateId);
-						return;
-					}
-				}
-				let answer: unknown;
-				if (
-					presentation?.multi &&
-					typeof rawAnswer === "object" &&
-					rawAnswer !== null &&
-					(rawAnswer as { controlId?: unknown }).controlId === "navigation_forward"
-				) {
-					if (!presentation.allowEmpty && presentation.selectedOptions.length === 0) {
-						native.closeClaimInvalid(reply.replyReceiptId, "invalid_control");
-						gatePresentations.closeInteraction(reply.id, "invalid_control");
-						gatePresentations.reissue(gateId);
-						return;
-					}
-					answer = { selected: presentation.selectedOptions };
-				} else if (
-					typeof rawAnswer === "object" &&
-					rawAnswer !== null &&
-					(rawAnswer as { action?: unknown }).action === "clarify"
-				) {
-					answer = rawAnswer;
-				} else if (presentation?.multi && typeof rawAnswer === "string") {
-					answer = { selected: presentation.selectedOptions, other: true, custom: rawAnswer };
-				} else {
-					const mapped = mapAnswerToGate(reply.answerJson, gateOptions.get(gateId) ?? []);
-					if (!mapped.ok) {
-						// A numeric selector outside options is invalid (issue #2030): close the
-						// exact claim/receipt and reissue the interaction — never a success ack.
-						native.closeClaimInvalid(reply.replyReceiptId, mapped.reason);
-						gatePresentations.closeInteraction(reply.id, mapped.reason);
-						gatePresentations.reissue(gateId);
-						return;
-					}
-					answer = mapped.answer;
-				}
-				void gate
-					.resolveGateFromNotification(
-						{ gate_id: gateId, answer, idempotency_key: reply.idempotencyKey ?? undefined },
-						{
-							interactionActionId: reply.id,
-							replyReceiptId: reply.replyReceiptId,
-							answerJson: reply.answerJson,
-							idempotencyKey: reply.idempotencyKey ?? undefined,
-							resolveClaim: () =>
-								native.resolveClaim(reply.replyReceiptId, reply.answerJson, reply.idempotencyKey ?? undefined),
-							closeClaimInvalid: reason => {
-								native.closeClaimInvalid(reply.replyReceiptId, reason);
-								gatePresentations.closeInteraction(reply.id, reason);
-								gatePresentations.reissue(gateId);
-							},
-							requestSelectedAck: input =>
-								requestLiveSelectedAck(native, {
-									replyReceiptId: input.replyReceiptId,
-									actionId: input.actionId,
-									commitKey: input.commitKey,
-									deadlineAt: input.daemonDeadlineAt,
-								}),
-						},
-					)
-					.catch(error => logger.warn(`notifications: resolveGateFromNotification failed: ${String(error)}`));
-				return;
-			}
 			try {
-				server.closeClaimInvalid(reply.replyReceiptId, "unknown_action");
-			} catch (error) {
-				logger.warn(`notifications: closeClaimInvalid failed: ${String(error)}`);
-			}
-		});
-
-		// Inbound free-text injection / in-thread config command from a session
-		// thread (forwarded by the daemon over the WS, fail-closed at the daemon).
-		server.onInbound((err, inbound) => {
-			if (err || !inbound) return;
-			if (inbound.kind === "control_command") {
-				const frame = sdkInboundFrame(inbound.commandJson);
-				if (frame) {
-					inboundSdkFrame?.(`seam:${inbound.requestId ?? "notification"}`, frame);
-					return;
-				}
-			}
-
-			if (inbound.kind === "user_message") {
-				// Inject as a user turn (steers/continues the agent; the resulting
-				// turn streams back via the turn_end handler even when not idle).
-				// Record the update id so it can be acked as "consumed" on the next
-				// turn_start, and steer (vs start a fresh turn) when already busy.
-				const text = inbound.text ?? "";
-				const images = inbound.images ?? [];
-				if (!text && images.length === 0) return;
-				if (runtime && typeof inbound.updateId === "number") runtime.pendingInbound.add(inbound.updateId);
-				const content: string | (TextContent | ImageContent)[] =
-					images.length > 0
-						? [
-								...(text ? [{ type: "text", text } as TextContent] : []),
-								...images.map(
-									img =>
-										({ type: "image", data: img.data, mimeType: img.mime ?? "image/jpeg" }) as ImageContent,
-								),
-							]
-						: text;
-				try {
-					api.sendUserMessage(content, runtime?.busy ? { deliverAs: "steer" } : undefined);
-				} catch (e) {
-					logger.warn(`notifications: sendUserMessage failed: ${String(e)}`);
-				}
-				return;
-			}
-			if (inbound.kind === "config_command") {
-				if (!runtime) return;
-				const update: {
-					type: "config_update";
-					sessionId: string;
-					verbosity?: "lean" | "verbose";
-					redact?: boolean;
-				} = {
-					type: "config_update",
-					sessionId: id,
-				};
-				if (inbound.verbosity === "lean" || inbound.verbosity === "verbose") {
-					runtime.verbosity = inbound.verbosity;
-					update.verbosity = inbound.verbosity;
-				}
-				if (typeof inbound.redact === "boolean") {
-					runtime.redact = inbound.redact;
-					update.redact = inbound.redact;
-				}
-				if (update.verbosity !== undefined || update.redact !== undefined) {
-					try {
-						pushSessionFrame(runtime, update);
-					} catch (e) {
-						logger.warn(`notifications: config_update failed: ${String(e)}`);
-					}
-				}
-			}
-			if (inbound.kind === "control_command") {
-				if (!runtime || !inbound.requestId) return;
-				void executeNotificationControlCommand(parseControlCommandPayload(inbound.commandJson), ctx, api)
-					.then(result => {
-						if (runtime)
-							pushSessionFrame(runtime, {
-								type: "control_command_result",
-								sessionId: runtime.id,
-								requestId: inbound.requestId,
-								updateId: inbound.updateId,
-								status: result.status,
-								message: result.message,
-							});
-					})
-					.catch(err => {
-						try {
-							if (runtime)
-								pushSessionFrame(runtime, {
-									type: "control_command_result",
-									sessionId: runtime.id,
-									requestId: inbound.requestId,
-									updateId: inbound.updateId,
-									status: "error",
-									message: `Control command failed: ${err instanceof Error ? err.message : String(err)}`,
-								});
-						} catch (pushErr) {
-							logger.warn(`notifications: control_command_result failed: ${String(pushErr)}`);
-						}
-					});
-			}
-		});
+				await host.stop();
+				host.reverse.dispose();
+			} catch {}
+			try {
+				cursors.close();
+				await revisions.close();
+			} catch {}
+		};
 
 		try {
+			server.onSdkFrame((err, inbound) => {
+				if (err || !inbound) return;
+				try {
+					inboundSdkFrame?.(inbound.connectionId, JSON.parse(inbound.json) as Record<string, unknown>);
+				} catch {}
+			});
+			// Required: the negotiated-capability callback is how the TS host learns
+			// each connection's caps for replay-frame gating. If the linked
+			// @gajae-code/natives binary predates it (linked/deduped installs where the
+			// version did not change), fail loudly with an actionable message instead of
+			// silently shipping a half-wired capability bridge.
+			if (typeof server.onNegotiatedCapabilities !== "function") {
+				throw new Error(
+					"@gajae-code/natives is out of date: missing onNegotiatedCapabilities. Rebuild the native addon (bun --cwd=packages/natives run build).",
+				);
+			}
+			server.onNegotiatedCapabilities((_err, connectionId, capabilities) => {
+				if (connectionId) hostCapCache.set(connectionId, new Set(capabilities));
+			});
+			server.onConnectionClose((_err, connectionId) => {
+				if (!connectionId) return;
+				host.handleDisconnect(connectionId);
+				hostCapCache.delete(connectionId);
+				for (const submission of promptSubmissions.values())
+					if (submission.connectionId === connectionId) abandonPrompt(submission);
+			});
+
+			server.onReply((err, reply) => {
+				if (err || !reply) return;
+				if (runtime?.stopping || runtimes.get(id) !== runtime) {
+					try {
+						server.closeClaimInvalid(reply.replyReceiptId, "session_stopping");
+					} catch {}
+					return;
+				}
+				const native = server as unknown as {
+					resolveClaim(receiptId: string, answerJson?: string, idempotencyKey?: string): void;
+					closeClaimInvalid(receiptId: string, reason: string): void;
+					requestAskSelectedAck(
+						receiptId: string,
+						requestJson: string,
+					): Promise<{ status: string; messageId?: number; reason?: string }>;
+				};
+				const pending = pendingInteractive.get(reply.id);
+				if (pending) {
+					if (pendingInteractive.get(reply.id) === pending) pendingInteractive.delete(reply.id);
+					let interaction: AskRemoteInteraction | undefined;
+					try {
+						const answer = JSON.parse(reply.answerJson) as unknown;
+						if (typeof answer === "object" && answer && "controlId" in answer) {
+							const controlId = (answer as { controlId?: unknown }).controlId;
+							if (
+								controlId === "navigation_forward" &&
+								pending.controls.some(control => control.id === controlId && control.enabled)
+							) {
+								interaction = { kind: "control", controlId };
+							}
+						} else {
+							const value = mapAnswerToLabel(reply.answerJson, pending.options);
+							if (value !== undefined) interaction = { kind: "value", value };
+						}
+					} catch {}
+					if (!interaction) {
+						try {
+							native.closeClaimInvalid(reply.replyReceiptId, "invalid_answer");
+						} catch {}
+						if (!pending.reissue()) pending.resolve(undefined);
+						return;
+					}
+					let settled: Promise<AskSettlementResult> | undefined;
+					const receipt: AskRemoteReceipt = {
+						source: "remote",
+						interaction,
+						settle(settlement: AskSettlement): Promise<AskSettlementResult> {
+							if (settled) return settled;
+							settled = Promise.resolve().then(async () => {
+								if (settlement.kind === "invalid") {
+									try {
+										native.closeClaimInvalid(reply.replyReceiptId, settlement.reason);
+									} catch (error) {
+										pending.fail(reply.id);
+										throw error;
+									}
+									pending.reissue();
+									return { kind: "invalid_closed" };
+								}
+								try {
+									if (settlement.kind === "resolve_without_commit") {
+										native.resolveClaim(
+											reply.replyReceiptId,
+											reply.answerJson,
+											reply.idempotencyKey ?? undefined,
+										);
+										pending.complete(reply.id);
+										return { kind: "resolved_without_commit" };
+									}
+									const ack = await requestLiveSelectedAck(native, {
+										replyReceiptId: reply.replyReceiptId,
+										actionId: reply.id,
+										commitKey: `${reply.id}:${reply.idempotencyKey ?? reply.replyReceiptId}`,
+										deadlineAt: Date.now() + 8_000,
+									});
+									native.resolveClaim(
+										reply.replyReceiptId,
+										reply.answerJson,
+										reply.idempotencyKey ?? undefined,
+									);
+									pending.complete(reply.id);
+									return { kind: "committed", ack };
+								} catch (error) {
+									try {
+										native.closeClaimInvalid(reply.replyReceiptId, "settlement_failed");
+									} catch {}
+									pending.fail(reply.id);
+									throw error;
+								}
+							});
+							return settled;
+						},
+					};
+					pending.resolve(receipt);
+					return;
+				}
+				const gate = runtime?.workflowGate;
+				const workflowGateActive =
+					gate?.isUnattended?.() === true &&
+					typeof gate.onGateEmitted === "function" &&
+					typeof gate.resolveGateFromNotification === "function";
+				const gateId = gatePresentations.routeFor(reply.id);
+				if (gate && workflowGateActive && gateId && gate.resolveGateFromNotification) {
+					const presentation = gatePresentations.presentationFor(reply.id);
+					const rawAnswer = parseAnswer(reply.answerJson);
+					if (presentation?.multi) {
+						const option =
+							typeof rawAnswer === "number"
+								? presentation.options[rawAnswer]
+								: typeof rawAnswer === "string" && presentation.options.includes(rawAnswer)
+									? rawAnswer
+									: undefined;
+						if (option !== undefined) {
+							native.resolveClaim(reply.replyReceiptId, reply.answerJson, reply.idempotencyKey ?? undefined);
+							if (!gatePresentations.toggle(reply.id, option)) gatePresentations.reissue(gateId);
+							return;
+						}
+					}
+					let answer: unknown;
+					if (
+						presentation?.multi &&
+						typeof rawAnswer === "object" &&
+						rawAnswer !== null &&
+						(rawAnswer as { controlId?: unknown }).controlId === "navigation_forward"
+					) {
+						if (!presentation.allowEmpty && presentation.selectedOptions.length === 0) {
+							native.closeClaimInvalid(reply.replyReceiptId, "invalid_control");
+							gatePresentations.closeInteraction(reply.id, "invalid_control");
+							gatePresentations.reissue(gateId);
+							return;
+						}
+						answer = { selected: presentation.selectedOptions };
+					} else if (
+						typeof rawAnswer === "object" &&
+						rawAnswer !== null &&
+						(rawAnswer as { action?: unknown }).action === "clarify"
+					) {
+						answer = rawAnswer;
+					} else if (presentation?.multi && typeof rawAnswer === "string") {
+						answer = { selected: presentation.selectedOptions, other: true, custom: rawAnswer };
+					} else {
+						const mapped = mapAnswerToGate(reply.answerJson, gateOptions.get(gateId) ?? []);
+						if (!mapped.ok) {
+							// A numeric selector outside options is invalid (issue #2030): close the
+							// exact claim/receipt and reissue the interaction — never a success ack.
+							native.closeClaimInvalid(reply.replyReceiptId, mapped.reason);
+							gatePresentations.closeInteraction(reply.id, mapped.reason);
+							gatePresentations.reissue(gateId);
+							return;
+						}
+						answer = mapped.answer;
+					}
+					const resolution = gate
+						.resolveGateFromNotification(
+							{ gate_id: gateId, answer, idempotency_key: reply.idempotencyKey ?? undefined },
+							{
+								interactionActionId: reply.id,
+								replyReceiptId: reply.replyReceiptId,
+								answerJson: reply.answerJson,
+								idempotencyKey: reply.idempotencyKey ?? undefined,
+								resolveClaim: () =>
+									native.resolveClaim(
+										reply.replyReceiptId,
+										reply.answerJson,
+										reply.idempotencyKey ?? undefined,
+									),
+								closeClaimInvalid: reason => {
+									native.closeClaimInvalid(reply.replyReceiptId, reason);
+									gatePresentations.closeInteraction(reply.id, reason);
+									gatePresentations.reconcile();
+								},
+								requestSelectedAck: input =>
+									requestLiveSelectedAck(native, {
+										replyReceiptId: input.replyReceiptId,
+										actionId: input.actionId,
+										commitKey: input.commitKey,
+										deadlineAt: input.daemonDeadlineAt,
+									}),
+							},
+						)
+						.catch(() => {
+							let durable: "pending" | "terminal" | "unavailable" = "unavailable";
+							try {
+								if (gate.listPendingGates)
+									durable = gate.listPendingGates().some(candidate => candidate.gate_id === gateId)
+										? "pending"
+										: "terminal";
+							} catch {
+								// Durable state is unavailable; remain fail-closed.
+							}
+							if (durable === "pending") gatePresentations.reconcile();
+							else {
+								if (durable === "unavailable") {
+									try {
+										gate.quarantineGate?.(gateId);
+									} catch {
+										// The presentation remains fail-closed when the durable fence is unavailable.
+									}
+								}
+								gatePresentations.complete(gateId);
+							}
+							logger.warn("workflow_gate_notification_resolution_failed", { gateId, durable });
+						});
+					trackGateResolution(resolution);
+					return;
+				}
+				try {
+					server.closeClaimInvalid(reply.replyReceiptId, "unknown_action");
+				} catch (error) {
+					logger.warn(`notifications: closeClaimInvalid failed: ${String(error)}`);
+				}
+			});
+
+			// Inbound free-text injection / in-thread config command from a session
+			// thread (forwarded by the daemon over the WS, fail-closed at the daemon).
+			server.onInbound((err, inbound) => {
+				if (err || !inbound) return;
+				if (inbound.kind === "control_command") {
+					const frame = sdkInboundFrame(inbound.commandJson);
+					if (frame) {
+						inboundSdkFrame?.(`seam:${inbound.requestId ?? "notification"}`, frame);
+						return;
+					}
+				}
+
+				if (inbound.kind === "user_message") {
+					// Inject as a user turn (steers/continues the agent; the resulting
+					// turn streams back via the turn_end handler even when not idle).
+					// Record the update id so it can be acked as "consumed" on the next
+					// turn_start, and steer (vs start a fresh turn) when already busy.
+					const text = inbound.text ?? "";
+					const images = inbound.images ?? [];
+					if (!text && images.length === 0) return;
+					if (runtime && typeof inbound.updateId === "number") runtime.pendingInbound.add(inbound.updateId);
+					const content: string | (TextContent | ImageContent)[] =
+						images.length > 0
+							? [
+									...(text ? [{ type: "text", text } as TextContent] : []),
+									...images.map(
+										img =>
+											({
+												type: "image",
+												data: img.data,
+												mimeType: img.mime ?? "image/jpeg",
+											}) as ImageContent,
+									),
+								]
+							: text;
+					try {
+						api.sendUserMessage(content, runtime?.busy ? { deliverAs: "steer" } : undefined);
+					} catch (e) {
+						logger.warn(`notifications: sendUserMessage failed: ${String(e)}`);
+					}
+					return;
+				}
+				if (inbound.kind === "config_command") {
+					if (!runtime) return;
+					const update: {
+						type: "config_update";
+						sessionId: string;
+						verbosity?: "lean" | "verbose";
+						redact?: boolean;
+					} = {
+						type: "config_update",
+						sessionId: runtime.id,
+					};
+					if (inbound.verbosity === "lean" || inbound.verbosity === "verbose") {
+						runtime.verbosity = inbound.verbosity;
+						update.verbosity = inbound.verbosity;
+					}
+					if (typeof inbound.redact === "boolean") {
+						// Redact turning ON: terminalize any already-visible in-flight tool
+						// bubbles (while redact is still off so the helper emits) so they never
+						// strand permanently in "started"; subsequent detail is then suppressed.
+						if (inbound.redact && !runtime.redact) {
+							terminalizeInFlightTools(runtime, runtime.id, "unknown");
+						}
+						runtime.redact = inbound.redact;
+						update.redact = inbound.redact;
+					}
+					if (update.verbosity !== undefined || update.redact !== undefined) {
+						try {
+							pushSessionFrame(runtime, update);
+						} catch (error) {
+							logger.warn(`notifications: config_update failed: ${String(error)}`);
+						}
+					}
+				}
+				if (inbound.kind === "control_command") {
+					if (!runtime || !inbound.requestId) return;
+					const activeRuntime = runtime;
+					if (inbound.sessionId !== activeRuntime.id) {
+						pushSessionFrame(activeRuntime, {
+							type: "control_command_result",
+							sessionId: activeRuntime.id,
+							requestId: inbound.requestId,
+							updateId: inbound.updateId,
+							status: "error",
+							message: STALE_MODEL_BUTTON_MESSAGE,
+						});
+						return;
+					}
+					void executeNotificationControlCommand(
+						parseControlCommandPayload(inbound.commandJson),
+						ctx,
+						api,
+						inbound.sessionId,
+					).then(result => {
+						if (runtime !== activeRuntime) return;
+						pushSessionFrame(activeRuntime, {
+							type: "control_command_result",
+							sessionId: activeRuntime.id,
+							requestId: inbound.requestId,
+							updateId: inbound.updateId,
+							status: result.status,
+							message: result.message,
+							modelChoices: result.modelChoices,
+						});
+					});
+				}
+			});
+
 			await host.start();
+			lifecycleStartupCapability?.rollback?.recordGeneration(host.generation);
+			throwIfLifecycleStopped();
+			if (runtimes.get(id) !== runtime) {
+				finishStartup({ status: "failed" });
+				await cleanupAbandonedStartup();
+				return { status: "failed" };
+			}
+			if (notificationsEnabledForSession && settingsAvailable && settings) {
+				try {
+					if (!(await ensureConfiguredDaemons(settings, cfg, ctx.cwd, id))) {
+						const result = failLifecycleStartup("failed", "Telegram daemon ownership is blocked.");
+						finishStartup(result);
+						await cleanupAbandonedStartup();
+						return result;
+					}
+				} catch (error) {
+					const result = failLifecycleStartup("failed", error);
+					finishStartup(result);
+					await cleanupAbandonedStartup();
+					return result;
+				}
+			}
+
+			// Startup contract: identity is committed to the replayable SDK event log
+			// immediately after the host starts, before awaiting notification transport
+			// startup. Native frames are ephemeral, so ensure configured daemon owners
+			// before broadcasting identity; late SDK consumers still recover it from
+			// event_replay.
+			const identityHeader = {
+				type: "identity_header",
+				sessionId: id,
+				...buildIdentity(ctx.cwd, ctx.sessionManager.getSessionName()),
+			};
+			host.emitEvent({ kind: identityHeader.type, payload: identityHeader });
 			const endpoint = await server.start();
-			const agentDir = settings?.getAgentDir?.();
+			throwIfLifecycleStopped();
+			if (runtimes.get(id) !== runtime) {
+				finishStartup({ status: "failed" });
+				await cleanupAbandonedStartup();
+				return { status: "failed" };
+			}
+
+			server.pushFrame(JSON.stringify(identityHeader));
+			const agentDir = lifecycleAgentDir ?? settings?.getAgentDir?.();
+			if (lifecycleRequired && !agentDir) throw new Error("Lifecycle SDK host requires an agent directory.");
+
 			if (agentDir) {
 				try {
 					await ensureBroker({ agentDir });
+					throwIfLifecycleStopped();
 					const index = await new SessionIndex(agentDir).open();
+					throwIfLifecycleStopped();
 					const locator = { repo: path.resolve(ctx.cwd), stateRoot };
 					const endpointMtimeMs = fs.statSync(path.join(stateRoot, "sdk", `${id}.json`)).mtimeMs;
 					await host.registerWithBroker({
@@ -2216,62 +3536,29 @@ export function createNotificationsExtension(
 								locator,
 								pid: process.pid,
 								endpointMtimeMs,
+								...(lifecycleRequestId ? { lifecycleRequestId } : {}),
 							});
 						},
 						unregister: async input => {
-							await index.append({ type: "host_unregistered", ...input, locator, pid: process.pid });
+							await index.append({
+								type: "host_unregistered",
+								...input,
+								locator,
+								pid: process.pid,
+								...(lifecycleRequestId ? { lifecycleRequestId } : {}),
+							});
 						},
 					});
-					const timer = setInterval(() => {
-						void index
-							.append({
-								type: "host_heartbeat",
-								sessionId: id,
-								locator,
-								endpointGeneration: host.generation,
-								pid: process.pid,
-							})
-							.catch(error => logger.warn(`sdk broker heartbeat failed: ${String(error)}`));
-					}, 5_000);
-					stopBrokerHeartbeat = () => clearInterval(timer);
+					throwIfLifecycleStopped();
+					runtime.brokerRegistrationActive = true;
+					// Host liveness is derived from alive(pid) when the index is read; heartbeats
+					// are deliberately not appended to the durable session index.
 				} catch (brokerError) {
+					if (lifecycleRequired) throw brokerError;
 					logger.warn(`sdk broker registration skipped: ${String(brokerError)}`);
 				}
 			}
 
-			runtime = {
-				server,
-				host,
-				revisions,
-				cursors,
-				id,
-				idleSeq: 0,
-				pendingInteractive,
-				disposeAnswerSource: () => {},
-				disposeFileSink: () => {},
-				disposeGateListener: () => {},
-				notificationsActive: false,
-				enableNotifications: () => {},
-				disposeGateTerminalController: () => {},
-				disposeAckRecoveryParticipant: () => {},
-				disposeGateEmitterListener: () => {},
-				workflowGate: undefined,
-				gatePresentations,
-				cancelPostmortemCleanup: () => {},
-				stopBrokerHeartbeat,
-
-				redact,
-				verbosity,
-				stream: streamingEnabled(),
-				sessionTag: tag,
-				busy: false,
-				pendingPromptCorrelations,
-				activePromptCorrelation: undefined,
-				recordPromptTerminal,
-				pendingInbound: new Set<number>(),
-			};
-			runtimes.set(id, runtime);
-			activeRuntimeId = id;
 			const startedRuntime = runtime;
 			runtime.enableNotifications = () => {
 				const runtime = startedRuntime;
@@ -2279,29 +3566,29 @@ export function createNotificationsExtension(
 				runtime.notificationsActive = true;
 				runtime.disposeAnswerSource = registerInteractiveAnswerSource(
 					runtime.id,
-					server,
 					pendingInteractive,
-					() => runtime.redact,
-					tag,
+					gatePresentations,
 				);
 				runtime.disposeFileSink = registerTelegramFileSink(runtime.id, async file => {
 					if (runtime.redact) return { ok: false, error: TELEGRAM_FILE_REDACTION_ERROR };
 					try {
 						const data = await fs.promises.readFile(file.path);
-						pushSessionFrame(runtime, {
-							type: "file_attachment",
-							sessionId: runtime.id,
-							name: path.basename(file.path),
-							data: data.toString("base64"),
-							caption: file.caption,
-						});
+						pushFileAttachment(
+							runtime,
+							{
+								type: "file_attachment",
+								sessionId: runtime.id,
+								name: path.basename(file.path),
+								caption: file.caption,
+							},
+							data,
+						);
 						return { ok: true };
 					} catch (e) {
 						return { ok: false, error: e instanceof Error ? e.message : String(e) };
 					}
 				});
 			};
-			if (notificationsEnabledForSession) runtime.enableNotifications();
 			const activeRuntime = runtime;
 			// A native terminal close (SIGHUP), SIGTERM, Ctrl+C exit, or fatal error
 			// skips AgentSession.dispose(), so the `session_shutdown` extension event
@@ -2313,48 +3600,26 @@ export function createNotificationsExtension(
 				await stopSession(runtime!.id);
 			});
 			logger.info(`notifications: serving session ${id} at ${endpoint.url}`);
-
-			if (notificationsEnabledForSession && settingsAvailable && settings) {
-				try {
-					if (isTelegramConfigured(cfg))
-						await ensureTelegramDaemonRunning({ settings, cwd: ctx.cwd, sessionId: id });
-					if (isDiscordConfigured(cfg)) await ensureDiscordDaemon(settings);
-					if (isSlackConfigured(cfg)) await ensureSlackDaemon(settings);
-				} catch (e) {
-					logger.warn(`notifications: failed to ensure notification daemon: ${String(e)}`);
-				}
-			}
-
-			// One-time identity header (repo/branch/machine/session) pinned at the top
-			// of the session thread by the daemon.
-			try {
-				pushSessionFrame(runtime, {
-					type: "identity_header",
-					sessionId: id,
-					...buildIdentity(ctx.cwd, ctx.sessionManager.getSessionName()),
-				});
-			} catch (e) {
-				logger.warn(`notifications: identity_header failed: ${String(e)}`);
-			}
-
 			// A workflow-gate emitter can be installed after session startup.
 			// Attach dynamically so the SDK bus presents every durable gate.
 			const attachWorkflowGate = (gate: WorkflowGateEmitter | undefined): void => {
 				if (activeRuntime.workflowGate === gate) return;
 				activeRuntime.disposeGateListener();
-				activeRuntime.disposeGateTerminalController();
+				activeRuntime.workflowGate?.setRuntimeTurnProvider?.(null);
 				activeRuntime.disposeAckRecoveryParticipant();
+				gatePresentations.dispose();
+				activeRuntime.disposeGateTerminalController();
 				activeRuntime.disposeGateListener = () => {};
 				activeRuntime.disposeGateTerminalController = () => {};
 				activeRuntime.disposeAckRecoveryParticipant = () => {};
 				activeRuntime.workflowGate = undefined;
 				gateOptions.clear();
-				gatePresentations.dispose();
 				if (typeof gate?.onGateEmitted !== "function" || typeof gate.resolveGateFromNotification !== "function") {
 					return;
 				}
 				activeRuntime.workflowGate = gate;
-				if (gate.registerGateTerminalController) {
+				gate.setRuntimeTurnProvider?.(() => activeRuntime.activePromptCorrelation?.turnId);
+				if (hasTerminalArbitrationCapability(gate)) {
 					const controller: WorkflowGateTerminalController = {
 						completeGateInteractions: gateId => gatePresentations.complete(gateId),
 						cancelGateInteractions: (gateId, reason) => gatePresentations.cancel(gateId, reason),
@@ -2379,6 +3644,7 @@ export function createNotificationsExtension(
 							: {};
 					gatePresentations.retain({
 						gateId: g.gate_id,
+						workflowGateId: g.gate_id,
 						sessionId: id,
 						question,
 						options,
@@ -2388,7 +3654,6 @@ export function createNotificationsExtension(
 						navigationLabel: stageState.navigation_label === "Next" ? "Next" : "Done",
 						selectedOptions: [],
 					});
-					gatePresentations.reissue(g.gate_id);
 				});
 				if (gate.setAckRecoveryParticipant) {
 					const native = server as unknown as {
@@ -2407,21 +3672,57 @@ export function createNotificationsExtension(
 					});
 					activeRuntime.disposeAckRecoveryParticipant = () => gate.setAckRecoveryParticipant?.(null);
 				}
+				void (typeof gate.recoverAcceptedGates === "function"
+					? trackGateResolution(gate.recoverAcceptedGates()).catch(() => {})
+					: Promise.resolve());
 			};
 			activeRuntime.disposeGateEmitterListener = registerWorkflowGateEmitterListener(id, attachWorkflowGate);
 			if (ctx.workflowGate) attachWorkflowGate(ctx.workflowGate);
-			return "started";
+			if (notificationsEnabledForSession) runtime.enableNotifications();
+			finishStartup({ status: "started", runtime });
+			return { status: "started", runtime };
 		} catch (e) {
 			logger.warn(`notifications: failed to start server: ${String(e)}`);
-			stopBrokerHeartbeat();
-			try {
-				await host.stop();
-			} catch (stopError) {
-				logger.warn(`sdk host: startup cleanup failed: ${String(stopError)}`);
-			}
-			return "failed";
+			const result = failLifecycleStartup("failed", e);
+			finishStartup(result);
+			if (!(await stopSession(id, "session", runtime))) await cleanupAbandonedStartup();
+			return { ...result, runtime };
 		}
 	}
+
+	const sessionRuntime: NotificationSessionRuntime<ExtensionContext> = {
+		isRunning: binding => runtimes.get(binding.sessionId)?.notificationsActive === true,
+		start: async binding => {
+			if (sessionStartPromises.has(binding.sessionId)) {
+				const result = await startSession(binding.context);
+				if (result.status !== "started" && result.status !== "already") return result.status;
+				const runtime = runtimes.get(binding.sessionId);
+				if (!runtime || sessionId(binding.context) !== binding.sessionId || activeRuntimeId !== binding.sessionId) {
+					return "failed";
+				}
+				runtime.enableNotifications();
+				return "started";
+			}
+			const runtime = runtimes.get(binding.sessionId);
+			if (runtime) {
+				runtime.enableNotifications();
+				return "started";
+			}
+			const result = await startSession(binding.context);
+			return result.status === "started" || result.status === "already" ? "started" : result.status;
+		},
+		stop: async binding => await stopSession(binding.sessionId, "notifications"),
+		ensureTelegramDaemon: async binding => {
+			const { settings, settingsAvailable } = resolveSettings(options.settings);
+			if (!settingsAvailable || !settings) return "blocked_identity";
+			try {
+				return await ensureTelegramOwner(settings, binding.cwd, binding.sessionId);
+			} catch {
+				return "blocked_identity";
+			}
+		},
+	};
+	controller.attachRuntime(sessionRuntime);
 
 	api.registerCommand("notify", {
 		description: "Control notifications for this session (on, off, status).",
@@ -2436,10 +3737,9 @@ export function createNotificationsExtension(
 			});
 
 			if (command === "off") {
-				disabledSessions.add(id);
-				const stopped = await stopSession(id, "notifications");
+				const result = await controller.setLocalEnabled(ctx, false);
 				ctx.ui.notify(
-					stopped
+					result.outcome === "stopped"
 						? "Notifications disabled for this session."
 						: "Notifications already disabled for this session.",
 					"info",
@@ -2466,19 +3766,19 @@ export function createNotificationsExtension(
 					);
 					return;
 				}
-				disabledSessions.delete(id);
-				const existing = runtimes.get(id);
-				if (existing) existing.enableNotifications();
-				const result = existing ? "started" : await startSession(ctx);
+				const result = await controller.setLocalEnabled(ctx, true);
+				const enabled = result.status.running && result.status.effectiveEnabled;
+				const rotated = sessionId(ctx) !== id;
+				const failed = result.outcome === "failed" || (!enabled && !rotated && activeRuntimeId !== id);
 				ctx.ui.notify(
-					result === "started"
+					enabled
 						? "Notifications enabled for this session."
-						: result === "already"
-							? "Notifications already enabled for this session."
-							: result === "failed"
+						: rotated
+							? "Notifications were not enabled because the active session changed during startup."
+							: failed
 								? "Notifications failed to start for this session."
-								: "Notifications are not configured. Run `gjc notify setup` or set GJC_NOTIFICATIONS=1.",
-					result === "failed" ? "error" : result === "disabled" ? "warning" : "info",
+								: "Notifications were not enabled because daemon ownership could not be proved.",
+					enabled ? "info" : rotated ? "warning" : failed ? "error" : "warning",
 				);
 				return;
 			}
@@ -2488,12 +3788,10 @@ export function createNotificationsExtension(
 				return;
 			}
 
-			const running = runtimes.has(id);
-			const locallyDisabled = disabledSessions.has(id);
-			const enabled = isEnabledForSession(id, resolved.cfg);
+			const status = controller.query(ctx);
 			const runtime = runtimes.get(id);
 			ctx.ui.notify(
-				`Notifications ${running ? "running" : enabled ? "enabled" : "disabled"} for this session; redaction ${(runtime?.redact ?? resolved.cfg.redact) ? "on" : "off"}; verbosity ${runtime?.verbosity ?? resolved.cfg.verbosity}${locallyDisabled ? "; locally off" : ""}.`,
+				`Notifications ${status.running ? "running" : status.effectiveEnabled ? "enabled" : "disabled"} for this session; redaction ${(runtime?.redact ?? resolved.cfg.redact) ? "on" : "off"}; verbosity ${runtime?.verbosity ?? resolved.cfg.verbosity}${status.locallyEnabled ? "" : "; locally off"}.`,
 				"info",
 			);
 		},
@@ -2501,6 +3799,7 @@ export function createNotificationsExtension(
 
 	api.on("session_start", async (_event, ctx) => {
 		await startSession(ctx);
+		await controller.reconcileCurrentSession(ctx);
 	});
 
 	// A session endpoint's token and generation are authority for exactly one
@@ -2514,10 +3813,11 @@ export function createNotificationsExtension(
 		const newId = sessionId(ctx);
 		const prevId = activeRuntimeId ?? sessionIdFromFile(event.previousSessionFile);
 		if (prevId && prevId !== newId) {
-			if (disabledSessions.delete(prevId)) disabledSessions.add(newId);
+			controller.rekeySession(prevId, newId);
 			await stopSession(prevId);
 		}
 		await startSession(ctx);
+		await controller.reconcileCurrentSession(ctx);
 	};
 	api.on("session_switch", async (event, ctx) => {
 		if (identityControlInFlight) {
@@ -2534,6 +3834,19 @@ export function createNotificationsExtension(
 		await rotateSessionAuthority(event, ctx);
 	});
 
+	const terminalizeInFlightTools = (rt: SessionRuntime, id: string, phase: "cancelled" | "unknown"): void => {
+		if (rt.notificationsActive && !rt.redact) {
+			for (const [toolCallId, { toolName }] of rt.inFlightTools) {
+				try {
+					pushSessionFrame(rt, { type: "tool_activity", sessionId: id, toolCallId, toolName, phase });
+				} catch (e) {
+					logger.warn(`notifications: synthetic tool_activity failed: ${String(e)}`);
+				}
+			}
+		}
+		rt.inFlightTools.clear();
+	};
+
 	// Drive the live typing indicator: mark busy when the agent loop starts so
 	// the daemon shows "typing…" in the thread while the agent is thinking,
 	// before any turn output exists. Cleared on `agent_end` below.
@@ -2546,7 +3859,7 @@ export function createNotificationsExtension(
 		rt.busy = true;
 		const correlation = rt.pendingPromptCorrelations.shift();
 		rt.activePromptCorrelation = correlation;
-		emitAgentLifecycle(rt, { type: "agent_start", sessionId: id, ...correlation });
+		rt.emitPromptLifecycle(correlation, { type: "agent_start", sessionId: id, ...correlation });
 		try {
 			// `activity` is the native live-host lifecycle surface. The separately
 			// emitted agent_start above is replayable with command/turn correlation.
@@ -2562,7 +3875,9 @@ export function createNotificationsExtension(
 	api.on("turn_start", (_event, ctx) => {
 		const id = sessionId(ctx);
 		const rt = runtimes.get(id);
-		if (!rt?.notificationsActive) return;
+		if (!rt) return;
+		rt.turnSeq = (rt.turnSeq ?? 0) + 1;
+		if (!rt.notificationsActive) return;
 		// A new turn is live: re-open the live-stream window (see turnClosed).
 		rt.turnClosed = false;
 		if (rt.pendingInbound.size === 0) return;
@@ -2580,22 +3895,30 @@ export function createNotificationsExtension(
 	// per `turn_end`. turn_end fires once per turn iteration, so a single
 	// user-visible idle previously produced many idle pings (the flood); agent_end
 	// fires exactly once per settle, yielding exactly one idle notification.
-	api.on("agent_end", (_event, ctx) => {
+	api.on("agent_end", (event, ctx) => {
 		const id = sessionId(ctx);
 		const rt = runtimes.get(id);
 		if (!rt) return;
 		// Clear the streaming flag for SDK consumers even when notifications are off.
 		rt.busy = false;
 		const correlation = rt.activePromptCorrelation;
+		if (correlation) {
+			if (rt.recordPromptTerminal(correlation))
+				rt.emitPromptLifecycle(correlation, { type: "agent_end", sessionId: id, ...correlation });
+		} else {
+			rt.emitPromptLifecycle(undefined, { type: "agent_end", sessionId: id });
+		}
 		rt.activePromptCorrelation = undefined;
-		rt.recordPromptTerminal(correlation);
-		emitAgentLifecycle(rt, { type: "agent_end", sessionId: id, ...correlation });
+		terminalizeInFlightTools(rt, id, event.stopReason === "cancelled" ? "cancelled" : "unknown");
 		try {
 			pushSessionFrame(rt, { type: "activity", sessionId: id, state: "idle" });
 		} catch (e) {
 			logger.warn(`notifications: activity (idle) failed: ${String(e)}`);
 		}
 		if (!rt.notificationsActive) return;
+		void (typeof rt.workflowGate?.recoverAcceptedGates === "function"
+			? rt.trackGateResolution(rt.workflowGate.recoverAcceptedGates()).catch(() => {})
+			: Promise.resolve());
 		const seq = rt.idleSeq++;
 		// Re-assert the identity header so the daemon renames the topic once the
 		// session title has been auto-generated ("{repo}/{branch} - {title}"). The
@@ -2667,11 +3990,10 @@ export function createNotificationsExtension(
 		rt.preAskFlushedText = text;
 		// Decision A: a stream-enabled turn must finalize as an in-place edit of ONE
 		// live message, never a fresh (rich-promotable) send. If live frames were
-		// async-queued and none landed before this flush, allocate the per-turn ref
-		// now so the finalized frame always carries a messageRef → the daemon keeps it
-		// editable (HTML edit) and never rich-promotes a streamed final.
-		if (finalAnswer && rt.stream && rt.liveRef === undefined) {
-			rt.turnSeq = (rt.turnSeq ?? 0) + 1;
+		// async-queued and none landed before this flush, reuse the per-turn ref
+		// assigned at turn_start so the finalized frame remains editable (HTML edit)
+		// and never rich-promotes a streamed final.
+		if (finalAnswer && rt.stream && rt.liveRef === undefined && rt.turnSeq !== undefined) {
 			rt.liveRef = String(rt.turnSeq);
 		}
 		try {
@@ -2695,11 +4017,99 @@ export function createNotificationsExtension(
 	// path and ordered before it — unlike message_update, which is queued async),
 	// then flushed here before the ask tool's execute calls registerAsk.
 	api.on("tool_execution_start", (event, ctx) => {
-		if (event.toolName !== "ask") return;
+		if (event.toolName === "ask") {
+			const id = sessionId(ctx);
+			const rt = runtimes.get(id);
+			if (!rt?.notificationsActive || rt.redact) return;
+			flushTurnText(rt, id, rt.currentTurnText, false);
+		}
 		const id = sessionId(ctx);
 		const rt = runtimes.get(id);
 		if (!rt?.notificationsActive || rt.redact) return;
-		flushTurnText(rt, id, rt.currentTurnText, false);
+		rt.inFlightTools.set(event.toolCallId, { toolName: event.toolName, args: event.args });
+		try {
+			pushSessionFrame(rt, {
+				type: "tool_activity",
+				sessionId: id,
+				toolCallId: event.toolCallId,
+				toolName: event.toolName,
+				phase: "started",
+			});
+		} catch (e) {
+			logger.warn(`notifications: tool_activity start failed: ${String(e)}`);
+		}
+	});
+
+	api.on("tool_execution_end", (event, ctx) => {
+		const id = sessionId(ctx);
+		const rt = runtimes.get(id);
+		if (!rt) return;
+		const inFlight = rt.inFlightTools.get(event.toolCallId);
+		if (!rt.notificationsActive || rt.redact) {
+			rt.inFlightTools.delete(event.toolCallId);
+			return;
+		}
+		try {
+			const frame: {
+				type: "tool_activity";
+				sessionId: string;
+				toolCallId: string;
+				toolName: string;
+				phase: "completed" | "failed";
+				isError: boolean;
+				argsSummary?: string;
+				resultSummary?: string;
+			} = {
+				type: "tool_activity",
+				sessionId: id,
+				toolCallId: event.toolCallId,
+				toolName: event.toolName,
+				phase: event.isError ? "failed" : "completed",
+				isError: event.isError,
+			};
+			if (rt.verbosity === "verbose") {
+				const tool = ctx.resolveTool(event.toolName);
+				const argsSummary = projectToolSummary(tool, "args", inFlight?.args);
+				const resultSummary = projectToolSummary(tool, "result", event.result);
+				if (argsSummary !== undefined) frame.argsSummary = argsSummary;
+				if (resultSummary !== undefined) frame.resultSummary = resultSummary;
+			}
+			pushSessionFrame(rt, frame);
+		} catch (e) {
+			logger.warn(`notifications: tool_activity end failed: ${String(e)}`);
+		} finally {
+			rt.inFlightTools.delete(event.toolCallId);
+		}
+	});
+
+	api.on("reasoning_summary_end", (event, ctx) => {
+		const id = sessionId(ctx);
+		const rt = runtimes.get(id);
+		if (!rt?.notificationsActive || rt.redact || rt.verbosity !== "verbose") return;
+		if (!event.message || typeof event.message !== "object" || !("content" in event.message)) return;
+		const content = event.message.content;
+		if (!Array.isArray(content)) return;
+		const block = content[event.contentIndex];
+		if (block?.type !== "thinking" || (block.provenance !== "summary" && block.provenance !== "mixed")) return;
+		// CoT boundary: emit ONLY the canonical provider-marked summaryText. Never
+		// fall back to the event payload, which could carry inconsistent/mutated text.
+		const text = block.summaryText;
+		if (typeof text !== "string" || text === "") return;
+		try {
+			pushSessionFrame(rt, {
+				type: "reasoning_summary",
+				sessionId: id,
+				text,
+				// Coalesce on the reasoning block's stable itemId carried on the event, NOT
+				// the mutable rt.turnSeq: a streamed reasoning_summary_end is queued async and
+				// turn_start for the next iteration advances turnSeq synchronously first, so
+				// reading turnSeq here could bind turn N's summary to turn N+1. Absent an
+				// itemId, omit turnRef (threaded-render sends a fresh non-editable message).
+				...((block as { itemId?: string }).itemId ? { turnRef: (block as { itemId?: string }).itemId } : {}),
+			});
+		} catch (e) {
+			logger.warn(`notifications: reasoning_summary failed: ${String(e)}`);
+		}
 	});
 
 	api.on("turn_end", (event, ctx) => {
@@ -2729,8 +4139,7 @@ export function createNotificationsExtension(
 		const rt = runtimes.get(id);
 		if (!rt?.notificationsActive || !rt.stream || rt.redact || rt.turnClosed) return;
 		if ((event.message as { role?: unknown }).role !== "assistant") return;
-		if (rt.liveRef === undefined) {
-			rt.turnSeq = (rt.turnSeq ?? 0) + 1;
+		if (rt.liveRef === undefined && rt.turnSeq !== undefined) {
 			rt.liveRef = String(rt.turnSeq);
 		}
 		const now = Date.now();
@@ -2776,6 +4185,12 @@ export function createNotificationsExtension(
 	});
 
 	api.on("session_shutdown", async (_event, ctx) => {
-		await stopSession(sessionId(ctx));
+		const id = sessionId(ctx);
+		const rt = runtimes.get(id);
+		if (rt) terminalizeInFlightTools(rt, id, "unknown");
+		const controllerStop =
+			typeof ctx.sessionManager.getCwd === "function" ? controller.stopCurrentSession(ctx) : Promise.resolve(false);
+		void controllerStop.catch(error => logger.warn(`notifications: controller shutdown failed: ${String(error)}`));
+		await stopSession(id);
 	});
 }

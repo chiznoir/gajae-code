@@ -19,11 +19,10 @@ import type { AgentTool, AgentToolResult, AgentToolUpdateCallback } from "@gajae
 import type { Model, Usage } from "@gajae-code/ai";
 import { $env, prompt, Snowflake } from "@gajae-code/utils";
 import type { ToolSession } from "..";
-import { AsyncJobManager } from "../async";
+import { AsyncJobManager, OwnerSubagentShutdownError, type ResumeRunner } from "../async";
 import { resolveAgentModelPatterns } from "../config/model-resolver";
 import type { Theme } from "../modes/theme/theme";
 import planModeSubagentPrompt from "../prompts/system/plan-mode-subagent.md" with { type: "text" };
-import subagentUserPromptTemplate from "../prompts/system/subagent-user-prompt.md" with { type: "text" };
 import taskDescriptionTemplate from "../prompts/tools/task.md" with { type: "text" };
 import taskSummaryTemplate from "../prompts/tools/task-summary.md" with { type: "text" };
 import type { ForkContextSeed } from "../session/agent-session";
@@ -48,7 +47,7 @@ import type { LocalProtocolOptions } from "../internal-urls";
 import { generateCommitMessage } from "../utils/commit-message-generator";
 import * as git from "../utils/git";
 import { discoverAgents, filterVisibleAgents, getAgent } from "./discovery";
-import { runSubprocess } from "./executor";
+import { renderSubagentUserPrompt, runSubprocess } from "./executor";
 import { adviseForkContextMode } from "./fork-context-advisory";
 import { FORK_CONTEXT_TOKEN_BUDGET_BY_MODE } from "./fork-context-budget";
 import { getTaskIdValidationError, validateAllocatedTaskId } from "./id";
@@ -87,11 +86,8 @@ interface TaskResumeDescriptor {
 function isTaskResumeDescriptor(value: unknown): value is TaskResumeDescriptor {
 	return typeof value === "object" && value !== null && "task" in value && "params" in value;
 }
-function renderSubagentUserPrompt(assignment: string, simpleMode: TaskSimpleMode): string {
-	return prompt.render(subagentUserPromptTemplate, {
-		assignment: assignment.trim(),
-		independentMode: simpleMode === "independent",
-	});
+function renderTaskAssignment(assignment: string, simpleMode: TaskSimpleMode): string {
+	return renderSubagentUserPrompt(assignment, simpleMode === "independent");
 }
 function createUsageTotals(): Usage {
 	return {
@@ -293,23 +289,30 @@ function requestsForkContext(
 	return FORK_CONTEXT_REQUEST_MODE_SET.has(task.inheritContext);
 }
 
+function normalizeForkContextCap(value: number | undefined, fallback: number, maximum: number): number {
+	if (value === undefined || !Number.isFinite(value) || value <= 0) return fallback;
+	return Math.min(maximum, Math.max(1, Math.trunc(value)));
+}
+
 function resolveForkSeedParamsForMode(
 	mode: ForkContextMode,
 	configuredMaxMessages: number | undefined,
 	configuredMaxTokens: number,
 	model: Model | undefined,
-): { maxMessages: number; maxTokens: number } | undefined {
+): { maxMessages: number; maxTokens: number; preserveLatestUser?: boolean } | undefined {
 	const capMessages = (defaultMaxMessages: number): number =>
-		configuredMaxMessages === undefined
-			? defaultMaxMessages
-			: Math.min(defaultMaxMessages, Math.max(0, Math.trunc(configuredMaxMessages)));
+		normalizeForkContextCap(configuredMaxMessages, defaultMaxMessages, defaultMaxMessages);
 	switch (mode) {
 		case "none":
 			return undefined;
 		case "receipt":
 			return { maxMessages: 1, maxTokens: FORK_CONTEXT_TOKEN_BUDGET_BY_MODE.receipt };
 		case "last-turn":
-			return { maxMessages: 2, maxTokens: FORK_CONTEXT_TOKEN_BUDGET_BY_MODE["last-turn"] };
+			return {
+				maxMessages: 2,
+				maxTokens: FORK_CONTEXT_TOKEN_BUDGET_BY_MODE["last-turn"],
+				preserveLatestUser: true,
+			};
 		case "bounded":
 			return { maxMessages: capMessages(50), maxTokens: FORK_CONTEXT_TOKEN_BUDGET_BY_MODE.bounded };
 		case "full":
@@ -343,9 +346,12 @@ function validateForkContextRequests(
 }
 
 export function resolveForkContextMaxTokens(configured: number, model: Model | undefined): number {
-	if (configured > 0) return Math.trunc(configured);
-	const contextWindow = model?.contextWindow ?? 0;
-	return contextWindow > 0 ? Math.max(1, Math.floor(contextWindow * 0.15)) : 15_000;
+	const contextWindow = model?.contextWindow;
+	const fallback =
+		contextWindow && Number.isFinite(contextWindow) && contextWindow > 0
+			? Math.max(1, Math.floor(contextWindow * 0.15))
+			: 15_000;
+	return normalizeForkContextCap(configured, fallback, Number.MAX_SAFE_INTEGER);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -507,7 +513,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				agent: params.agent,
 				agentSource: fallbackAgentSource,
 				status: "pending",
-				task: renderSubagentUserPrompt(assignment, simpleMode),
+				task: renderTaskAssignment(assignment, simpleMode),
 				assignment,
 				description: taskItem.description,
 				recentTools: [],
@@ -547,8 +553,9 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		};
 
 		const maxConcurrency = this.session.settings.get("task.maxConcurrency");
+		let resumeRunner: ResumeRunner | undefined;
 		if (typeof manager.setResumeRunner === "function") {
-			manager.setResumeRunner((_subagentId, message, resumeDescriptor) => {
+			resumeRunner = (_subagentId, message, resumeDescriptor) => {
 				const descriptor = isTaskResumeDescriptor(resumeDescriptor?.data) ? resumeDescriptor.data : undefined;
 				if (!descriptor) return undefined;
 				const forkSeeds = descriptor.forkContextSeed
@@ -590,7 +597,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						},
 					},
 				);
-			});
+			};
+			manager.setResumeRunner(resumeRunner);
 		}
 		const semaphore = new Semaphore(maxConcurrency);
 		const buildForkContextSeedForTask = async (task: TaskItem): Promise<ForkContextSeed | undefined> => {
@@ -631,6 +639,15 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 
 			const uniqueId = validateAllocatedTaskId(uniqueIds[i] ?? "");
 			const frozenForkSeed = await buildForkContextSeedForTask(taskItem);
+			if (signal?.aborted) {
+				for (let skippedIndex = i; skippedIndex < taskItems.length; skippedIndex++) {
+					const skippedTask = taskItems[skippedIndex]!;
+					failedSchedules.push(`${skippedTask.id}: cancelled before scheduling`);
+					const skippedProgress = progressByTaskId.get(skippedTask.id);
+					if (skippedProgress) skippedProgress.status = "aborted";
+				}
+				break;
+			}
 			if (frozenForkSeed) frozenForkSeeds.set(uniqueId, frozenForkSeed);
 			const singleParams: TaskParams = { ...params, tasks: [taskItem] };
 			const label = uniqueId;
@@ -770,18 +787,21 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				);
 				startedJobs.push({ jobId, taskId: taskItem.id });
 				if (typeof manager.registerResumeDescriptor === "function") {
-					manager.registerResumeDescriptor({
-						subagentId: uniqueId,
-						ownerId: this.session.getAgentId?.() ?? undefined,
-						data: {
-							toolCallId: _toolCallId,
-							params,
-							task: { ...taskItem, id: uniqueId },
-							sessionFile: subtaskSessionFile,
-							forkContextSeed: frozenForkSeed,
-							agentSource: fallbackAgentSource,
-						} satisfies TaskResumeDescriptor,
-					});
+					manager.registerResumeDescriptor(
+						{
+							subagentId: uniqueId,
+							ownerId: this.session.getAgentId?.() ?? undefined,
+							data: {
+								toolCallId: _toolCallId,
+								params,
+								task: { ...taskItem, id: uniqueId },
+								sessionFile: subtaskSessionFile,
+								forkContextSeed: frozenForkSeed,
+								agentSource: fallbackAgentSource,
+							} satisfies TaskResumeDescriptor,
+						},
+						resumeRunner,
+					);
 				}
 				if (typeof manager.registerSubagentRecord === "function") {
 					manager.registerSubagentRecord({
@@ -795,7 +815,12 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					});
 				}
 			} catch (error) {
-				const message = error instanceof Error ? error.message : String(error);
+				const message =
+					error instanceof OwnerSubagentShutdownError
+						? error.message
+						: error instanceof Error
+							? error.message
+							: String(error);
 				failedSchedules.push(`${taskItem.id}: ${message}`);
 				const progress = progressByTaskId.get(taskItem.id);
 				if (progress) {
@@ -1222,7 +1247,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					agent: agentName,
 					agentSource: agent.source,
 					status: "pending",
-					task: renderSubagentUserPrompt(assignment, simpleMode),
+					task: renderTaskAssignment(assignment, simpleMode),
 					assignment,
 					recentTools: [],
 					recentOutput: [],
@@ -1287,7 +1312,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					const result = await runSubprocess({
 						cwd: this.session.cwd,
 						agent: effectiveAgent,
-						task: renderSubagentUserPrompt(task.assignment, simpleMode),
+						task: renderTaskAssignment(task.assignment, simpleMode),
 						assignment: task.assignment.trim(),
 						context: sharedContext,
 						description: task.description,
@@ -1351,7 +1376,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						cwd: this.session.cwd,
 						worktree: isolationDir,
 						agent: effectiveAgent,
-						task: renderSubagentUserPrompt(task.assignment, simpleMode),
+						task: renderTaskAssignment(task.assignment, simpleMode),
 						assignment: task.assignment.trim(),
 						context: sharedContext,
 						description: task.description,
@@ -1464,7 +1489,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						id: task.id,
 						agent: agent.name,
 						agentSource: agent.source,
-						task: renderSubagentUserPrompt(assignment, simpleMode),
+						task: renderTaskAssignment(assignment, simpleMode),
 						assignment,
 						description: task.description,
 						exitCode: 1,
@@ -1504,7 +1529,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					id: task.id,
 					agent: agentName,
 					agentSource: agent.source,
-					task: renderSubagentUserPrompt(assignment, simpleMode),
+					task: renderTaskAssignment(assignment, simpleMode),
 					assignment,
 					description: task.description,
 					exitCode: 1,

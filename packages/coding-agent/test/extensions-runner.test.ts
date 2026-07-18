@@ -56,6 +56,35 @@ describe("ExtensionRunner", () => {
 		};
 	};
 
+	describe("safe tool resolver", () => {
+		it("exposes only tool safe-summary metadata through extension context", () => {
+			const safeSummary = (kind: "args" | "result", value: unknown) =>
+				kind === "args" ? `safe:${String(value)}` : undefined;
+			const resolver = vi.fn((name: string) =>
+				name === "safe-tool"
+					? { safeSummary, safeSummaryFields: { args: ["path"], result: ["status"] } }
+					: undefined,
+			);
+			const runner = new ExtensionRunner(
+				[],
+				{ flagValues: new Map(), pendingProviderRegistrations: [] } as never,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			runner.initialize({} as never, { resolveTool: resolver } as never);
+
+			const ctx = runner.createContext();
+			expect(ctx.resolveTool("safe-tool")).toEqual({
+				safeSummary,
+				safeSummaryFields: { args: ["path"], result: ["status"] },
+			});
+			expect(ctx.resolveTool("unknown-tool")).toBeUndefined();
+			expect(resolver).toHaveBeenCalledWith("safe-tool");
+			expect(resolver).toHaveBeenCalledWith("unknown-tool");
+		});
+	});
+
 	describe("shortcut conflicts", () => {
 		it("warns when extension shortcut conflicts with built-in", async () => {
 			const extCode = `
@@ -747,11 +776,20 @@ describe("ExtensionRunner", () => {
 					setLabel: () => {},
 					getActiveTools: () => [],
 					getAllTools: () => [],
+					resolveTool: () => undefined,
 					setActiveTools: async () => {},
 					getCommands: () => [],
 					setModel: async () => false,
 					getThinkingLevel: () => undefined,
 					setThinkingLevel: () => {},
+					getThinkingVisibility: () => "visible",
+					setThinkingVisibility: () => {},
+					cycleThinkingLevel: () => undefined,
+					setThinkingLevelForControl: async () => {},
+					setThinkingVisibilityForControl: async () => {},
+					setModelTemporaryForControl: async () => false,
+					fetchUsageReportsForControl: async () => null,
+					getThinkingScopeForControl: () => "global config",
 					getSessionName: () => sessionManager.getSessionName(),
 					setSessionName: async () => {},
 				},
@@ -815,11 +853,20 @@ describe("ExtensionRunner", () => {
 					setLabel: () => {},
 					getActiveTools: () => [],
 					getAllTools: () => [],
+					resolveTool: () => undefined,
 					setActiveTools: async () => {},
 					getCommands: () => [],
 					setModel: async () => false,
 					getThinkingLevel: () => undefined,
 					setThinkingLevel: () => {},
+					getThinkingVisibility: () => "visible",
+					setThinkingVisibility: () => {},
+					cycleThinkingLevel: () => undefined,
+					setThinkingLevelForControl: async () => {},
+					setThinkingVisibilityForControl: async () => {},
+					setModelTemporaryForControl: async () => false,
+					fetchUsageReportsForControl: async () => null,
+					getThinkingScopeForControl: () => "global config",
 					getSessionName: () => sessionManager.getSessionName(),
 					setSessionName: async name => {
 						await sessionManager.setSessionName(name);
@@ -859,11 +906,20 @@ describe("ExtensionRunner", () => {
 				setLabel: () => {},
 				getActiveTools: () => [],
 				getAllTools: () => [],
+				resolveTool: () => undefined,
 				setActiveTools: async () => {},
 				getCommands: () => [],
 				setModel: async () => false,
 				getThinkingLevel: () => undefined,
 				setThinkingLevel: () => {},
+				getThinkingVisibility: () => "visible" as const,
+				setThinkingVisibility: () => {},
+				cycleThinkingLevel: () => undefined,
+				setThinkingLevelForControl: async () => {},
+				setThinkingVisibilityForControl: async () => {},
+				setModelTemporaryForControl: async () => false,
+				fetchUsageReportsForControl: async () => null,
+				getThinkingScopeForControl: () => "global config" as const,
 				getSessionName: () => undefined,
 				setSessionName: async () => {},
 			};
@@ -1188,11 +1244,20 @@ describe("ExtensionRunner", () => {
 					setLabel: () => {},
 					getActiveTools: () => [],
 					getAllTools: () => [],
+					resolveTool: () => undefined,
 					setActiveTools: async () => {},
 					getCommands: () => [],
 					setModel: async () => false,
 					getThinkingLevel: () => undefined,
 					setThinkingLevel: () => {},
+					getThinkingVisibility: () => "visible",
+					setThinkingVisibility: () => {},
+					cycleThinkingLevel: () => undefined,
+					setThinkingLevelForControl: async () => {},
+					setThinkingVisibilityForControl: async () => {},
+					setModelTemporaryForControl: async () => false,
+					fetchUsageReportsForControl: async () => null,
+					getThinkingScopeForControl: () => "global config",
 					getSessionName: () => sessionManager.getSessionName(),
 					setSessionName: async () => {},
 				},

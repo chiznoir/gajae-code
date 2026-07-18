@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { THINKING_CONTROL_MODES } from "@gajae-code/ai";
 import {
 	applyGeneratedModelPolicies,
 	clampThinkingLevelForModel,
@@ -9,7 +10,7 @@ import {
 	mapEffortToGoogleThinkingLevel,
 	requireSupportedEffort,
 } from "@gajae-code/ai/model-thinking";
-import type { Api, Model, Provider } from "@gajae-code/ai/types";
+import type { Api, Model, Provider, ThinkingControlMode } from "@gajae-code/ai/types";
 
 function createModel<TApi extends Api>(overrides: {
 	id: string;
@@ -30,6 +31,14 @@ function createModel<TApi extends Api>(overrides: {
 		maxTokens: 32000,
 	});
 }
+
+describe("thinking control modes", () => {
+	it("exports the canonical runtime vocabulary without duplicates", () => {
+		const modes: readonly ThinkingControlMode[] = THINKING_CONTROL_MODES;
+		expect(modes).toEqual(["effort", "budget", "google-level", "anthropic-adaptive", "anthropic-budget-effort"]);
+		expect(new Set(modes).size).toBe(modes.length);
+	});
+});
 
 describe("model thinking metadata", () => {
 	it("stores supported efforts for Codex mini in model metadata", () => {
@@ -410,32 +419,33 @@ describe("generated model policies", () => {
 		}
 	});
 
-	it("normalizes GPT-5.6 tier context windows to the 373K prompt budget", () => {
+	it("caps only Codex product GPT-5.6 tiers at the 272K prompt budget", () => {
 		const models: Model<Api>[] = [
 			{
-				...createModel({
-					id: "gpt-5.6-sol",
-					api: "openai-codex-responses",
-					provider: "openai-codex",
-				}),
+				...createModel({ id: "gpt-5.6-sol", api: "openai-codex-responses", provider: "openai-codex" }),
 				contextWindow: 1_050_000,
 				maxTokens: 128000,
 			},
 			{
-				...createModel({
-					id: "gpt-5.6-terra",
-					api: "openai-responses",
-					provider: "openai",
-				}),
-				contextWindow: 272000,
+				...createModel({ id: "gpt-5.6-terra", api: "openai-responses", provider: "openai" }),
+				contextWindow: 1_050_000,
+				maxTokens: 128000,
+			},
+			{
+				...createModel({ id: "gpt-5.6-luna", api: "openai-codex-responses", provider: "custom" }),
+				contextWindow: 200_000,
+				maxTokens: 128000,
+			},
+			{
+				...createModel({ id: "gpt-5.6-codex", api: "openai-codex-responses", provider: "openai-codex" }),
+				contextWindow: 373_000,
 				maxTokens: 128000,
 			},
 		];
 
 		applyGeneratedModelPolicies(models);
 
-		expect(models[0]?.contextWindow).toBe(373_000);
-		expect(models[1]?.contextWindow).toBe(373_000);
+		expect(models.map(model => model.contextWindow)).toEqual([272_000, 1_050_000, 200_000, 272_000]);
 		expect(models[0]?.applyPatchToolType).toBe("freeform");
 		expect(models[1]?.applyPatchToolType).toBe("freeform");
 	});

@@ -1,6 +1,7 @@
 /**
  * CLI argument parsing and help display
  */
+import * as path from "node:path";
 import { type Effort, THINKING_EFFORTS } from "@gajae-code/ai";
 import { APP_NAME, CONFIG_DIR_NAME, logger } from "@gajae-code/utils";
 import { CliParseError } from "@gajae-code/utils/cli";
@@ -24,6 +25,7 @@ export interface Args {
 	credential?: string;
 	systemPrompt?: string;
 	appendSystemPrompt?: string;
+	mcpConfig?: string;
 	thinking?: Effort;
 	continue?: boolean;
 	resume?: string | true;
@@ -57,6 +59,8 @@ export interface Args {
 	fileArgs: string[];
 	/** Retained for test/runtime compatibility; extension-defined flags are no longer parsed. */
 	unknownFlags: Map<string, boolean | string>;
+	/** Exact interactive startup login intent, recognized before model-profile activation. */
+	authBootstrap?: true;
 }
 
 function isStartupSlashCommandArg(arg: string | undefined): boolean {
@@ -66,6 +70,13 @@ function isStartupSlashCommandArg(arg: string | undefined): boolean {
 		arg === "/provicer" ||
 		arg?.startsWith("/provicer:") === true
 	);
+}
+
+function isStartupLoginCommandArg(args: readonly string[], index: number): boolean {
+	const command = args[index];
+	if (command !== "/login" && command !== "login") return false;
+	const argumentCount = args.length - index - 1;
+	return argumentCount === 0 || (argumentCount === 1 && !args[index + 1].startsWith("-"));
 }
 
 export function parseArgs(args: string[]): Args {
@@ -78,6 +89,12 @@ export function parseArgs(args: string[]): Args {
 	for (let i = 0; i < args.length; i++) {
 		let arg = args[i];
 
+		if (isStartupLoginCommandArg(args, i)) {
+			result.authBootstrap = true;
+			const loginCommand = arg === "login" ? "/login" : arg;
+			result.messages.push([loginCommand, ...args.slice(i + 1)].join(" "));
+			break;
+		}
 		if (isStartupSlashCommandArg(arg)) {
 			result.messages.push(args.slice(i).join(" "));
 			break;
@@ -147,6 +164,15 @@ export function parseArgs(args: string[]): Args {
 			result.systemPrompt = args[++i];
 		} else if (arg === "--append-system-prompt" && i + 1 < args.length) {
 			result.appendSystemPrompt = args[++i];
+		} else if (arg === "--mcp-config") {
+			if (result.mcpConfig !== undefined) {
+				throw new CliParseError("--mcp-config can only be specified once");
+			}
+			const next = args[i + 1];
+			if (!next || next.startsWith("-") || !path.isAbsolute(next)) {
+				throw new CliParseError("--mcp-config requires <absolute-path>");
+			}
+			result.mcpConfig = args[++i];
 		} else if (arg === "--provider-session-id" && i + 1 < args.length) {
 			result.providerSessionId = args[++i];
 		} else if (arg === "--no-session") {
@@ -215,6 +241,14 @@ export function parseArgs(args: string[]): Args {
 
 	if (result.default && !result.mpreset) {
 		throw new Error("--default requires --mpreset <name>");
+	}
+	if (
+		result.mcpConfig !== undefined &&
+		(result.mode === "acp" || result.listModels !== undefined || result.export !== undefined)
+	) {
+		throw new CliParseError(
+			"--mcp-config is only supported in standalone interactive, tmux, print, text, or json modes.",
+		);
 	}
 
 	return result;

@@ -23,6 +23,7 @@ import { HookInputComponent } from "../../modes/components/hook-input";
 import { HookSelectorComponent } from "../../modes/components/hook-selector";
 import { getAvailableThemesWithPaths, getThemeByName, setTheme, type Theme, theme } from "../../modes/theme/theme";
 import type { InteractiveModeContext } from "../../modes/types";
+import { createReadonlySessionManager } from "../../session/session-manager";
 import { parseThinkingLevel } from "../../thinking";
 import type { TodoPhase } from "../../tools/todo-write";
 import { setSessionTerminalTitle, setTerminalTitle } from "../../utils/title-generator";
@@ -51,6 +52,40 @@ export class ExtensionUiController {
 		this.#activeHookCustomOverlay = undefined;
 		component?.dispose?.();
 		overlay?.hide();
+	}
+
+	captureSessionUiCleanup(): () => void {
+		const terminalInputUnsubscribers = [...this.#extensionTerminalInputUnsubscribers];
+		const widgetsAbove = [...this.#hookWidgetsAbove.entries()];
+		const widgetsBelow = [...this.#hookWidgetsBelow.entries()];
+		const activeHookCustomComponent = this.#activeHookCustomComponent;
+		const activeHookCustomOverlay = this.#activeHookCustomOverlay;
+		return () => {
+			for (const unsubscribe of terminalInputUnsubscribers) {
+				unsubscribe();
+				this.#extensionTerminalInputUnsubscribers.delete(unsubscribe);
+			}
+			let widgetsChanged = false;
+			for (const [key, widget] of widgetsAbove) {
+				if (this.#hookWidgetsAbove.get(key) !== widget) continue;
+				this.#hookWidgetsAbove.delete(key);
+				widget.dispose?.();
+				widgetsChanged = true;
+			}
+			for (const [key, widget] of widgetsBelow) {
+				if (this.#hookWidgetsBelow.get(key) !== widget) continue;
+				this.#hookWidgetsBelow.delete(key);
+				widget.dispose?.();
+				widgetsChanged = true;
+			}
+			if (
+				this.#activeHookCustomComponent === activeHookCustomComponent &&
+				this.#activeHookCustomOverlay === activeHookCustomOverlay
+			) {
+				this.#clearActiveHookCustom();
+			}
+			if (widgetsChanged) this.#rebuildHookWidgets();
+		};
 	}
 
 	#sdkControl = async (operation: string, input: Record<string, unknown>): Promise<unknown> => {
@@ -322,15 +357,29 @@ export class ExtensionUiController {
 			},
 			getActiveTools: () => this.ctx.session.getActiveToolNames(),
 			getAllTools: () => this.ctx.session.getAllToolNames(),
+			resolveTool: name => {
+				const tool = this.ctx.session.getToolByName(name);
+				return tool ? { safeSummary: tool.safeSummary, safeSummaryFields: tool.safeSummaryFields } : undefined;
+			},
 			setActiveTools: toolNames => this.ctx.session.setActiveToolsByName(toolNames),
 			setModel: async model => {
 				const key = await this.ctx.session.modelRegistry.getApiKey(model);
 				if (!key) return false;
-				await this.ctx.session.setModel(model);
+				await this.ctx.session.setModel(model, "default", { cause: "user-selection" });
 				return true;
 			},
 			getThinkingLevel: () => this.ctx.session.thinkingLevel,
-			setThinkingLevel: level => this.ctx.session.setThinkingLevel(level),
+			setThinkingLevel: (level, persist) => this.ctx.session.setThinkingLevel(level, persist),
+			getThinkingVisibility: () => this.ctx.session.getThinkingVisibility(),
+			setThinkingVisibility: (visibility, persist) => this.ctx.session.setThinkingVisibility(visibility, persist),
+			cycleThinkingLevel: () => this.ctx.session.cycleThinkingLevel(),
+			setThinkingLevelForControl: (level, persist) => this.ctx.session.setThinkingLevelForControl(level, persist),
+			setThinkingVisibilityForControl: (visibility, persist) =>
+				this.ctx.session.setThinkingVisibilityForControl(visibility, persist),
+			setModelTemporaryForControl: (model, expectedSessionId) =>
+				this.ctx.session.setModelTemporaryForControl(model, expectedSessionId),
+			fetchUsageReportsForControl: () => this.ctx.session.fetchUsageReportsForControl(),
+			getThinkingScopeForControl: () => this.ctx.session.getThinkingScopeForControl(),
 			getCommands: () => getSessionSlashCommands(this.ctx.session),
 			getSessionName: () => this.ctx.sessionManager.getSessionName(),
 			setSessionName: name => this.#updateSessionName(name),
@@ -348,6 +397,10 @@ export class ExtensionUiController {
 			getQueuedMessages: () => this.ctx.session.getQueuedMessageEntries(),
 			getActiveTools: () => this.ctx.session.getActiveToolNames(),
 			getAllTools: () => this.ctx.session.getAllToolNames(),
+			resolveTool: name => {
+				const tool = this.ctx.session.getToolByName(name);
+				return tool ? { safeSummary: tool.safeSummary, safeSummaryFields: tool.safeSummaryFields } : undefined;
+			},
 
 			shutdown: () => {
 				// Defer the actual teardown to the main loop, which calls
@@ -404,36 +457,30 @@ export class ExtensionUiController {
 				this.ctx.showStatus("Reloaded session");
 			},
 			newSession: async options => {
-				// Stop any loading animation
+				const cleanupPreviousSessionUi = this.captureSessionUiCleanup();
+				const success = await this.ctx.session.newSession({ parentSession: options?.parentSession });
+				if (!success) {
+					return { cancelled: true };
+				}
+				cleanupPreviousSessionUi();
+
 				if (this.ctx.loadingAnimation) {
 					this.ctx.loadingAnimation.stop();
 					this.ctx.loadingAnimation = undefined;
 				}
 				this.ctx.statusContainer.clear();
-
-				// Create new session
-				this.clearExtensionTerminalInputListeners();
-				this.clearHookWidgets();
-				const success = await this.ctx.session.newSession({ parentSession: options?.parentSession });
-				if (!success) {
-					return { cancelled: true };
-				}
 				this.ctx.resetIrcSidebarSession();
-
 				setSessionTerminalTitle(this.ctx.sessionManager.getSessionName(), this.ctx.sessionManager.getCwd());
 
-				// Call setup callback if provided
 				if (options?.setup) {
 					await options.setup(this.ctx.sessionManager);
 				}
 
-				// Reset and update status line
 				this.ctx.statusLine.invalidate();
 				this.ctx.statusLine.setSessionStartTime(Date.now());
 				this.ctx.updateEditorTopBorder();
 				this.ctx.ui.requestRender();
 
-				// Clear UI state
 				prepareTranscriptRebuild(this.ctx.ui, "replace-identity");
 				this.ctx.chatContainer.clear();
 				this.ctx.pendingMessagesContainer.clear();
@@ -612,15 +659,29 @@ export class ExtensionUiController {
 			},
 			getActiveTools: () => this.ctx.session.getActiveToolNames(),
 			getAllTools: () => this.ctx.session.getAllToolNames(),
+			resolveTool: name => {
+				const tool = this.ctx.session.getToolByName(name);
+				return tool ? { safeSummary: tool.safeSummary, safeSummaryFields: tool.safeSummaryFields } : undefined;
+			},
 			setActiveTools: toolNames => this.ctx.session.setActiveToolsByName(toolNames),
 			setModel: async model => {
 				const key = await this.ctx.session.modelRegistry.getApiKey(model);
 				if (!key) return false;
-				await this.ctx.session.setModel(model);
+				await this.ctx.session.setModel(model, "default", { cause: "user-selection" });
 				return true;
 			},
 			getThinkingLevel: () => this.ctx.session.thinkingLevel,
 			setThinkingLevel: (level, persist) => this.ctx.session.setThinkingLevel(level, persist),
+			getThinkingVisibility: () => this.ctx.session.getThinkingVisibility(),
+			setThinkingVisibility: (visibility, persist) => this.ctx.session.setThinkingVisibility(visibility, persist),
+			cycleThinkingLevel: () => this.ctx.session.cycleThinkingLevel(),
+			setThinkingLevelForControl: (level, persist) => this.ctx.session.setThinkingLevelForControl(level, persist),
+			setThinkingVisibilityForControl: (visibility, persist) =>
+				this.ctx.session.setThinkingVisibilityForControl(visibility, persist),
+			setModelTemporaryForControl: (model, expectedSessionId) =>
+				this.ctx.session.setModelTemporaryForControl(model, expectedSessionId),
+			fetchUsageReportsForControl: () => this.ctx.session.fetchUsageReportsForControl(),
+			getThinkingScopeForControl: () => this.ctx.session.getThinkingScopeForControl(),
 			getCommands: () => getSessionSlashCommands(this.ctx.session),
 			getSessionName: () => this.ctx.sessionManager.getSessionName(),
 			setSessionName: name => this.#updateSessionName(name),
@@ -638,6 +699,10 @@ export class ExtensionUiController {
 			getQueuedMessages: () => this.ctx.session.getQueuedMessageEntries(),
 			getActiveTools: () => this.ctx.session.getActiveToolNames(),
 			getAllTools: () => this.ctx.session.getAllToolNames(),
+			resolveTool: name => {
+				const tool = this.ctx.session.getToolByName(name);
+				return tool ? { safeSummary: tool.safeSummary, safeSummaryFields: tool.safeSummaryFields } : undefined;
+			},
 
 			shutdown: () => {
 				// Defer the actual teardown to the main loop, which calls
@@ -697,28 +762,24 @@ export class ExtensionUiController {
 				if (this.ctx.isBackgrounded) {
 					return { cancelled: true };
 				}
-				// Stop any loading animation
+				const cleanupPreviousSessionUi = this.captureSessionUiCleanup();
+				const success = await this.ctx.session.newSession({ parentSession: options?.parentSession });
+				if (!success) {
+					return { cancelled: true };
+				}
+				cleanupPreviousSessionUi();
+
 				if (this.ctx.loadingAnimation) {
 					this.ctx.loadingAnimation.stop();
 					this.ctx.loadingAnimation = undefined;
 				}
 				this.ctx.statusContainer.clear();
-
-				// Create new session
-				this.clearExtensionTerminalInputListeners();
-				this.clearHookWidgets();
-				const success = await this.ctx.session.newSession({ parentSession: options?.parentSession });
-				if (!success) {
-					return { cancelled: true };
-				}
 				this.ctx.resetIrcSidebarSession();
 
-				// Call setup callback if provided
 				if (options?.setup) {
 					await options.setup(this.ctx.sessionManager);
 				}
 
-				// Clear UI state
 				prepareTranscriptRebuild(this.ctx.ui, "replace-identity");
 				this.ctx.chatContainer.clear();
 				this.ctx.pendingMessagesContainer.clear();
@@ -848,7 +909,7 @@ export class ExtensionUiController {
 						compact: instructionsOrOptions => this.#compactSession(instructionsOrOptions),
 						hasUI: !this.ctx.isBackgrounded,
 						cwd: this.ctx.sessionManager.getCwd(),
-						sessionManager: this.ctx.session.sessionManager,
+						sessionManager: createReadonlySessionManager(this.ctx.session.sessionManager),
 						modelRegistry: this.ctx.session.modelRegistry,
 						model: this.ctx.session.model,
 						isIdle: () => !this.ctx.session.isStreaming,
@@ -861,6 +922,12 @@ export class ExtensionUiController {
 						getQueuedMessages: () => this.ctx.session.getQueuedMessageEntries(),
 						getActiveTools: () => this.ctx.session.getActiveToolNames(),
 						getAllTools: () => this.ctx.session.getAllToolNames(),
+						resolveTool: name => {
+							const tool = this.ctx.session.getToolByName(name);
+							return tool
+								? { safeSummary: tool.safeSummary, safeSummaryFields: tool.safeSummaryFields }
+								: undefined;
+						},
 						hasQueuedMessages: () => this.ctx.session.queuedMessageCount > 0,
 						abort: () => {
 							this.ctx.session.abort();

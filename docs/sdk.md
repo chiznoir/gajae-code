@@ -1,6 +1,7 @@
 # Gajae-Code SDK
 
 For embedding GJC in-process, see [the embedding SDK guide](./sdk-embedding.md).
+For a beginner-friendly application development guide (recipes, customization, and surface selection), see [Building applications on the SDK](./sdk-app-guide.md).
 
 <p align="center">
   <img src="../assets/telegram-mobile-hero.png" alt="Gajae Code mobile answers for coding agents hero illustration" width="100%" />
@@ -19,6 +20,20 @@ N-API, or wire-protocol change is required for a new integration.
 > lifecycle, loopback WebSocket server, and endpoint discovery file. The bundled
 > Telegram daemon is a reference client layered on top of this SDK; it is not the
 > upstream topology.
+
+## TypeScript transport client
+
+Install the standalone transport-only client when connecting to the v3 SDK WebSocket endpoint from TypeScript:
+
+```bash
+bun add @gajae-code/bridge-client
+```
+
+```ts
+import { SdkClient } from "@gajae-code/bridge-client";
+```
+
+`@gajae-code/coding-agent/sdk` remains a compatibility re-export of this same `SdkClient` class and associated types, so both entry points preserve class identity. The package is a client for the documented v3 transport only: it does not restore the historical BridgeClient backend protocol, handshake/commands/SSE endpoints, or any direct host-control path.
 
 ## Architecture
 
@@ -86,6 +101,14 @@ ws://127.0.0.1:<port>/?token=<token>
 
 A wrong/missing token is rejected at the handshake with HTTP `401`.
 
+### Internal broker launch isolation
+
+When the SDK starts its default internal broker or session host from the published TypeScript source, GJC uses a fixed Bun launch policy: `--no-env-file`, a product-owned empty `bunfig.toml`, absolute product entrypoint paths, and no inherited `BUN_OPTIONS` or mutable compiled-mode markers. The broker bootstraps from the product SDK directory rather than the caller project; a session host still runs with the lifecycle-authorized workspace as its process cwd.
+
+This boundary prevents a child from newly loading caller-cwd or user-global Bun preload/dotenv policy. It cannot determine how a value already present in the parent environment was originally loaded, so ordinary provider/GJC environment values remain inherited. Default internal children, including compiled self-spawns, remove inherited `BUN_OPTIONS` so parent eval/test/inspect/debug/runtime options cannot be replayed into a detached child. Compiled binaries otherwise retain their existing self-spawn command contract, corroborated by a dedicated embedded marker and exact anchored Bun virtual-filesystem identity. The explicit `GJC_SDK_SESSION_COMMAND` session-host override remains a trusted legacy operator boundary and is not parsed as a shell-safe general command API. There is no broker-command override.
+
+Broker and per-session discovery tokens remain in their authoritative private discovery files because clients need them. Launch errors, logs, and diagnostics redact those tokens and never include the child environment or isolation configuration contents.
+
 ## Protocol
 
 JSON text frames. Field names are `camelCase`; the `type` discriminator is
@@ -96,32 +119,38 @@ JSON text frames. Field names are `camelCase`; the `type` discriminator is
 `action_needed` — something needs attention:
 
 ```json
-{ "type": "action_needed", "id": "wg_run_stage_1", "kind": "ask",
-  "sessionId": "sess-1", "question": "Proceed?", "options": ["Yes", "No"] }
+{ "type": "action_needed", "id": "act_9e31", "kind": "ask",
+  "sessionId": "sess-1", "workflowGateId": "wg_run_stage_1",
+  "question": "Proceed?", "options": ["Yes", "No"] }
+```
+
+```json
+{ "type": "action_needed", "id": "act_a42f", "kind": "ask",
+  "sessionId": "sess-1", "question": "Choose a target", "options": ["A", "B"] }
 ```
 
 ```json
 { "type": "action_needed", "id": "idle-sess-1-7", "kind": "idle",
   "sessionId": "sess-1", "summary": "finished refactor; awaiting next step" }
 ```
-- `kind: "ask"` is answerable in interactive/TUI and SDK workflow-gate sessions.
-  The `id` is the real workflow-gate id.
-- `kind: "idle"` is notify-only and ephemeral (not replayed to clients that
-  connect later).
+
+- `id` is an opaque, transient presentation/action ID. It is the **only** authority accepted by generic `reply.id`; use it only with the current authenticated endpoint. It is not a durable workflow ID.
+- `workflowGateId?: string` is optional, additive SDK v3 correlation metadata, present only for the active presentation of a durable workflow gate. When present, it equals that gate's Q12 `gate_id`. Its public correlation key is `(sessionId, workflowGateId)` at the current authenticated endpoint; it never authorizes generic `reply`.
+- `kind: "ask"` is answerable in interactive/TUI and SDK workflow-gate sessions. `kind: "idle"` is notify-only and ephemeral (not replayed to clients that connect later). Ordinary asks and idle frames omit `workflowGateId`.
+- This corrects the pre-v3 documentation invariant that `action_needed.id == gate_id`: they are deliberately different values. Clients must not preserve that invariant, infer a relationship from question/options/order, or retain private route, claim, receipt, epoch, token, or endpoint-generation maps.
 
 `action_resolved` — a pending action is now terminal and **non-repliable**:
 
 ```json
-{ "type": "action_resolved", "id": "wg_run_stage_1", "resolvedBy": "local" }
+{ "type": "action_resolved", "id": "act_9e31", "resolvedBy": "local" }
 ```
 
-`resolvedBy` is `local` (answered in the CLI/TUI), `client` (a remote reply won),
-or `timeout`.
+`resolvedBy` is `local` (a local/direct control retired the presentation), `client` (a remote generic reply won), or `timeout`.
 
 `reply_rejected` — sent only to the client whose reply failed:
 
 ```json
-{ "type": "reply_rejected", "id": "wg_run_stage_1", "reason": "already_answered" }
+{ "type": "reply_rejected", "id": "act_9e31", "reason": "already_answered" }
 ```
 
 Reasons: `already_answered`, `unknown_action`, `invalid_answer`,
@@ -144,7 +173,7 @@ remote conversation), `config_update` (current verbosity/redact), `hello`
 `reply` — answer a pending `ask`:
 
 ```json
-{ "type": "reply", "id": "wg_run_stage_1", "answer": 0, "token": "<token>" }
+{ "type": "reply", "id": "act_9e31", "answer": 0, "token": "<token>" }
 ```
 
 `answer` accepts:
@@ -161,19 +190,115 @@ Threaded clients may also send optional client → server frames: `user_message`
 in-thread), `hello` (capability/version), and `ping`. A minimal client only
 needs `reply`.
 
+## Model catalog query (Q10)
+
+The SDK exposes the model catalog through the paged Q10 registry query. `Q10`,
+`models.list/current`, `models.list`, and `models.current` are exact aliases:
+each returns the same paged registry array, not a current-model singleton or a
+filtered list. Continue using the returned cursor until `page.complete` is
+true.
+
+Each row preserves the five legacy fields (`provider`, `id`, `name`,
+`contextWindow`, and `maxTokens`) and additively includes `reasoning`,
+`thinking`, and `current`. `currentThinkingLevel` appears only on the current
+row when the live session has a thinking level. The exported DTO types are
+`Q10Model`, `Q10ThinkingCapabilities`, `Q10ThinkingEffort`,
+`Q10SettableThinkingLevel`, `Q10CurrentThinkingLevel`, and
+`Q10ThinkingMode`, all from `@gajae-code/coding-agent/sdk`; there is no public
+`/sdk/models` subpath.
+
+```json
+{
+  "provider": "runtime-provider",
+  "id": "reasoning-model",
+  "name": "Reasoning Model",
+  "contextWindow": 128000,
+  "maxTokens": 8192,
+  "reasoning": true,
+  "thinking": {
+    "validLevels": ["off", "minimal", "low", "medium", "high"],
+    "minLevel": "minimal",
+    "maxLevel": "high",
+    "mode": "effort",
+    "defaultLevel": "low"
+  },
+  "current": true,
+  "currentThinkingLevel": "high"
+}
+```
+
+`thinking.validLevels` is always present and starts with `"off"`; it is the
+canonical menu for `model.set` and never contains `"inherit"`. For a
+non-reasoning model it is exactly `["off"]`. Successful reasoning rows always
+include `minLevel`, `maxLevel`, and `mode`; only `defaultLevel` and raw `levels`
+are optional. Raw `levels` deliberately keeps its descriptor order and
+duplicates, while `validLevels` is the canonical, deduplicated menu clients
+should render. `"inherit"` is a current-state readback value only and is rejected
+as a `model.set` input.
+
+Malformed reasoning descriptors are not client-recoverable catalog data. The
+query returns the SDK's safe `internal` error rather than exposing a partially
+formed row or descriptor details.
+
 ## Answer semantics
 
 A remote reply answers a pending ask in every session state:
 
 - **Interactive / TUI mode:** the ask tool races the local selector against the
-  remote reply (first valid answer wins). If you tap a button in the client, the
-  ask resolves with that option; if you answer locally, the client receives
-  `action_resolved` (`resolvedBy: "local"`) and the action becomes non-repliable.
-- **SDK workflow gate:** the reply resolves the real workflow-gate, driving the
-  session the same way a local answer would.
+  remote reply (first valid answer wins). A client submits generic `reply` using
+  the active presentation `id`; a local answer emits `action_resolved`
+  (`resolvedBy: "local"`) and that presentation becomes non-repliable.
+- **SDK workflow gate:** generic `reply` still uses the active presentation
+  `id`, never `workflowGateId`. The resolved gate drives the session the same
+  way a local answer would.
 
-In both modes the first valid reply wins; later replies get `already_answered`.
-Idle pings are notify-only.
+A session has at most one active answerable presentation. Interactive asks and durable workflow gates are serialized; further Q12 gates wait in a durable queue. A same-server reconnect replays the active `action_needed` with the same presentation ID. After a process restart, previously pending or accepted-but-unadvanced records are quarantined diagnostics and a reconstructed workflow remints fresh durable gate and presentation IDs. Terminal, stale, and reissued action IDs never regain authority.
+
+Generic and direct controls may race. Once the native generic claim is acquired, it wins; a direct control that atomically retires the exact unclaimed active presentation first wins instead. Losing direct controls fail without advancing the gate, and losing generic replies are stale/non-repliable. Clients must not retry by matching text, durable IDs, or presentation history; they must fail closed rather than guess when session or action identity is unsafe or ambiguous.
+
+### Durable workflow controls and Q12
+
+`workflow.gate_answer` and `workflow.plan_approve` operate on the durable
+Q12 `gate_id`, not `action_needed.id`. Both accept optional
+`expectedSessionId`; clients should always send the `sessionId` observed from
+the current authenticated endpoint:
+
+```json
+{ "type": "control_request", "operation": "workflow.gate_answer",
+  "input": { "id": "wg_run_stage_1", "response": "approve", "expectedSessionId": "sess-1" } }
+```
+
+```json
+{ "type": "control_request", "operation": "workflow.plan_approve",
+  "input": { "id": "wg_run_stage_1", "choice": "approve", "expectedSessionId": "sess-1" } }
+```
+
+`expectedSessionId` omission remains accepted and audited for the entire SDK v3 line so deployed v3 control clients continue to work; new clients must send it now. It cannot become mandatory, or be removed from the controls, before SDK v4 and at least one full published deprecation release/window with deployed-client notice. A supplied session mismatch is rejected before the gate resolver runs. Neither control accepts a presentation ID, remaps an old ID to a reminted gate, or uses heuristic matching.
+
+Q12 (`workflow.gates.list`) exposes durable query records and additive SDK v3 diagnostics. A pending record preserves its workflow fields including `gate_id` and adds `id: "pending:<gate_id>"` and `tag: "pending"`. A restart quarantine diagnostic uses `id: "diagnostic:<gate_id>"`, `tag: "quarantined"`, and optional `lifecycle` containing `state: "quarantined"`, its restart reason, `quarantinedAt`, and an optional `supersededByGateId` after a remint. Diagnostics are query-only: they cannot be routed, answered, or promoted. Treat Q12 as the durable status surface, not as generic-reply authority.
+
+### Coordinator MCP question pull loop
+
+The Coordinator MCP bridge is a separate, public-safe pull surface for external coordinators. `gjc_coordinator_list_questions` requires `session_id` and reconciles pending `workflow.gates.list` rows on every call, returning bounded public `questions`, `diagnostics`, and `reconciliation`. It accepts `status: "pending"`; `status: "open"` remains a compatibility alias. Multiple pending rows can be returned. A pending row carries its safe question shape, public option ids, and `answer_binding`, never raw/private gate payloads or values.
+
+`gjc_coordinator_submit_question_answer` requires `session_id`, `turn_id`, `question_id`, `answer_binding`, `answer`, `idempotency_key`, and `allow_mutation: true`. It re-lists/revalidates after restart and resolves through `workflow.gate_answer`, not generic `ask.answer`. An incomplete reconciliation returns `terminal_uncertain`; stale, terminal, missing, or ownership-mismatched rows cannot be answered. Re-list after restart rather than retaining old identifiers. An identical retry with the same idempotency key replays the accepted result; conflicting reuse returns `idempotency_conflict`.
+
+This contract does not change #2549/#2551 or unattended plain-CLI behavior.
+
+### Rust and N-API compatibility
+
+The Rust `ActionNeeded`, `ServerMessage`, and `register_ask` APIs remain
+legacy-compatible and uncorrelated. Correlation is available through additive
+Rust workflow-frame decoding/current-reader APIs and the workflow registration
+path; consumers that need correlation must opt in explicitly. N-API likewise
+retains `registerAsk`, and adds `registerWorkflowGateAsk` for a correlated wire
+frame plus `registerArbitratedAsk` and `retireIfUnclaimed` for in-process
+presentation arbitration. The arbitration lease and all claim/receipt/epoch
+state remain private: these APIs do not create a public authority value.
+
+### Runtime and native addon release pairing
+
+The `@gajae-code/coding-agent` runtime and `@gajae-code/natives` native addon ship from the same source release at exact matching package versions. The native loader requires the matching version sentinel; mixed native/runtime versions are unsupported and must not claim SDK compatibility.
 
 ## Minimal client example
 
@@ -203,11 +328,53 @@ ws.on("message", (data) => {
 Swap `ws` for a Telegram bot's long-poll loop, a Discord gateway client, or a
 Slack socket-mode app — the contract above is all you implement.
 
+## Fallback chains
+
+Model-role selectors may be ordered fallback chains; see [Fallback chains](./models.md#fallback-chains) for configuration and retry-budget details. Resolution-time skips do not consume attempts. When a request-time retry advances to another eligible entry, the selected default fallback remains sticky for later prompts in that session until an explicit model selection or a chain reset changes it.
+
+`model_fallback_switched { eventId, from, to, reason, role, scope, activeIndex, chainLength, attemptsUsed }` is the canonical session lifecycle event for every real fallback-model switch. It replaces the legacy `retry_fallback_applied` / `retry_fallback_succeeded` event names. Embedding clients can subscribe to this session event; generic WebSocket clients should use only the protocol frames documented above and any adapter-specific status updates they support.
+
+
+## Managed session-directory adapter guidance
+
+SDK adapters that need to inspect saved sessions must import only the supported public surface from `@gajae-code/coding-agent/sdk`:
+
+```ts
+import {
+  SESSION_DIRECTORY_API_VERSION,
+  listManagedSessionCandidates,
+  resolveManagedSessionScope,
+} from "@gajae-code/coding-agent/sdk";
+
+if (SESSION_DIRECTORY_API_VERSION !== 1) throw new Error("Unsupported session-directory API");
+const resolved = await resolveManagedSessionScope({ cwd: process.cwd() });
+if (resolved.kind === "resolved") {
+  const listing = await listManagedSessionCandidates({ scope: resolved.scope });
+  // Consume only listing.kind === "complete" and its owned candidates.
+}
+```
+
+This is a readonly resolver/listing contract. Do not import `@gajae-code/coding-agent/session/internal/*`, derive `v2-…` names, write bindings, or implement migration/cleanup in an adapter; private internal subpaths are intentionally unavailable from the packaged module. Treat `network_unsupported`, binding/security errors, incomplete listings, invalid candidates, and foreign candidates as non-authoritative results rather than retrying with a guessed path.
+
+The resolver uses canonical native identity: supported POSIX and Windows local aliases can designate one scope, while UNC/network workspaces are unsupported. Scope digests are collision-resistant identifiers, not injective aliases, credentials, or authentication. The owner-only checks protect managed local storage paths but do not authenticate an adapter or make hostile concurrent filesystem races safe. Adapters that need mutations must use the higher-level lifecycle/session APIs rather than the readonly directory API.
 ## Managed notification adapters
 
 GJC ships managed SDK-client adapters for Telegram, Discord, and Slack. They use
 one local SDK endpoint per session; the adapters do not change the wire protocol,
 keep endpoint credentials in provider state, or expose a remote shell.
+
+The recommended interactive path is `/settings` → **Notifications**. It owns
+setup, health, test, recovery, reconnect, local enablement, and Telegram
+removal without exposing stored credentials.
+`gjc notify setup` remains the authoritative CLI fallback for headless and
+automated environments.
+
+Notification credentials and `notifications.*` settings are global-only.
+Project notification keys are
+ignored and runtime notification overrides are rejected. Telegram pairing
+revalidates the complete bot-token/chat identity immediately before polling and
+again before activation. A foreign or unknown owner is never killed, reloaded, or taken over;
+setup fails closed without saving or exposing the raw token.
 
 - [Telegram notification onboarding](./telegram-onboarding.md) documents
   `gjc notify setup` and private-chat pairing.

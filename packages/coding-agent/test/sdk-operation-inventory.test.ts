@@ -66,6 +66,37 @@ describe("SDK operation inventory", () => {
 		expect(result.exitCode, output(result)).toBe(0);
 	});
 
+	it("locks private mid-run maintenance test seams out of the public SDK", async () => {
+		const records = (await Bun.file(inventory).json()) as Array<{
+			sourceId: string;
+			decision: string;
+			rationale?: string;
+			exclusionMetadata?: { adapterMappings: string; testIds: string };
+		}>;
+
+		const expected = new Map([
+			[
+				"agent_session:runMidRunMaintenanceForTests",
+				"test-only maintenance seam, not a user-facing SDK control seam",
+			],
+			[
+				"agent_session:estimateMidRunContextTokensForTests",
+				"test-only estimator seam, not a user-facing SDK control seam",
+			],
+		]);
+		for (const [sourceId, rationale] of expected) {
+			const record = records.find(candidate => candidate.sourceId === sourceId);
+			expect(record).toEqual(
+				expect.objectContaining({
+					sourceId,
+					decision: "exclude",
+					rationale,
+					exclusionMetadata: { adapterMappings: "not_applicable", testIds: "not_applicable" },
+				}),
+			);
+		}
+	});
+
 	it("rejects a generated matrix with a dropped row", async () => {
 		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-sdk-inventory-"));
 		tempDirs.push(directory);
@@ -103,6 +134,41 @@ describe("SDK operation inventory", () => {
 		});
 	}
 
+	it("fails closed when the slash-command scanner anchor is absent", () => {
+		expect(() => scanSlashCommands('const COMMANDS = [{ name: "goal" }];')).toThrow(
+			"SDK operation inventory scanner: required anchor const BUILTIN_SLASH_COMMAND_REGISTRY was not found.",
+		);
+	});
+
+	it("fails closed when the AgentSession scanner anchor is absent", () => {
+		expect(() => scanAgentSessionMethods("class OtherSession {} ")).toThrow(
+			"SDK operation inventory scanner: required AgentSession class declaration was not found.",
+		);
+	});
+
+	it("fails closed when the AgentSession class body is malformed", () => {
+		expect(() => scanAgentSessionMethods("class AgentSession extends Base")).toThrow(
+			"SDK operation inventory scanner: AgentSession class is missing its opening body delimiter.",
+		);
+		expect(() => scanAgentSessionMethods("class AgentSession { action() {} ")).toThrow(
+			"SDK operation inventory scanner: AgentSession class body is unbalanced.",
+		);
+	});
+
+	it("classifies explicit AgentSession test seams as non-public authority", async () => {
+		const source = await Bun.file(path.join(repoRoot, "packages/coding-agent/src/session/agent-session.ts")).text();
+		const sourceIds = scanAgentSessionMethods(source).filter(sourceId => sourceId.endsWith("ForTests"));
+		expect(sourceIds).toEqual(
+			expect.arrayContaining([
+				"agent_session:runMidRunMaintenanceForTests",
+				"agent_session:estimateMidRunContextTokensForTests",
+				"agent_session:activeMidRunBarrierCountForTests",
+				"agent_session:activeMidRunMaintenanceCountForTests",
+			]),
+		);
+		expect(pendingReviewErrors(sourceIds.map(sourceId => ({ sourceId })))).toEqual([]);
+	});
+
 	it("discovers AgentSession method declarations independent of modifiers and layout", () => {
 		const seams = scanAgentSessionMethods(`
 			function decorator(_: unknown, _context: unknown) {}
@@ -116,6 +182,7 @@ describe("SDK operation inventory", () => {
 				override overrideable(): void {}
 				get accessor(): string { return "value"; }
 				set accessor(_value: string) {}
+				get accessorForTests(): number { return 1; }
 				*generatorMethod(): Generator<string> { yield "value"; }
 				@decorator
 				decoratedMethod(): void {}
@@ -132,6 +199,7 @@ describe("SDK operation inventory", () => {
 			"agent_session:privateMethod",
 			"agent_session:staticMethod",
 			"agent_session:overrideable",
+			"agent_session:accessorForTests",
 			"agent_session:generatorMethod",
 			"agent_session:decoratedMethod",
 			"agent_session:multilineMethod",
@@ -168,10 +236,30 @@ describe("SDK operation inventory", () => {
 					yield \`{\${value}}\`;
 				}
 				["computed"]() {}
+				["resetForTests"]() {}
+				get ["stateForTests"](): number { return 1; }
+				[\`templateMethodForTests\`]() {}
+				get [\`templateGetterForTests\`](): number { return 1; }
+				set [\`templateSetterForTests\`](_value: number) {}
+				[dynamicForTests]() {}
 				field = () => ({ text: "notAMethod() {}" });
 			}
 		`);
-		expect(seams).toEqual(["agent_session:decoratedPrivate"]);
+		expect(seams).toEqual([
+			"agent_session:decoratedPrivate",
+			"agent_session:resetForTests",
+			"agent_session:stateForTests",
+			"agent_session:templateMethodForTests",
+			"agent_session:templateGetterForTests",
+			"agent_session:templateSetterForTests",
+		]);
+		expect(pendingReviewErrors(seams.slice(1).map(sourceId => ({ sourceId })))).toEqual([
+			"Pending review source seam: agent_session:resetForTests. Add it to SEAM_TO_SDK or LOCKED_EXCLUSIONS.",
+			"Pending review source seam: agent_session:stateForTests. Add it to SEAM_TO_SDK or LOCKED_EXCLUSIONS.",
+			"Pending review source seam: agent_session:templateMethodForTests. Add it to SEAM_TO_SDK or LOCKED_EXCLUSIONS.",
+			"Pending review source seam: agent_session:templateGetterForTests. Add it to SEAM_TO_SDK or LOCKED_EXCLUSIONS.",
+			"Pending review source seam: agent_session:templateSetterForTests. Add it to SEAM_TO_SDK or LOCKED_EXCLUSIONS.",
+		]);
 	});
 
 	it("finds direct and nested ACP method cases without reading strings or interpolated templates", () => {

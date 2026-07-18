@@ -26,8 +26,9 @@ use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
 use tokio::{
 	net::{TcpListener, TcpStream},
-	sync::{broadcast, mpsc, oneshot},
-	time::sleep,
+	sync::{Mutex as AsyncMutex, broadcast, mpsc, oneshot},
+	task::{JoinHandle, JoinSet},
+	time::{sleep, timeout},
 };
 use tokio_tungstenite::tungstenite::{
 	Error, Message,
@@ -38,16 +39,20 @@ use tokio_tungstenite::tungstenite::{
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-	actions::{ActionIdentity, ActionRegistry, ClaimOutcome, ReplyOutcome},
+	actions::{
+		ActionIdentity, ActionRegistrationError, ActionRegistry, ClaimOutcome, ReplyOutcome,
+		RetireIfUnclaimed,
+	},
 	discovery::EndpointRecord,
 	protocol::{
 		ActionKind, ActionNeeded, ActionUnavailable, ActionUnavailableReason, AskSelectedAckCancel,
 		AskSelectedAckCancelReason, AskSelectedAckFailedReason, AskSelectedAckOutcome,
 		AskSelectedAckRequest, AskSelectedAckUnknownReason, ClientMessage, PROTOCOL_VERSION, Pong,
 		RejectReason, ReplyAnswer, ReplyRejected, ServerHello, ServerMessage, SessionReady,
-		capabilities,
+		WorkflowGateActionNeeded, WorkflowGateWireDiscriminator, capabilities,
+		serialize_workflow_gate_action_needed,
 	},
-	query::REQUEST_FRAME_BYTES,
+	query::{REQUEST_FRAME_BYTES, RESPONSE_CEILING_BYTES},
 };
 
 /// Configuration for a per-session notification server.
@@ -94,11 +99,19 @@ impl ServerConfig {
 /// its capabilities.
 const CLIENT_HELLO_GRACE: Duration = Duration::from_secs(1);
 
+/// Grace period for connection tasks to observe server cancellation before
+/// forced abort.
+const CONNECTION_JOIN_GRACE: Duration = Duration::from_secs(1);
+
 /// Commands serialized through the owning connection task.
 #[derive(Debug)]
 enum DirectCommand {
 	Deliver(Box<ServerMessage>, Option<oneshot::Sender<bool>>),
-	RawJson(String),
+	DirectedFrame {
+		json:                   String,
+		connection_generation:  String,
+		requires_tool_activity: bool,
+	},
 	ReevaluateAsk,
 }
 
@@ -107,6 +120,90 @@ fn prepare_direct_ack(state: &ServerState, message: &ServerMessage) -> bool {
 		return true;
 	};
 	state.acks.lock().begin_dispatch(request.request_id())
+}
+
+/// Validate the host-to-client directed envelope before it enters a connection
+/// writer. The host can only direct typed v3 envelopes; raw WebSocket text is
+/// deliberately not an escape hatch around transport policy.
+fn validate_directed_frame(json: String) -> Option<(String, bool)> {
+	if json.len() > RESPONSE_CEILING_BYTES {
+		return None;
+	}
+	let frame: serde_json::Value = serde_json::from_str(&json).ok()?;
+	let object = frame.as_object()?;
+	let frame_type = object.get("type").and_then(serde_json::Value::as_str);
+	if frame_type != Some("event_replay_result") {
+		let requires_tool_activity =
+			frame_type.is_some_and(|kind| matches!(kind, "tool_activity" | "reasoning_summary"));
+		return Some((json, requires_tool_activity));
+	}
+	if !object.get("id").is_some_and(serde_json::Value::is_string)
+		|| !object.get("ok").is_some_and(serde_json::Value::is_boolean)
+		|| !object
+			.get("generation")
+			.is_some_and(serde_json::Value::is_u64)
+		|| !object.get("lastSeq").is_some_and(serde_json::Value::is_u64)
+	{
+		return None;
+	}
+	let events = object.get("events")?.as_array()?;
+	if !events.iter().all(|event| {
+		event.as_object().is_some_and(|event| {
+			if event.get("type").and_then(serde_json::Value::as_str) != Some("event") {
+				return false;
+			}
+			let canonical = event
+				.get("generation")
+				.is_some_and(serde_json::Value::is_u64)
+				&& event.get("seq").is_some_and(serde_json::Value::is_u64);
+			let legacy = event.get("name").is_some_and(serde_json::Value::is_string)
+				&& event
+					.get("payload")
+					.is_some_and(serde_json::Value::is_object);
+			canonical || legacy
+		})
+	}) {
+		return None;
+	}
+	let requires_tool_activity = events.iter().any(|event| {
+		let event = event.as_object();
+		let kind = event
+			.and_then(|event| event.get("kind"))
+			.and_then(serde_json::Value::as_str);
+		let name = event
+			.and_then(|event| event.get("name"))
+			.and_then(serde_json::Value::as_str);
+		let payload_type = event
+			.and_then(|event| event.get("payload"))
+			.and_then(serde_json::Value::as_object)
+			.and_then(|payload| payload.get("type"))
+			.and_then(serde_json::Value::as_str);
+		[kind, name, payload_type]
+			.into_iter()
+			.flatten()
+			.any(|kind| matches!(kind, "tool_activity" | "reasoning_summary"))
+	});
+	Some((json, requires_tool_activity))
+}
+
+fn may_deliver_directed_frame(
+	state: &ServerState,
+	connection_id: &str,
+	connection_generation: &str,
+	requires_tool_activity: bool,
+) -> bool {
+	state
+		.connections
+		.lock()
+		.get(connection_id)
+		.is_some_and(|connection| {
+			connection.generation == connection_generation
+				&& (!requires_tool_activity
+					|| connection
+						.capabilities
+						.iter()
+						.any(|capability| capability == capabilities::TOOL_ACTIVITY_V1))
+		})
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -137,8 +234,36 @@ struct Connection {
 	tx:           mpsc::UnboundedSender<DirectCommand>,
 }
 
+/// A rejected workflow-gate registration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkflowGateRegistrationError {
+	/// Durable workflow-gate correlation cannot be empty.
+	EmptyWorkflowGateId,
+	/// The generic action id was already registered during this server's
+	/// lifetime.
+	ActionIdAlreadyRegistered,
+	/// The generic action id is already bound to a distinct correlated wire
+	/// presentation.
+	CorrelatedPresentationCollision,
+}
+
+impl std::fmt::Display for WorkflowGateRegistrationError {
+	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self {
+			Self::EmptyWorkflowGateId => formatter.write_str("workflow gate id must be nonempty"),
+			Self::ActionIdAlreadyRegistered => formatter.write_str("action id is already registered"),
+			Self::CorrelatedPresentationCollision => {
+				formatter.write_str("action id is bound to a distinct correlated wire presentation")
+			},
+		}
+	}
+}
+
+impl std::error::Error for WorkflowGateRegistrationError {}
+
 /// Error returned when a caller attempts to broadcast an action through the
 /// generic frame API instead of the action lifecycle APIs.
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PushFrameError {
 	ActionNeededProhibited,
@@ -271,6 +396,13 @@ impl AckRegistry {
 	}
 }
 
+/// A negotiated client capability set paired with its connection id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapabilityUpdate {
+	pub connection_id: String,
+	pub capabilities:  Vec<String>,
+}
+
 #[derive(Debug)]
 struct ServerState {
 	token:               String,
@@ -284,6 +416,8 @@ struct ServerState {
 	inbound_tx:          mpsc::UnboundedSender<ClientMessage>,
 	/// v3 frames, kept raw so the SDK host owns their protocol semantics.
 	frame_tx:            mpsc::UnboundedSender<(String, String)>,
+	/// Negotiated capability snapshots for host-side per-connection policy.
+	cap_tx:              mpsc::UnboundedSender<CapabilityUpdate>,
 	/// Connection lifecycle notifications for provider lease cleanup.
 	close_tx:            mpsc::UnboundedSender<String>,
 	connections:         Mutex<HashMap<String, Connection>>,
@@ -296,21 +430,24 @@ struct ServerState {
 }
 
 type FrameReceiver = mpsc::UnboundedReceiver<(String, String)>;
+type CapabilityReceiver = mpsc::UnboundedReceiver<CapabilityUpdate>;
 
 /// Handle to a running server. Dropping it does not stop the server; call
 /// [`ServerHandle::stop`] (idempotent) for deterministic shutdown.
 #[derive(Debug, Clone)]
 pub struct ServerHandle {
-	addr:        SocketAddr,
-	state:       Arc<ServerState>,
-	cancel:      CancellationToken,
-	accept_task: Arc<tokio::task::JoinHandle<()>>,
-	session_id:  String,
-	state_root:  Option<PathBuf>,
+	addr:          SocketAddr,
+	state:         Arc<ServerState>,
+	cancel:        CancellationToken,
+	accept_task:   Arc<Mutex<Option<JoinHandle<()>>>>,
+	shutdown_wait: Arc<AsyncMutex<()>>,
+	session_id:    String,
+	state_root:    Option<PathBuf>,
 	reply_rx: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<crate::actions::ClaimedReply>>>>,
-	inbound_rx:  Arc<Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<ClientMessage>>>>,
-	frame_rx:    Arc<Mutex<Option<FrameReceiver>>>,
-	close_rx:    Arc<Mutex<Option<mpsc::UnboundedReceiver<String>>>>,
+	inbound_rx:    Arc<Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<ClientMessage>>>>,
+	frame_rx:      Arc<Mutex<Option<FrameReceiver>>>,
+	capability_rx: Arc<Mutex<Option<CapabilityReceiver>>>,
+	close_rx:      Arc<Mutex<Option<mpsc::UnboundedReceiver<String>>>>,
 }
 
 impl ServerHandle {
@@ -327,12 +464,84 @@ impl ServerHandle {
 	}
 
 	/// Register an `ask` action and queue a connection-local reevaluation for
-	/// every client. All asks use this path; only idle pings use broadcast.
+	/// every client. Duplicate ids fail closed without reevaluating clients; use
+	/// [`Self::try_register_ask`] to observe the typed failure.
 	///
 	/// `repliable` should be `true` only when the SDK workflow-gate resolver can
 	/// actually answer the ask.
 	pub fn register_ask(&self, needed: ActionNeeded, repliable: bool) {
-		self.state.registry.lock().register_ask(needed, repliable);
+		let _ = self.try_register_ask(needed, repliable);
+	}
+
+	/// Register an `ask`, returning an error when its id was used previously.
+	pub fn try_register_ask(
+		&self,
+		needed: ActionNeeded,
+		repliable: bool,
+	) -> Result<(), ActionRegistrationError> {
+		self
+			.state
+			.registry
+			.lock()
+			.try_register_ask(needed, repliable)?;
+		self.reevaluate_asks();
+		Ok(())
+	}
+
+	/// Register a correlated workflow-gate ask. The correlation is emitted only
+	/// by the connection-local action presentation path and is replayable while
+	/// this server remains live.
+	///
+	/// # Errors
+	/// Returns a typed error without mutating the action registry when the
+	/// workflow-gate id is empty or the action id has already been registered.
+	pub fn register_workflow_gate_ask(
+		&self,
+		needed: ActionNeeded,
+		workflow_gate_id: String,
+		repliable: bool,
+	) -> Result<(), WorkflowGateRegistrationError> {
+		self.register_workflow_gate_ask_with_discriminator(
+			needed,
+			workflow_gate_id,
+			WorkflowGateWireDiscriminator::ActionNeeded,
+			repliable,
+		)
+	}
+
+	pub(crate) fn register_workflow_gate_ask_with_discriminator(
+		&self,
+		needed: ActionNeeded,
+		workflow_gate_id: String,
+		wire_discriminator: WorkflowGateWireDiscriminator,
+		repliable: bool,
+	) -> Result<(), WorkflowGateRegistrationError> {
+		if workflow_gate_id.is_empty() {
+			return Err(WorkflowGateRegistrationError::EmptyWorkflowGateId);
+		}
+		self
+			.state
+			.registry
+			.lock()
+			.try_register_workflow_gate_ask_with_discriminator(
+				needed,
+				workflow_gate_id,
+				wire_discriminator,
+				repliable,
+			)
+			.map_err(|error| match error {
+				ActionRegistrationError::ActionIdAlreadyRegistered => {
+					WorkflowGateRegistrationError::ActionIdAlreadyRegistered
+				},
+				ActionRegistrationError::CorrelatedPresentationCollision => {
+					WorkflowGateRegistrationError::CorrelatedPresentationCollision
+				},
+			})?;
+		self.reevaluate_asks();
+		Ok(())
+	}
+
+	fn reevaluate_asks(&self) {
 		let connections = self
 			.state
 			.connections
@@ -343,6 +552,45 @@ impl ServerHandle {
 		for connection in connections {
 			let _ = connection.send(DirectCommand::ReevaluateAsk);
 		}
+	}
+
+	/// Read the current workflow correlation without exposing presentation
+	/// delivery state, claims, receipts, or its private registration epoch.
+	#[must_use]
+	pub fn current_workflow_gate_ask(&self) -> Option<WorkflowGateActionNeeded> {
+		self
+			.state
+			.registry
+			.lock()
+			.current_workflow_gate_ask()
+			.map(|(workflow, _)| workflow)
+	}
+
+	/// Return the current exact presentation identity for in-process
+	/// arbitration.
+	#[must_use]
+	pub fn current_identity(&self) -> Option<ActionIdentity> {
+		self.state.registry.lock().current_identity()
+	}
+
+	/// Atomically terminalize an exact current presentation. The status proves
+	/// whether the supplied private lease retired, was already terminal, was
+	/// claimed, or is stale; only retirement broadcasts a local terminal frame.
+	pub fn terminalize_if_current(&self, expected: &ActionIdentity) -> RetireIfUnclaimed {
+		let outcome = self.state.registry.lock().retire_if_unclaimed(expected);
+		if let RetireIfUnclaimed::Retired(resolved) = &outcome {
+			let _ = self
+				.state
+				.tx
+				.send(ServerMessage::ActionResolved(resolved.clone()));
+		}
+		outcome
+	}
+
+	/// Atomically retire an exact unclaimed presentation. Prefer
+	/// [`Self::terminalize_if_current`] for typed terminal proof.
+	pub fn retire_if_unclaimed(&self, expected: &ActionIdentity) -> RetireIfUnclaimed {
+		self.terminalize_if_current(expected)
 	}
 
 	/// Broadcast an ephemeral idle ping (not buffered, not repliable).
@@ -426,16 +674,35 @@ impl ServerHandle {
 		self.close_rx.lock().take()
 	}
 
-	/// Send raw JSON to one connected client. Returns false after that client
-	/// has disconnected.
+	/// Take negotiated client capability snapshots paired with their connection
+	/// id. Returns the receiver exactly once; subsequent calls return `None`.
+	#[must_use]
+	pub fn take_capability_receiver(&self) -> Option<mpsc::UnboundedReceiver<CapabilityUpdate>> {
+		self.capability_rx.lock().take()
+	}
+
+	/// Send a validated JSON envelope to one connected v3 SDK client. Returns
+	/// false when the destination is no longer current, the envelope is invalid,
+	/// or it exceeds the transport frame bound.
 	pub fn send_to(&self, connection_id: &str, json: String) -> bool {
+		let Some((json, requires_tool_activity)) = validate_directed_frame(json) else {
+			return false;
+		};
 		let sender = self
 			.state
 			.connections
 			.lock()
 			.get(connection_id)
-			.map(|connection| connection.tx.clone());
-		sender.is_some_and(|sender| sender.send(DirectCommand::RawJson(json)).is_ok())
+			.map(|connection| (connection.tx.clone(), connection.generation.clone()));
+		sender.is_some_and(|(sender, connection_generation)| {
+			sender
+				.send(DirectCommand::DirectedFrame {
+					json,
+					connection_generation,
+					requires_tool_activity,
+				})
+				.is_ok()
+		})
 	}
 
 	/// Resolve an unclaimed legacy action. Claimed forward-mode replies require
@@ -815,9 +1082,20 @@ impl ServerHandle {
 			);
 		}
 		self.cancel.cancel();
-		self.accept_task.abort();
 		if let Some(root) = self.state_root.as_deref() {
 			let _ = crate::discovery::remove_endpoint(root, &self.session_id);
+		}
+	}
+
+	/// Stop the server and wait until the accept loop and every connection task
+	/// have released their sockets. This is the authoritative filesystem
+	/// teardown boundary for callers that remove a server-owned state root.
+	pub async fn stop_and_wait(&self) {
+		self.stop();
+		let _shutdown = self.shutdown_wait.lock().await;
+		let task = self.accept_task.lock().take();
+		if let Some(task) = task {
+			let _ = task.await;
 		}
 	}
 }
@@ -860,6 +1138,7 @@ pub async fn start(config: ServerConfig) -> std::io::Result<ServerHandle> {
 	};
 	let (inbound_tx, inbound_rx) = mpsc::unbounded_channel::<ClientMessage>();
 	let (frame_tx, frame_rx) = mpsc::unbounded_channel();
+	let (cap_tx, cap_rx) = mpsc::unbounded_channel();
 	let (close_tx, close_rx) = mpsc::unbounded_channel();
 	let state = Arc::new(ServerState {
 		token: config.token,
@@ -869,6 +1148,7 @@ pub async fn start(config: ServerConfig) -> std::io::Result<ServerHandle> {
 		reply_tx,
 		inbound_tx,
 		frame_tx,
+		cap_tx,
 		close_tx,
 		connections: Mutex::new(HashMap::new()),
 		acks: Mutex::new(AckRegistry::default()),
@@ -882,25 +1162,43 @@ pub async fn start(config: ServerConfig) -> std::io::Result<ServerHandle> {
 		addr,
 		state,
 		cancel,
-		accept_task: Arc::new(accept_task),
+		accept_task: Arc::new(Mutex::new(Some(accept_task))),
+		shutdown_wait: Arc::new(AsyncMutex::new(())),
 		session_id: config.session_id,
 		state_root: config.state_root,
 		reply_rx: Arc::new(Mutex::new(reply_rx)),
 		inbound_rx: Arc::new(Mutex::new(Some(inbound_rx))),
 		frame_rx: Arc::new(Mutex::new(Some(frame_rx))),
+		capability_rx: Arc::new(Mutex::new(Some(cap_rx))),
 		close_rx: Arc::new(Mutex::new(Some(close_rx))),
 	})
 }
 
 async fn accept_loop(listener: TcpListener, state: Arc<ServerState>, cancel: CancellationToken) {
+	let mut connections = JoinSet::new();
 	loop {
 		tokio::select! {
 			() = cancel.cancelled() => break,
+			joined = connections.join_next(), if !connections.is_empty() => {
+				let _ = joined;
+			},
 			accepted = listener.accept() => {
 				let Ok((stream, _peer)) = accepted else { continue };
-				tokio::spawn(handle_conn(stream, Arc::clone(&state), cancel.clone()));
+				connections.spawn(handle_conn(stream, Arc::clone(&state), cancel.clone()));
 			}
 		}
+	}
+	cancel.cancel();
+	join_connection_tasks(&mut connections).await;
+}
+
+async fn join_connection_tasks(connections: &mut JoinSet<()>) {
+	if timeout(CONNECTION_JOIN_GRACE, async { while connections.join_next().await.is_some() {} })
+		.await
+		.is_err()
+	{
+		connections.abort_all();
+		while connections.join_next().await.is_some() {}
 	}
 }
 
@@ -927,10 +1225,12 @@ async fn handle_conn(stream: TcpStream, state: Arc<ServerState>, cancel: Cancell
 		max_frame_size: Some(REQUEST_FRAME_BYTES),
 		..WebSocketConfig::default()
 	};
-	let Ok(ws) =
-		tokio_tungstenite::accept_hdr_async_with_config(stream, auth, Some(ws_config)).await
-	else {
-		return;
+	let ws = tokio::select! {
+		() = cancel.cancelled() => return,
+		accepted = tokio_tungstenite::accept_hdr_async_with_config(stream, auth, Some(ws_config)) => {
+			let Ok(ws) = accepted else { return };
+			ws
+		},
 	};
 	let connection_id =
 		format!("connection:{}", state.connection_sequence.fetch_add(1, Ordering::Relaxed));
@@ -950,6 +1250,7 @@ async fn handle_conn(stream: TcpStream, state: Arc<ServerState>, cancel: Cancell
 			capabilities::SESSION_READY.into(),
 			capabilities::ASK_CONTROLS_V1.into(),
 			capabilities::ASK_SELECTED_ACK_V1.into(),
+			capabilities::TOOL_ACTIVITY_V1.into(),
 		],
 		connection_id:    Some(connection_id.clone()),
 	});
@@ -1003,8 +1304,17 @@ async fn handle_conn(stream: TcpStream, state: Arc<ServerState>, cancel: Cancell
 							}
 							sent
 						},
-						DirectCommand::RawJson(json) => {
-							write.send(Message::Text(json)).await.is_ok()
+						DirectCommand::DirectedFrame {
+							json,
+							connection_generation,
+							requires_tool_activity,
+						} => {
+							may_deliver_directed_frame(
+								&state,
+								&connection_id,
+								&connection_generation,
+								requires_tool_activity,
+							) && write.send(Message::Text(json)).await.is_ok()
 						},
 						DirectCommand::ReevaluateAsk => true,
 					};
@@ -1077,8 +1387,17 @@ async fn handle_conn(stream: TcpStream, state: Arc<ServerState>, cancel: Cancell
 							break;
 						}
 					},
-					DirectCommand::RawJson(json) => {
-						if write.send(Message::Text(json)).await.is_err() {
+					DirectCommand::DirectedFrame {
+						json,
+						connection_generation,
+						requires_tool_activity,
+					} => {
+						if may_deliver_directed_frame(
+							&state,
+							&connection_id,
+							&connection_generation,
+							requires_tool_activity,
+						) && write.send(Message::Text(json)).await.is_err() {
 							break;
 						}
 					},
@@ -1096,7 +1415,15 @@ async fn handle_conn(stream: TcpStream, state: Arc<ServerState>, cancel: Cancell
 							&msg,
 							ServerMessage::ActionNeeded(needed)
 								if needed.kind != ActionKind::Idle || !needed.controls.is_empty()
-						);
+						)
+							&& (!matches!(
+								&msg,
+								ServerMessage::ToolActivity(_) | ServerMessage::ReasoningSummary(_)
+							) || state.connections.lock().get(&connection_id).is_some_and(|connection| {
+								connection.capabilities.iter().any(|capability| {
+									capability == capabilities::TOOL_ACTIVITY_V1
+								})
+							}));
 						if allowed && send_msg(&mut write, &msg).await.is_err() {
 							break;
 						}
@@ -1131,9 +1458,11 @@ async fn reevaluate_ask<S>(state: &Arc<ServerState>, write: &mut S, connection_i
 where
 	S: SinkExt<Message> + Unpin,
 {
-	let Some((needed, identity)) = state.registry.lock().current_ask_snapshot() else {
+	let Some((needed, workflow_gate_id, identity)) = state.registry.lock().current_wire_snapshot()
+	else {
 		return true;
 	};
+
 	let Some((negotiation, client_capabilities, delivered)) = state
 		.connections
 		.lock()
@@ -1175,16 +1504,30 @@ where
 	if state.registry.lock().current_identity().as_ref() != Some(&identity) {
 		return true;
 	}
-	let message = match presentation {
-		Presentation::Full => ServerMessage::ActionNeeded(needed),
-		Presentation::Unavailable => ServerMessage::ActionUnavailable(ActionUnavailable {
-			id:                    needed.id,
-			session_id:            needed.session_id,
-			reason:                ActionUnavailableReason::MissingCapability,
-			required_capabilities: vec![capabilities::ASK_CONTROLS_V1.into()],
-		}),
+	let sent = match presentation {
+		Presentation::Full => match workflow_gate_id {
+			Some(workflow_gate_id) => {
+				let Ok(json) = serialize_workflow_gate_action_needed(&needed, &workflow_gate_id) else {
+					return false;
+				};
+				write.send(Message::Text(json)).await.map_err(|_| ())
+			},
+			None => send_msg(write, &ServerMessage::ActionNeeded(needed)).await,
+		},
+		Presentation::Unavailable => {
+			send_msg(
+				write,
+				&ServerMessage::ActionUnavailable(ActionUnavailable {
+					id:                    needed.id,
+					session_id:            needed.session_id,
+					reason:                ActionUnavailableReason::MissingCapability,
+					required_capabilities: vec![capabilities::ASK_CONTROLS_V1.into()],
+				}),
+			)
+			.await
+		},
 	};
-	if send_msg(write, &message).await.is_err() {
+	if sent.is_err() {
 		return false;
 	}
 	if let Some(connection) = state.connections.lock().get_mut(connection_id) {
@@ -1209,7 +1552,10 @@ where
 	if is_v3_frame(text) {
 		return state
 			.frame_tx
-			.send((connection_id.to_owned(), text.to_owned()))
+			.send((
+				connection_id.to_owned(),
+				attach_event_replay_capabilities(text, state, connection_id),
+			))
 			.is_ok();
 	}
 	let Ok(msg) = serde_json::from_str::<ClientMessage>(text) else {
@@ -1252,13 +1598,22 @@ where
 		},
 		ClientMessage::Hello(hello) => {
 			*awaiting = false;
-			if let Some(connection) = state.connections.lock().get_mut(connection_id) {
-				for capability in hello.capabilities {
-					if !connection.capabilities.contains(&capability) {
-						connection.capabilities.push(capability);
+			let capabilities =
+				if let Some(connection) = state.connections.lock().get_mut(connection_id) {
+					for capability in hello.capabilities {
+						if !connection.capabilities.contains(&capability) {
+							connection.capabilities.push(capability);
+						}
 					}
-				}
-				connection.negotiation = Negotiation::Negotiated;
+					connection.negotiation = Negotiation::Negotiated;
+					Some(connection.capabilities.clone())
+				} else {
+					None
+				};
+			if let Some(capabilities) = capabilities {
+				let _ = state
+					.cap_tx
+					.send(CapabilityUpdate { connection_id: connection_id.to_owned(), capabilities });
 			}
 			let _ = direct_tx.send(DirectCommand::ReevaluateAsk);
 			return true;
@@ -1350,6 +1705,40 @@ where
 	write.send(Message::Text(json)).await.map_err(|_| ())
 }
 
+/// Attaches the authoritative, locally negotiated capability set to forwarded
+/// `event_replay` frames. Hello is handled before later frames on a connection,
+/// so this does not depend on an asynchronously mirrored host cache.
+fn attach_event_replay_capabilities(
+	text: &str,
+	state: &ServerState,
+	connection_id: &str,
+) -> String {
+	let Ok(mut frame) = serde_json::from_str::<serde_json::Value>(text) else {
+		return text.to_owned();
+	};
+	if frame.get("type").and_then(serde_json::Value::as_str) != Some("event_replay") {
+		return text.to_owned();
+	}
+	let capabilities = state
+		.connections
+		.lock()
+		.get(connection_id)
+		.map_or_else(Vec::new, |connection| connection.capabilities.clone());
+	if let Some(object) = frame.as_object_mut() {
+		object.insert(
+			"capabilities".to_owned(),
+			serde_json::Value::Array(
+				capabilities
+					.into_iter()
+					.map(serde_json::Value::String)
+					.collect(),
+			),
+		);
+		return serde_json::to_string(&frame).unwrap_or_else(|_| text.to_owned());
+	}
+	text.to_owned()
+}
+
 fn is_v3_frame(text: &str) -> bool {
 	let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
 		return false;
@@ -1397,7 +1786,9 @@ mod tests {
 	use tokio_tungstenite::connect_async;
 
 	use super::*;
-	use crate::protocol::{ActionKind, AskControl, ClientHello, Ping, Reply};
+	use crate::protocol::{
+		ActionKind, AskControl, ClientHello, Ping, Reply, ToolActivity, ToolActivityPhase,
+	};
 
 	// Tokio's mock clock is process-global. Acquire the lock before constructing
 	// a paused runtime so concurrent libtest workers cannot share its clock.
@@ -1422,6 +1813,19 @@ mod tests {
 				keep_runtime_busy.abort();
 				let _ = keep_runtime_busy.await;
 			});
+	}
+
+	#[tokio::test]
+	async fn stalled_connection_tasks_are_aborted_after_shutdown_grace() {
+		let mut connections = JoinSet::new();
+		connections.spawn(async { std::future::pending::<()>().await });
+		tokio::time::timeout(
+			CONNECTION_JOIN_GRACE + Duration::from_secs(1),
+			join_connection_tasks(&mut connections),
+		)
+		.await
+		.expect("connection joins must remain bounded");
+		assert!(connections.is_empty());
 	}
 
 	fn ask(id: &str) -> ActionNeeded {
@@ -1554,6 +1958,93 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn hello_publishes_negotiated_capabilities() {
+		let handle = start(ServerConfig::new("s", "secret")).await.unwrap();
+		let mut updates = handle
+			.take_capability_receiver()
+			.expect("capability receiver");
+		let mut ws = connect(&handle, "secret").await;
+		next_server_hello(&mut ws).await;
+		send_hello(&mut ws, vec![capabilities::TOOL_ACTIVITY_V1.into()]).await;
+
+		let update = tokio::time::timeout(Duration::from_secs(2), updates.recv())
+			.await
+			.expect("timed out waiting for capability update")
+			.expect("capability receiver closed");
+		assert_eq!(update.capabilities, vec![capabilities::TOOL_ACTIVITY_V1]);
+		assert!(!update.connection_id.is_empty());
+		handle.stop();
+	}
+
+	#[tokio::test]
+	async fn event_replay_forwards_authoritative_capabilities() {
+		let handle = start(ServerConfig::new("s", "secret")).await.unwrap();
+		let mut frames = handle.take_frame_receiver().expect("frame receiver");
+		let mut updates = handle
+			.take_capability_receiver()
+			.expect("capability receiver");
+		let mut ws = connect(&handle, "secret").await;
+		next_server_hello(&mut ws).await;
+		send_hello(&mut ws, vec![capabilities::TOOL_ACTIVITY_V1.into()]).await;
+		updates.recv().await.expect("capability update");
+		ws.send(Message::Text(r#"{"type":"event_replay","id":"replay-1"}"#.into()))
+			.await
+			.unwrap();
+
+		let (_, frame) = tokio::time::timeout(Duration::from_secs(2), frames.recv())
+			.await
+			.expect("timed out waiting for replay frame")
+			.expect("frame receiver closed");
+		let frame: serde_json::Value = serde_json::from_str(&frame).unwrap();
+		assert_eq!(frame["capabilities"], serde_json::json!([capabilities::TOOL_ACTIVITY_V1]));
+		handle.stop();
+	}
+
+	#[tokio::test]
+	async fn tool_activity_is_sent_only_to_capable_clients() {
+		let handle = start(ServerConfig::new("s", "secret")).await.unwrap();
+		let mut updates = handle
+			.take_capability_receiver()
+			.expect("capability receiver");
+		let mut non_capable = connect(&handle, "secret").await;
+		next_server_hello(&mut non_capable).await;
+		send_hello(&mut non_capable, vec![]).await;
+		let mut capable = connect(&handle, "secret").await;
+		next_server_hello(&mut capable).await;
+		send_hello(&mut capable, vec![capabilities::TOOL_ACTIVITY_V1.into()]).await;
+		wait_for_clients(&handle, 2).await;
+		for _ in 0..2 {
+			tokio::time::timeout(Duration::from_secs(2), updates.recv())
+				.await
+				.expect("timed out waiting for capability update")
+				.expect("capability receiver closed");
+		}
+
+		handle
+			.push_frame(ServerMessage::ToolActivity(ToolActivity {
+				session_id:     "s".into(),
+				tool_call_id:   "call-1".into(),
+				tool_name:      "functions.read".into(),
+				phase:          ToolActivityPhase::Started,
+				args_summary:   None,
+				result_summary: None,
+				is_error:       None,
+			}))
+			.unwrap();
+
+		assert!(matches!(
+			next_server_msg(&mut capable).await,
+			ServerMessage::ToolActivity(activity) if activity.tool_call_id == "call-1"
+		));
+		assert!(
+			tokio::time::timeout(Duration::from_millis(100), non_capable.next())
+				.await
+				.is_err()
+		);
+		handle.stop();
+	}
+
+	#[tokio::test]
 	async fn start_binds_ephemeral_port() {
 		let handle = start(ServerConfig::new("s", "secret")).await.unwrap();
 		assert_ne!(handle.addr().port(), 0);
@@ -1566,6 +2057,62 @@ mod tests {
 		let handle = start(ServerConfig::new("s", "secret")).await.unwrap();
 		let url = format!("ws://{}/?token=wrong", handle.addr());
 		assert!(connect_async(url).await.is_err());
+		handle.stop();
+	}
+
+	#[tokio::test]
+	async fn workflow_gate_correlation_survives_same_server_replay() {
+		let handle = start(ServerConfig::new("s", "secret")).await.unwrap();
+		handle
+			.register_workflow_gate_ask(ask("presentation-1"), "gate-1".into(), true)
+			.unwrap();
+
+		let mut first = connect(&handle, "secret").await;
+		let _ = next_server_hello(&mut first).await;
+		let first_raw = first
+			.next()
+			.await
+			.expect("workflow frame")
+			.expect("websocket frame");
+		let Message::Text(first_raw) = first_raw else {
+			panic!("expected workflow text frame")
+		};
+		let first_workflow = crate::protocol::decode_workflow_gate_action_needed(first_raw.as_str())
+			.unwrap()
+			.expect("workflow correlation");
+		assert_eq!(first_workflow.action.id, "presentation-1");
+		assert_eq!(first_workflow.workflow_gate_id, "gate-1");
+
+		let mut replay = connect(&handle, "secret").await;
+		let _ = next_server_hello(&mut replay).await;
+		let replay_raw = replay
+			.next()
+			.await
+			.expect("replayed workflow frame")
+			.expect("websocket frame");
+		let Message::Text(replay_raw) = replay_raw else {
+			panic!("expected replay text frame")
+		};
+		let replay_workflow =
+			crate::protocol::decode_workflow_gate_action_needed(replay_raw.as_str())
+				.unwrap()
+				.expect("replayed workflow correlation");
+		assert_eq!(replay_workflow, first_workflow);
+		handle.stop();
+	}
+
+	#[tokio::test]
+	async fn empty_workflow_gate_correlation_is_rejected_without_registry_mutation() {
+		let handle = start(ServerConfig::new("s", "secret")).await.unwrap();
+		handle.register_ask(ask("existing"), true);
+		let identity = handle.current_identity();
+
+		assert_eq!(
+			handle.register_workflow_gate_ask(ask("replacement"), String::new(), true),
+			Err(WorkflowGateRegistrationError::EmptyWorkflowGateId)
+		);
+		assert_eq!(handle.current_identity(), identity);
+		assert!(handle.current_workflow_gate_ask().is_none());
 		handle.stop();
 	}
 
@@ -1749,55 +2296,16 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn same_id_replacement_rejects_stale_full_delivery_epoch() {
-		let mut config = ServerConfig::new("s", "secret");
-		config.forward_replies = true;
-		let handle = start(config).await.unwrap();
-		let mut ws = connect(&handle, "secret").await;
-		next_server_hello(&mut ws).await;
-		send_hello(&mut ws, vec![capabilities::ASK_CONTROLS_V1.into()]).await;
+	async fn pending_same_id_registration_is_rejected_without_replacing_delivery_identity() {
+		let handle = start(ServerConfig::new("s", "secret")).await.unwrap();
 		handle.register_ask(controlled_ask("a1"), true);
-		let _ = next_server_msg(&mut ws).await;
-		let delivered = handle
-			.state
-			.connections
-			.lock()
-			.values()
-			.next()
-			.and_then(|connection| connection.delivered.clone())
-			.expect("full delivery record");
-		handle
-			.state
-			.registry
-			.lock()
-			.register_ask(controlled_ask("a1"), true);
-		assert_ne!(
-			delivered.identity,
-			handle
-				.state
-				.registry
-				.lock()
-				.current_identity()
-				.expect("replacement identity")
-		);
+		let original = handle.current_identity().expect("original identity");
 
-		ws.send(Message::Text(
-			serde_json::to_string(&ClientMessage::Reply(Reply {
-				id:              "a1".into(),
-				answer:          ReplyAnswer::Index(0),
-				token:           "secret".into(),
-				idempotency_key: None,
-			}))
-			.unwrap(),
-		))
-		.await
-		.unwrap();
-		assert!(matches!(
-			next_server_msg(&mut ws).await,
-			ServerMessage::ReplyRejected(ReplyRejected { reason: RejectReason::InvalidAnswer, .. })
-		));
-		assert!(!handle.state.registry.lock().has_claim_for_action("a1"));
-		assert!(handle.state.registry.lock().is_pending("a1"));
+		assert_eq!(
+			handle.try_register_ask(controlled_ask("a1"), true),
+			Err(ActionRegistrationError::ActionIdAlreadyRegistered)
+		);
+		assert_eq!(handle.current_identity(), Some(original));
 		handle.stop();
 	}
 
@@ -2016,6 +2524,7 @@ mod tests {
 			capabilities::SESSION_READY,
 			capabilities::ASK_CONTROLS_V1,
 			capabilities::ASK_SELECTED_ACK_V1,
+			capabilities::TOOL_ACTIVITY_V1,
 		]);
 
 		match next_server_msg(&mut ws).await {
@@ -2079,6 +2588,27 @@ mod tests {
 		handle.stop();
 		handle.stop();
 		handle.stop();
+	}
+
+	#[tokio::test]
+	async fn awaited_stop_joins_half_open_and_established_connections_idempotently() {
+		let handle = start(ServerConfig::new("s", "secret")).await.unwrap();
+		let half_open = TcpStream::connect(handle.addr()).await.unwrap();
+		let mut ws = connect(&handle, "secret").await;
+		next_server_hello(&mut ws).await;
+		wait_for_clients(&handle, 1).await;
+
+		let left = handle.clone();
+		let right = handle.clone();
+		tokio::time::timeout(Duration::from_secs(1), async move {
+			tokio::join!(left.stop_and_wait(), right.stop_and_wait());
+		})
+		.await
+		.expect("awaited stop joins every accepted connection");
+
+		drop(half_open);
+		assert_eq!(handle.client_count(), 0);
+		handle.stop_and_wait().await;
 	}
 
 	#[tokio::test]
@@ -2634,6 +3164,40 @@ mod tests {
 		handle.stop();
 	}
 	#[tokio::test]
+	async fn directed_tool_frames_require_negotiated_capability() {
+		let handle = start(ServerConfig::new("s", "secret")).await.unwrap();
+		let mut legacy = connect(&handle, "secret").await;
+		let legacy_id = next_server_hello(&mut legacy)
+			.await
+			.connection_id
+			.expect("connection id");
+		send_hello(&mut legacy, vec![]).await;
+		let mut capable = connect(&handle, "secret").await;
+		let capable_id = next_server_hello(&mut capable)
+			.await
+			.connection_id
+			.expect("connection id");
+		send_hello(&mut capable, vec![capabilities::TOOL_ACTIVITY_V1.into()]).await;
+		wait_for_clients(&handle, 2).await;
+
+		let frame =
+			r#"{"type":"tool_activity","toolCallId":"c1","toolName":"read","phase":"started"}"#;
+		assert!(handle.send_to(&legacy_id, frame.into()));
+		assert!(
+			tokio::time::timeout(std::time::Duration::from_millis(300), legacy.next())
+				.await
+				.is_err()
+		);
+		assert!(handle.send_to(&capable_id, frame.into()));
+		let delivered = tokio::time::timeout(std::time::Duration::from_secs(2), capable.next())
+			.await
+			.expect("directed send timeout")
+			.expect("socket open")
+			.expect("ws message");
+		assert!(matches!(delivered, Message::Text(text) if text.contains("tool_activity")));
+		handle.stop();
+	}
+	#[tokio::test]
 	async fn oversized_text_frame_closes_only_the_offending_client() {
 		let handle = start(ServerConfig::new("s", "secret")).await.unwrap();
 		let mut oversized = connect(&handle, "secret").await;
@@ -2646,12 +3210,16 @@ mod tests {
 			.send(Message::Text("x".repeat(REQUEST_FRAME_BYTES + 1).into()))
 			.await
 			.expect("send oversized text frame");
-		let rejected = tokio::time::timeout(std::time::Duration::from_secs(2), oversized.next())
+		match tokio::time::timeout(std::time::Duration::from_secs(2), oversized.next())
 			.await
 			.expect("oversized client was not closed")
-			.expect("oversized client stream closed without a close frame")
-			.expect("oversized client close error");
-		assert!(matches!(rejected, Message::Close(Some(frame)) if frame.code == CloseCode::Size));
+		{
+			Some(Ok(Message::Close(Some(frame)))) => {
+				assert_eq!(frame.code, CloseCode::Size);
+			},
+			Some(Err(_)) | None => {},
+			Some(Ok(message)) => panic!("unexpected non-close message: {message:?}"),
+		}
 
 		healthy
 			.send(Message::Text(

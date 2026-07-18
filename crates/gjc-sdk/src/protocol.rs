@@ -120,8 +120,9 @@ pub enum AnswerSelector {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ActionNeeded {
-	/// Stable action id. For an answerable `ask`, this is the durable broker
-	/// `gate_id`.
+	/// Ephemeral presentation/action id and the sole generic reply authority.
+	/// Durable workflow correlation, when present, is carried separately on the
+	/// correlated wire envelope.
 	pub id:         String,
 	/// Whether this is an answerable ask or a notify-only idle ping.
 	pub kind:       ActionKind,
@@ -141,6 +142,86 @@ pub struct ActionNeeded {
 	/// A short summary (e.g. truncated last assistant message for `idle`).
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub summary:    Option<String>,
+}
+
+/// A correlated workflow-gate presentation. The embedded action retains the
+/// generic reply authority; `workflow_gate_id` is correlation metadata only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowGateActionNeeded {
+	pub action:           ActionNeeded,
+	pub workflow_gate_id: String,
+}
+
+/// The outer wire discriminator that scopes correlated workflow-gate
+/// registration. This is internal registration metadata; it does not add a wire
+/// field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorkflowGateWireDiscriminator {
+	ActionNeeded,
+	#[allow(
+		dead_code,
+		reason = "reserved to fence future correlated action_unavailable registrations"
+	)]
+	ActionUnavailable,
+}
+
+impl WorkflowGateWireDiscriminator {
+	#[must_use]
+	pub(crate) const fn as_str(self) -> &'static str {
+		match self {
+			Self::ActionNeeded => "action_needed",
+			Self::ActionUnavailable => "action_unavailable",
+		}
+	}
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WireActionNeeded<'a> {
+	#[serde(rename = "type")]
+	kind:             &'static str,
+	#[serde(flatten)]
+	action:           &'a ActionNeeded,
+	workflow_gate_id: &'a str,
+}
+
+/// Decode correlated workflow metadata from an `action_needed` wire frame.
+/// Legacy [`ServerMessage`] decoding remains intentionally correlation-blind.
+pub fn decode_workflow_gate_action_needed(
+	json: &str,
+) -> Result<Option<WorkflowGateActionNeeded>, serde_json::Error> {
+	let value: serde_json::Value = serde_json::from_str(json)?;
+	if value.get("type").and_then(serde_json::Value::as_str)
+		!= Some(WorkflowGateWireDiscriminator::ActionNeeded.as_str())
+	{
+		return Ok(None);
+	}
+	let Some(workflow_gate_value) = value.get("workflowGateId") else {
+		return Ok(None);
+	};
+	let workflow_gate_id = workflow_gate_value
+		.as_str()
+		.filter(|id| !id.is_empty())
+		.map(str::to_owned)
+		.ok_or_else(|| {
+			serde_json::Error::io(std::io::Error::new(
+				std::io::ErrorKind::InvalidData,
+				"workflowGateId must be a nonempty string",
+			))
+		})?;
+	let action = serde_json::from_value(value)?;
+	Ok(Some(WorkflowGateActionNeeded { action, workflow_gate_id }))
+}
+
+pub(crate) fn serialize_workflow_gate_action_needed(
+	action: &ActionNeeded,
+	workflow_gate_id: &str,
+) -> Result<String, serde_json::Error> {
+	serde_json::to_string(&WireActionNeeded {
+		kind: WorkflowGateWireDiscriminator::ActionNeeded.as_str(),
+		action,
+		workflow_gate_id,
+	})
 }
 
 /// Sent when a controlled action cannot be presented to this connection.
@@ -356,6 +437,11 @@ pub enum ServerMessage {
 	/// A controlled action could not be presented to this connection.
 	ActionUnavailable(ActionUnavailable),
 
+	/// A projected tool execution activity update.
+	ToolActivity(ToolActivity),
+	/// A finalized, provider-supplied reasoning summary.
+	ReasoningSummary(ReasoningSummary),
+
 	/// Forward-compat: an unrecognized frame type. Tolerated, never emitted.
 	#[serde(other)]
 	Unknown,
@@ -403,6 +489,17 @@ pub enum TurnPhase {
 	Live,
 	/// The clean, finalized turn output.
 	Finalized,
+}
+
+/// Phase of a projected tool execution activity update.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolActivityPhase {
+	Started,
+	Completed,
+	Failed,
+	Cancelled,
+	Unknown,
 }
 
 /// One-time per-session identity header, pinned at thread creation.
@@ -469,6 +566,32 @@ pub struct TurnStream {
 	/// Opaque ref to coalesce live edits onto one rendered message.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub message_ref:  Option<String>,
+}
+
+/// A projected tool execution activity update for a session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolActivity {
+	pub session_id:     String,
+	pub tool_call_id:   String,
+	pub tool_name:      String,
+	pub phase:          ToolActivityPhase,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub args_summary:   Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub result_summary: Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub is_error:       Option<bool>,
+}
+
+/// A finalized, provider-supplied reasoning summary for a session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReasoningSummary {
+	pub session_id: String,
+	pub text:       String,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub turn_ref:   Option<String>,
 }
 
 /// An agent-produced image artifact for a session thread.
@@ -647,21 +770,35 @@ pub enum ControlCommandStatus {
 	Unavailable,
 }
 
+/// A Telegram-safe model choice surfaced by a successful `model` list control
+/// result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelChoice {
+	/// Stable selector forwarded back to the session when this choice is tapped.
+	pub selector: String,
+	/// Human-readable button label.
+	pub label:    String,
+}
+
 /// Result of a deterministic transport control command.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ControlCommandResult {
 	/// The session this result belongs to.
-	pub session_id: String,
+	pub session_id:    String,
 	/// Client request id being answered.
-	pub request_id: String,
+	pub request_id:    String,
 	/// Telegram update id this result corresponds to, when known.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub update_id:  Option<i64>,
+	pub update_id:     Option<i64>,
 	/// Terminal command status.
-	pub status:     ControlCommandStatus,
+	pub status:        ControlCommandStatus,
 	/// Short deterministic Telegram-visible text.
-	pub message:    String,
+	pub message:       String,
+	/// Optional model choices for a successful bare `model` list request.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub model_choices: Option<Vec<ModelChoice>>,
 }
 
 /// Agent loop activity state, driving the client's live typing indicator.
@@ -767,11 +904,41 @@ pub mod capabilities {
 	pub const ASK_CONTROLS_V1: &str = "ask_controls_v1";
 	/// Correlated, origin-bound `Selected!` acknowledgement requests.
 	pub const ASK_SELECTED_ACK_V1: &str = "ask_selected_ack_v1";
+	/// Projected tool activity and finalized reasoning summary frames.
+	pub const TOOL_ACTIVITY_V1: &str = "tool_activity_v1";
 }
 
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn correlated_action_needed_roundtrips_without_changing_legacy_reader() {
+		let action = ActionNeeded {
+			id:         "presentation-1".into(),
+			kind:       ActionKind::Ask,
+			session_id: "session-1".into(),
+			question:   Some("Proceed?".into()),
+			options:    Some(vec!["Yes".into(), "No".into()]),
+			controls:   vec![],
+			summary:    None,
+		};
+		let raw = serialize_workflow_gate_action_needed(&action, "gate-1").unwrap();
+		let correlated = decode_workflow_gate_action_needed(&raw)
+			.unwrap()
+			.expect("correlation");
+		assert_eq!(correlated.action, action);
+		assert_eq!(correlated.workflow_gate_id, "gate-1");
+		let legacy: ServerMessage = serde_json::from_str(&raw).unwrap();
+		assert_eq!(legacy, ServerMessage::ActionNeeded(action));
+		assert!(
+			decode_workflow_gate_action_needed(
+				r#"{"type":"action_needed","id":"a","kind":"ask","sessionId":"s"}"#
+			)
+			.unwrap()
+			.is_none()
+		);
+	}
 
 	#[test]
 	fn action_needed_ask_serializes_camelcase_with_snake_type() {
@@ -996,6 +1163,94 @@ mod tests {
 	}
 
 	#[test]
+	fn tool_activity_serializes_camelcase_snake_tag() {
+		let msg = ServerMessage::ToolActivity(ToolActivity {
+			session_id:     "sess-1".into(),
+			tool_call_id:   "call-1".into(),
+			tool_name:      "functions.read".into(),
+			phase:          ToolActivityPhase::Completed,
+			args_summary:   Some("path: protocol.rs".into()),
+			result_summary: Some("1488 lines".into()),
+			is_error:       Some(false),
+		});
+		let value = serde_json::to_value(&msg).unwrap();
+		assert_eq!(value["type"], "tool_activity");
+		assert_eq!(value["sessionId"], "sess-1");
+		assert_eq!(value["toolCallId"], "call-1");
+		assert_eq!(value["toolName"], "functions.read");
+		assert_eq!(value["phase"], "completed");
+		assert_eq!(value["argsSummary"], "path: protocol.rs");
+		assert_eq!(value["resultSummary"], "1488 lines");
+		assert_eq!(value["isError"], false);
+		assert_eq!(serde_json::from_value::<ServerMessage>(value).unwrap(), msg);
+	}
+
+	#[test]
+	fn reasoning_summary_round_trips() {
+		let msg = ServerMessage::ReasoningSummary(ReasoningSummary {
+			session_id: "sess-1".into(),
+			text:       "Provider summary".into(),
+			turn_ref:   Some("turn-1".into()),
+		});
+		let value = serde_json::to_value(&msg).unwrap();
+		assert_eq!(value["type"], "reasoning_summary");
+		assert_eq!(value["sessionId"], "sess-1");
+		assert_eq!(value["turnRef"], "turn-1");
+		assert_eq!(serde_json::from_value::<ServerMessage>(value).unwrap(), msg);
+	}
+
+	#[test]
+	fn tool_activity_phase_snake_case() {
+		for (phase, expected) in [
+			(ToolActivityPhase::Started, "started"),
+			(ToolActivityPhase::Completed, "completed"),
+			(ToolActivityPhase::Failed, "failed"),
+			(ToolActivityPhase::Cancelled, "cancelled"),
+			(ToolActivityPhase::Unknown, "unknown"),
+		] {
+			assert_eq!(serde_json::to_string(&phase).unwrap(), format!("\"{expected}\""));
+		}
+	}
+
+	#[test]
+	fn unknown_variant_remains_final_serde_other() {
+		let msg: ServerMessage =
+			serde_json::from_str(r#"{"type":"totally_unknown","payload":true}"#).unwrap();
+		assert_eq!(msg, ServerMessage::Unknown);
+	}
+
+	#[test]
+	fn server_message_variant_enumeration() {
+		// TODO(#2299 rebase): extend to include ephemeral_turn/ephemeral_turn_result.
+		let raw = r#"[
+			{"type":"tool_activity","sessionId":"sess-1","toolCallId":"call-1","toolName":"functions.read","phase":"started"},
+			{"type":"reasoning_summary","sessionId":"sess-1","text":"Provider summary","turnRef":"turn-1"},
+			{"type":"future_server_variant","payload":true}
+		]"#;
+		let messages: Vec<ServerMessage> = serde_json::from_str(raw).unwrap();
+		assert_eq!(messages, vec![
+			ServerMessage::ToolActivity(ToolActivity {
+				session_id:     "sess-1".into(),
+				tool_call_id:   "call-1".into(),
+				tool_name:      "functions.read".into(),
+				phase:          ToolActivityPhase::Started,
+				args_summary:   None,
+				result_summary: None,
+				is_error:       None,
+			}),
+			ServerMessage::ReasoningSummary(ReasoningSummary {
+				session_id: "sess-1".into(),
+				text:       "Provider summary".into(),
+				turn_ref:   Some("turn-1".into()),
+			}),
+			ServerMessage::Unknown,
+		],);
+		let round_tripped: Vec<ServerMessage> =
+			serde_json::from_str(&serde_json::to_string(&messages).unwrap()).unwrap();
+		assert_eq!(round_tripped, messages);
+	}
+
+	#[test]
 	fn image_attachment_serializes() {
 		let msg = ServerMessage::ImageAttachment(ImageAttachment {
 			session_id: "sess-1".into(),
@@ -1188,13 +1443,17 @@ mod tests {
 	}
 
 	#[test]
-	fn control_command_result_serializes() {
+	fn control_command_result_model_choices_roundtrip() {
 		let msg = ServerMessage::ControlCommandResult(ControlCommandResult {
-			session_id: "s1".into(),
-			request_id: "r1".into(),
-			update_id:  Some(42),
-			status:     ControlCommandStatus::Ok,
-			message:    "Context: 1/2 (50.0%)".into(),
+			session_id:    "s1".into(),
+			request_id:    "r1".into(),
+			update_id:     Some(42),
+			status:        ControlCommandStatus::Ok,
+			message:       "Select a model".into(),
+			model_choices: Some(vec![ModelChoice {
+				selector: "provider/model".into(),
+				label:    "Model".into(),
+			}]),
 		});
 		let v = serde_json::to_value(&msg).unwrap();
 		assert_eq!(v["type"], "control_command_result");
@@ -1202,6 +1461,18 @@ mod tests {
 		assert_eq!(v["requestId"], "r1");
 		assert_eq!(v["updateId"], 42);
 		assert_eq!(v["status"], "ok");
+		assert_eq!(v["modelChoices"][0]["selector"], "provider/model");
+		assert_eq!(serde_json::from_value::<ServerMessage>(v).unwrap(), msg);
+	}
+
+	#[test]
+	fn control_command_result_without_model_choices_remains_compatible() {
+		let raw = r#"{"type":"control_command_result","sessionId":"s1","requestId":"r1","status":"ok","message":"done"}"#;
+		let msg: ServerMessage = serde_json::from_str(raw).unwrap();
+		match msg {
+			ServerMessage::ControlCommandResult(result) => assert_eq!(result.model_choices, None),
+			other => panic!("expected control_command_result, got {other:?}"),
+		}
 	}
 
 	#[test]

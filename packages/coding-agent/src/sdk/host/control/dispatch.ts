@@ -79,6 +79,10 @@ interface IdempotencyEntry {
 }
 const idempotentRequests = new WeakMap<ControlSurface, Map<string, IdempotencyEntry>>();
 
+type PreflightCancellableSurface = ControlSurface & {
+	cancelPendingPreflights?(): void;
+};
+
 function failure(
 	id: string,
 	code: ControlErrorCode,
@@ -129,6 +133,7 @@ function invoke(
 	operation: string,
 	input: ControlInput,
 	confirm: boolean | undefined,
+	idempotencyKey: string | undefined,
 ): Promise<ControlValue> | ControlValue {
 	switch (operation) {
 		case "turn.prompt":
@@ -144,9 +149,14 @@ function invoke(
 		case "ask.answer":
 			return surface.answerAsk(text(input, "id"), input.answer);
 		case "workflow.gate_answer":
-			return surface.answerGate(text(input, "id"), input.response);
+			return surface.answerGate(
+				text(input, "id"),
+				input.response,
+				input.expectedSessionId as string | undefined,
+				idempotencyKey,
+			);
 		case "workflow.plan_approve":
-			return surface.approvePlan(text(input, "id"), input.choice);
+			return surface.approvePlan(text(input, "id"), input.choice, input.expectedSessionId as string | undefined);
 		case "skill.invoke":
 			return surface.invokeSkill(text(input, "name"), input.args);
 		case "mode.plan.set":
@@ -272,7 +282,13 @@ async function execute(surface: ControlSurface, row: Operation, request: Control
 		return {
 			id: request.id,
 			ok: true,
-			result: await invoke(surface, row.sdkId, request.input as ControlInput, request.confirm),
+			result: await invoke(
+				surface,
+				row.sdkId,
+				request.input as ControlInput,
+				request.confirm,
+				request.idempotencyKey,
+			),
 		};
 	} catch (error) {
 		return errorResponse(request.id, row, error);
@@ -353,6 +369,11 @@ export function dispatchControl(
 			failure(request.id, "invalid_input", "confirm: true is required for this destructive operation."),
 		);
 	const work = () => execute(surface, row, request);
+	if (row.sdkId === "turn.abort_and_prompt") {
+		const cancellable = surface as PreflightCancellableSurface;
+		if (Object.hasOwn(cancellable, "cancelPendingPreflights")) cancellable.cancelPendingPreflights?.();
+		return serialize(surface, work);
+	}
 	if (row.idempotency === "idempotent" && request.idempotencyKey) return idempotent(surface, row, request, work);
 	return row.idempotency === "ordered" && row.sdkId !== "retry.now" ? serialize(surface, work) : work();
 }

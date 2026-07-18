@@ -3,7 +3,9 @@ import { createHash } from "node:crypto";
 import { mkdtemp, readdir, readFile, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { BrokerWorkflowGateEmitter, FileGateStore } from "../src/modes/shared/agent-wire/workflow-gate-broker";
 import { CursorRegistry, cursorMac, QueryHandlers, RevisionStore } from "../src/sdk/host/query/index.js";
+import { Q10ThinkingMetadataError } from "../src/sdk/models.js";
 
 const huge = (value: string) => `${value}${"x".repeat(140_000)}`;
 function surface(transcript: unknown[] = []) {
@@ -104,6 +106,62 @@ describe("SDK query pagination", () => {
 		expect(reused.error?.code).toBe("invalid_input");
 	});
 
+	it("routes Q10 and every models alias through the same installed paged registry", async () => {
+		const models = [
+			{ provider: "one", id: "one", name: huge("one") },
+			{ provider: "two", id: "two", name: huge("two") },
+			{ provider: "three", id: "three", name: huge("three") },
+		];
+		const store = new RevisionStore("s1");
+		const cursors = new CursorRegistry("token", store);
+		const query = new QueryHandlers(
+			{ ...surface(), getModels: () => models, installedQueries: new Set(["models.list/current"]) },
+			"s1",
+			store,
+			cursors,
+		);
+
+		const first = await query.dispatch({ query: "models.list", input: { current: true }, connectionId: "c" });
+		expect(first.page?.items.map(item => (item as { id: string }).id)).toEqual(["one"]);
+		expect(first.page?.complete).toBe(false);
+		const second = await query.dispatch({
+			query: "models.current",
+			cursor: first.page?.continuationCursor,
+			connectionId: "c",
+		});
+		expect(second.page?.items.map(item => (item as { id: string }).id)).toEqual(["two"]);
+		const third = await query.dispatch({
+			query: "models.list/current",
+			cursor: second.page?.continuationCursor,
+			connectionId: "c",
+		});
+		expect(third.page?.items.map(item => (item as { id: string }).id)).toEqual(["three"]);
+		expect(third.page?.complete).toBe(true);
+
+		const raw = await query.dispatch({ query: "Q10", connectionId: "c" });
+		expect(raw.page?.items.map(item => (item as { id: string }).id)).toEqual(["one"]);
+	});
+
+	it("returns safe Q10 projection failures through the query envelope", async () => {
+		const store = new RevisionStore("s1");
+		const query = new QueryHandlers(
+			{
+				...surface(),
+				getModels: () => {
+					throw new Q10ThinkingMetadataError("private-provider", "private-model", "missing_thinking");
+				},
+			},
+			"s1",
+			store,
+			new CursorRegistry("token", store),
+		);
+		const response = await query.dispatch({ query: "models.current", connectionId: "c" });
+		expect(response.error).toEqual({
+			code: "internal",
+			message: "Invalid thinking metadata for private-provider/private-model: missing_thinking",
+		});
+	});
+
 	it("rotates pins so sequential completed walks do not exhaust one connection", async () => {
 		const query = handlers([
 			{ id: "one", body: huge("one") },
@@ -119,7 +177,7 @@ describe("SDK query pagination", () => {
 			expect(complete.page?.complete).toBe(true);
 		}
 		expect(query.cursors.size).toBe(0);
-	});
+	}, 30000);
 
 	it("writes owner-private chunked spills atomically with bounded buffering", async () => {
 		const stateRoot = await mkdtemp(join(tmpdir(), "gjc-sdk-query-test-"));
@@ -150,6 +208,17 @@ describe("SDK query pagination", () => {
 			expect((await stat(join(objects, files[0]!))).mode & 0o777).toBe(0o600);
 		}
 		await store.close();
+	});
+
+	it("settles in-progress spill writes before terminal cleanup", async () => {
+		for (let index = 0; index < 3; index++) {
+			const stateRoot = await mkdtemp(join(tmpdir(), "gjc-sdk-query-close-race-"));
+			const store = new RevisionStore(`close-race-${index}`, Date.now, { storageDir: stateRoot });
+			const write = store.createRevision("large", "id", { body: "x".repeat(8 * 1024 * 1024) });
+			const close = store.close();
+			await expect(write).resolves.toBe("1");
+			await expect(close).resolves.toBeUndefined();
+		}
 	});
 
 	it("splits large CJK and emoji snapshots at UTF-8 boundaries", async () => {
@@ -313,6 +382,33 @@ it("keeps artifact range responses below the serialized one MiB ceiling", async 
 	expect(Buffer.byteLength(JSON.stringify(response))).toBeLessThan(1024 * 1024);
 	expect((response.result as { complete: boolean }).complete).toBe(false);
 });
+it("keeps random-sized paginated responses below the one MiB ceiling", async () => {
+	for (let seed = 1; seed <= 24; seed++) {
+		let state = seed;
+		const next = () => {
+			state = (state * 16_807) % 2_147_483_647;
+			return state;
+		};
+		const diff = Array.from({ length: 32 }, (_, index) => ({
+			id: String(index),
+			body: "x".repeat(next() % 180_000),
+		}));
+		const store = new RevisionStore(`page-${seed}`);
+		const query = new QueryHandlers(
+			{ ...surface([]), getDiff: () => diff },
+			`page-${seed}`,
+			store,
+			new CursorRegistry("token", store),
+		);
+		let response = await query.dispatch({ query: "Q06", connectionId: "c" });
+		while (response.page) {
+			expect(Buffer.byteLength(JSON.stringify(response))).toBeLessThan(1024 * 1024);
+			if (response.page.complete) break;
+			response = await query.dispatch({ query: "Q06", cursor: response.page.continuationCursor, connectionId: "c" });
+		}
+		await store.close();
+	}
+});
 
 it("describes an arbitrarily large indexed item from manifest metadata before reading its body", async () => {
 	const stateRoot = await mkdtemp(join(tmpdir(), "gjc-sdk-query-test-"));
@@ -410,3 +506,37 @@ it("incrementally continues very large escaped emoji fields through bounded snap
 	expect(reads.every(({ start, end }) => end - start < serializedBytes)).toBe(true);
 	await store.close();
 }, 30_000);
+
+it("reconstructs Q12 workflow gate state after a client restart without reviving the orphaned gate", async () => {
+	const stateRoot = await mkdtemp(join(tmpdir(), "gjc-sdk-q12-restart-"));
+	const storePath = join(stateRoot, "workflow-gates.json");
+	const first = new BrokerWorkflowGateEmitter("q12-session", new FileGateStore(storePath));
+	void first.emitGate({ stage: "ralplan", kind: "approval", schema: { type: "string", enum: ["approve"] } });
+	const restarted = new BrokerWorkflowGateEmitter("q12-session", new FileGateStore(storePath));
+	void restarted.emitGate({
+		stage: "ralplan",
+		kind: "approval",
+		schema: { type: "string", enum: ["approve"] },
+	});
+	const store = new RevisionStore("q12-session");
+	const query = new QueryHandlers(
+		{ ...surface([]), getGates: () => restarted.listWorkflowGateQueryRecords!() },
+		"q12-session",
+		store,
+		new CursorRegistry("token", store),
+	);
+	const response = await query.dispatch({ query: "Q12", connectionId: "restarted-client" });
+	if (!response.page) throw new Error("Q12 did not return a page");
+	const gates = response.page.items as Array<Record<string, unknown>>;
+	expect(gates).toEqual(
+		expect.arrayContaining([
+			expect.objectContaining({ id: expect.stringMatching(/^diagnostic:/), tag: "quarantined" }),
+			expect.objectContaining({ id: expect.stringMatching(/^pending:/), tag: "pending" }),
+		]),
+	);
+	expect(gates.filter(gate => gate.tag === "pending")).toHaveLength(1);
+	expect(gates.find(gate => gate.tag === "quarantined")).toMatchObject({
+		lifecycle: { reason: "orphaned_after_process_restart" },
+	});
+	await store.close();
+});

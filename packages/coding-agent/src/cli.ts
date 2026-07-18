@@ -9,7 +9,6 @@ import { Args, type CliConfig, Command, type CommandEntry, Flags, run } from "@g
 import { APP_NAME, formatBunRuntimeError, MIN_BUN_VERSION, VERSION } from "@gajae-code/utils/dirs";
 import { runFixtureReport } from "./cli/fixture-report";
 import { isTmuxOwnerIsolationCliArgv, runTmuxOwnerIsolationCliFromStdin } from "./gjc-runtime/tmux-owner-isolation-cli";
-import { runChatDaemonInternal } from "./sdk/bus/chat-daemon-cli";
 
 if (Bun.semver.order(Bun.version, MIN_BUN_VERSION) < 0) {
 	process.stderr.write(
@@ -134,6 +133,7 @@ async function runChatDaemonInternalFastPath(argv: string[]): Promise<void> {
 	if (action !== "discord-internal" && action !== "slack-internal") {
 		throw new Error("invalid chat daemon internal fast path");
 	}
+	const { runChatDaemonInternal } = await import("./sdk/bus/chat-daemon-cli");
 	await runChatDaemonInternal(action === "discord-internal" ? "discord" : "slack", argv.slice(2));
 }
 
@@ -189,6 +189,7 @@ export class RootHelpCommand extends Command {
 		}),
 		"system-prompt": Flags.string({ description: "System prompt (default: coding assistant prompt)" }),
 		"append-system-prompt": Flags.string({ description: "Append text or file contents to the system prompt" }),
+		"mcp-config": Flags.string({ description: "Tools-only MCP config file (absolute path)" }),
 		"allow-home": Flags.boolean({ description: "Allow starting in ~ without auto-switching to a temp dir" }),
 		mode: Flags.string({
 			description: "Output mode: text (default), json, or acp",

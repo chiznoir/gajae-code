@@ -114,7 +114,6 @@ export type ContextFileEntry = {
 	depth?: number;
 };
 
-export type { DiscoverableMCPTool } from "../runtime-mcp/discoverable-tool-metadata";
 export type {
 	DiscoverableTool,
 	DiscoverableToolSearchIndex,
@@ -278,6 +277,8 @@ export interface ToolSession {
 	bashRestrictionProfile?: BashRestrictionProfile;
 	/** Optional per-session allowlist for tools exposed through search_tool_bm25. */
 	discoverableToolAllowedNames?: readonly string[];
+	/** Throw instead of warn when toolNames contains an unknown name. */
+	strictToolNames?: boolean;
 	/** Get artifacts directory for artifact:// URLs */
 	getArtifactsDir?: () => string | null;
 	/** Get the ArtifactManager backing this session (shared across parent + subagents). */
@@ -326,18 +327,6 @@ export interface ToolSession {
 	getTodoPhases?: () => TodoPhase[];
 	/** Replace cached todo phases for this session. */
 	setTodoPhases?: (phases: TodoPhase[]) => void;
-	/** Whether MCP tool discovery is active for this session. */
-	isMCPDiscoveryEnabled?: () => boolean;
-	/** Get hidden-but-discoverable MCP tools for search_tool_bm25 prompts and fallbacks.
-	 * @deprecated Use getDiscoverableTools with source filter instead. */
-	getDiscoverableMCPTools?: () => import("../runtime-mcp/discoverable-tool-metadata").DiscoverableMCPTool[];
-	/** Get the cached discoverable MCP search index for search_tool_bm25 execution.
-	 * @deprecated Use getDiscoverableToolSearchIndex instead. */
-	getDiscoverableMCPSearchIndex?: () => import("../tool-discovery/tool-index").DiscoverableMCPSearchIndex;
-	/** Get MCP tools activated by prior search_tool_bm25 calls. */
-	getSelectedMCPToolNames?: () => string[];
-	/** Merge MCP tool selections into the active session tool set. */
-	activateDiscoveredMCPTools?: (toolNames: string[]) => Promise<string[]>;
 	// ── Generic tool discovery (unified — covers built-in + MCP + extension) ──
 	/** Whether any form of tool discovery is active (tools.discoveryMode !== "off" or mcp.discoveryMode). */
 	isToolDiscoveryEnabled?: () => boolean;
@@ -670,6 +659,14 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 		requestedTools.push("yield");
 	}
 
+	if (requestedTools) {
+		const unknownToolNames = requestedTools.filter(name => !allToolsByRequestName.has(name));
+		if (unknownToolNames.length > 0) {
+			const message = `Unknown tool name${unknownToolNames.length === 1 ? "" : "s"}: ${unknownToolNames.join(", ")}`;
+			if (session.strictToolNames) throw new Error(message);
+			logger.warn(message);
+		}
+	}
 	const filteredRequestedTools = requestedTools
 		?.map(name => allToolsByRequestName.get(name))
 		.filter((entry): entry is [string, ToolFactory] => entry !== undefined)

@@ -2308,6 +2308,129 @@ describe("AskTool deep-interview recorder persistence", () => {
 		expect(warn).toHaveBeenCalledWith(expect.stringContaining("deep-interview round recording failed"));
 	});
 
+	it("does not synthesize or record intent authorization on ask timeout", async () => {
+		const recorder = spyOn(deepInterviewRecorder, "appendOrMergeDeepInterviewRound").mockResolvedValue({
+			action: "created",
+			record: {} as AppendOrMergeResult["record"],
+		});
+		const tool = new AskTool(
+			createSession({ settings: Settings.isolated({ "ask.timeout": 0.001 }), getSessionId: () => "session-ask" }),
+		);
+		const context = createContext({
+			select: async (_prompt, _options, dialogOptions) => {
+				const timeout = dialogOptions?.timeout ?? 1;
+				await Bun.sleep(timeout + 5);
+				dialogOptions?.onTimeout?.();
+				return _options[0];
+			},
+		});
+		const contractQuestion = {
+			id: "intent-contract-timeout",
+			question: "Confirm locked intent",
+			options: [{ label: "Looks right" }, { label: "Revise" }],
+			deepInterview: {
+				round: 0,
+				component: "review-topology",
+				dimension: "topology",
+				ambiguity: 1,
+				intent_contract: {
+					items: [{ id: "artifact:report", category: "artifact" as const, statement: "Produce report" }],
+					confirmation_options: ["Looks right"],
+				},
+			},
+		};
+		const contractResult = await tool.execute(
+			"intent-contract-timeout",
+			{ questions: [contractQuestion] },
+			undefined,
+			undefined,
+			context,
+		);
+		expect(contractResult.details?.selectedOptions).toEqual([]);
+		const reviewQuestion = {
+			id: "intent-review-timeout",
+			question: "Approve reduction",
+			options: [{ label: "Approve reduction" }, { label: "Revise" }],
+			deepInterview: {
+				round: 2,
+				component: "locked-intent",
+				dimension: "constraints",
+				ambiguity: 0.2,
+				intent_review: {
+					observed_items: [{ id: "artifact:report", category: "artifact" as const, statement: "Produce report" }],
+					supporting_substitutions: [
+						{
+							removed_id: "surface:review",
+							replacement_ids: ["artifact:report"],
+							rationale: "Report replacement",
+						},
+					],
+					approval_options: ["Approve reduction"],
+				},
+			},
+		};
+		const reviewResult = await tool.execute(
+			"intent-review-timeout",
+			{ questions: [reviewQuestion] },
+			undefined,
+			undefined,
+			context,
+		);
+		expect(reviewResult.details?.selectedOptions).toEqual([]);
+		expect(recorder).not.toHaveBeenCalled();
+	});
+
+	it("discards focused intent choices before multi-question timeout navigation", async () => {
+		const recorder = spyOn(deepInterviewRecorder, "appendOrMergeDeepInterviewRound").mockResolvedValue({
+			action: "created",
+			record: {} as AppendOrMergeResult["record"],
+		});
+		const tool = new AskTool(
+			createSession({ settings: Settings.isolated({ "ask.timeout": 0.001 }), getSessionId: () => "session-ask" }),
+		);
+		let visits = 0;
+		const context = createContext({
+			select: async (_prompt, options, dialogOptions) => {
+				visits += 1;
+				if (visits === 1) {
+					const timeout = dialogOptions?.timeout ?? 1;
+					await Bun.sleep(timeout + 5);
+					dialogOptions?.onTimeout?.();
+				}
+				return options[0];
+			},
+		});
+		const result = await tool.execute(
+			"intent-multi-timeout",
+			{
+				questions: [
+					{
+						id: "intent-contract-timeout",
+						question: "Confirm locked intent",
+						options: [{ label: "Looks right" }, { label: "Revise" }],
+						deepInterview: {
+							round: 0,
+							component: "review-topology",
+							dimension: "topology",
+							ambiguity: 1,
+							intent_contract: {
+								items: [{ id: "artifact:report", category: "artifact", statement: "Produce report" }],
+								confirmation_options: ["Looks right"],
+							},
+						},
+					},
+					{ id: "ordinary", question: "Continue?", options: [{ label: "Yes" }, { label: "No" }] },
+				],
+			},
+			undefined,
+			undefined,
+			context,
+		);
+		expect(result.details?.results?.[0]?.selectedOptions).toEqual([]);
+		expect(result.details?.results?.[1]?.selectedOptions).toEqual(["Yes"]);
+		expect(recorder).not.toHaveBeenCalled();
+	});
+
 	it("times out a never-resolving recorder promise within the bounded await", async () => {
 		const warn = spyOn(logger, "warn").mockImplementation(() => {});
 		spyOn(deepInterviewRecorder, "appendOrMergeDeepInterviewRound").mockImplementation(
@@ -2448,6 +2571,30 @@ describe("AskTool deep-interview recorder persistence", () => {
 		expect(ralplanGateEmitter.emitGate).toHaveBeenCalledWith(
 			expect.objectContaining({ stage: "ralplan", kind: "approval" }),
 		);
+	});
+
+	it("prefers the local interactive UI over the workflow gate when a UI context is present", async () => {
+		// Regression: a durable workflow-gate emitter now exists for every session and
+		// its isUnattended() is always true. Attended TUI asks must still use the local
+		// selector instead of stranding on emitGate() waiting for a remote responder.
+		const gateEmitter = {
+			isUnattended: () => true,
+			emitGate: vi.fn(async () => ({ selected: ["no"] })),
+		};
+		const select = vi.fn(async () => "yes");
+		const context = createContext({ select });
+		const result = await new AskTool(
+			createSession({ getWorkflowGateEmitter: () => gateEmitter } as Partial<ToolSession>),
+		).execute(
+			"call-attended-no-gate",
+			{ questions: [{ id: "confirm", question: "Proceed?", options: [{ label: "yes" }, { label: "no" }] }] },
+			undefined,
+			undefined,
+			context,
+		);
+		expect(gateEmitter.emitGate).not.toHaveBeenCalled();
+		expect(select).toHaveBeenCalledTimes(1);
+		expect(result.details?.selectedOptions).toEqual(["yes"]);
 	});
 
 	it("keeps deepInterview optional and rejects malformed metadata", () => {

@@ -1,7 +1,7 @@
 {
 	"type": "module",
 	"name": "@gajae-code/coding-agent",
-	"version": "0.10.0",
+	"version": "0.11.1",
 	"description": "Gajae Code CLI with read, bash, edit, write tools and session management",
 	"homepage": "https://gajae-code.com",
 	"author": "Yeachan-Heo and Gajae Code Contributors",
@@ -29,10 +29,11 @@
 	},
 	"scripts": {
 		"build": "bun scripts/build-binary.ts",
-		"check": "biome check . && bun run verify:sdk-canonicalization && bun run check:types",
+		"check": "biome check . && bun run generate-hotkeys-docs --check && bun run verify:sdk-canonicalization && bun run check:types",
 		"check:types": "tsc -p tsconfig.json --noEmit",
 		"lint": "biome lint .",
 		"test": "bun test",
+		"generate-hotkeys-docs": "bun scripts/generate-hotkeys-docs.ts",
 		"bench:context": "bun run bench/context-optimization.bench.ts",
 		"generate-schemas": "bun ../../scripts/generate-json-schemas.ts",
 		"check:schemas": "bun ../../scripts/generate-json-schemas.ts --check",
@@ -54,6 +55,7 @@
 		"@gajae-code/stats": "catalog:",
 		"@gajae-code/agent-core": "catalog:",
 		"@gajae-code/ai": "catalog:",
+		"@gajae-code/bridge-client": "catalog:",
 		"@gajae-code/natives": "catalog:",
 		"@gajae-code/tui": "catalog:",
 		"@gajae-code/utils": "catalog:",
@@ -73,6 +75,9 @@
 		"zod": "catalog:"
 	},
 	"devDependencies": {
+		"@babel/traverse": "catalog:",
+		"@babel/types": "catalog:",
+		"@types/babel__traverse": "catalog:",
 		"@types/bun": "catalog:",
 		"@types/ws": "catalog:"
 	},
@@ -116,10 +121,18 @@
 		"./modes/components/runtime-mcp-add-wizard": null,
 		"./modes/controllers/runtime-mcp-command-controller": null,
 		"./slash-commands/helpers/mcp": null,
+		"./session/session-manager-internal": null,
+		"./session/session-manager-internal.js": null,
 		"./sdk": {
 			"types": "./src/sdk/index.ts",
 			"import": "./src/sdk/index.ts"
 		},
+		"./sdk/models": null,
+		"./sdk/models.js": null,
+		"./sdk/lifecycle-session": null,
+		"./sdk/lifecycle-session.js": null,
+		"./sdk/startup-capability": null,
+		"./sdk/startup-capability.js": null,
 		"./sdk/bus": {
 			"types": "./src/sdk/bus/index.ts",
 			"import": "./src/sdk/bus/index.ts"
@@ -128,6 +141,13 @@
 			"types": "./src/sdk/bus/*.ts",
 			"import": "./src/sdk/bus/*.ts"
 		},
+		"./session/internal/*": null,
+		"./config/model-auth": null,
+		"./config/model-auth.js": null,
+		"./config/model-bindings-applier": null,
+		"./config/model-bindings-applier.js": null,
+		"./config/model-discovery-manager": null,
+		"./config/model-discovery-manager.js": null,
 		"./*": {
 			"types": "./src/*.ts",
 			"import": "./src/*.ts"

@@ -32,6 +32,8 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 	"slash_command:notify":
 		"interactive diagnostics command; session on/off delegate to the notifications extension, not an SDK ingress seam",
 	"slash_command:pet": "visual/local-only command, not a user-facing SDK control seam",
+	"slash_command:transcript": "visual/local-only transcript viewer, not a user-facing SDK control seam",
+	"slash_command:sessions": "visual/local-only sessions dashboard, not a user-facing SDK control seam",
 	"agent_session:constructor": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:nextToolChoice": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:setForcedToolChoice": "internal accessor/plumbing, not a user-facing control seam",
@@ -46,6 +48,13 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 	"agent_session:markPlanCompactAbortPending": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:clearPlanCompactAbortPending": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:enqueueCustomMessageDisplay": "internal accessor/plumbing, not a user-facing control seam",
+	"agent_session:runMidRunMaintenanceForTests": "test-only maintenance seam, not a user-facing SDK control seam",
+	"agent_session:estimateMidRunContextTokensForTests": "test-only estimator seam, not a user-facing SDK control seam",
+	"agent_session:activeMidRunBarrierCountForTests": "read-only test seam, not a user-facing SDK control seam",
+	"agent_session:activeMidRunMaintenanceCountForTests": "read-only test seam, not a user-facing SDK control seam",
+	"agent_session:getPendingNextTurnMessagesForTests": "read-only test seam, not a user-facing SDK control seam",
+	"agent_session:setCancelAndSubmitAbortOutcomeProviderForTests":
+		"test-only cancellation seam, not a user-facing SDK control seam",
 	"agent_session:getAgentId": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:emitNotice": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:subscribe": "internal accessor/plumbing, not a user-facing control seam",
@@ -53,6 +62,8 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 	"agent_session:closeWriterStrict": "internal ACP lifecycle teardown plumbing, not a user-facing control seam",
 	"agent_session:disposeChildSubprocesses": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:waitForIdle": "internal accessor/plumbing, not a user-facing control seam",
+	"agent_session:awaitPendingContextTransformations":
+		"internal context-transformation lifecycle barrier, not a user-facing SDK control seam",
 	"agent_session:drainAsyncJobDeliveriesForAcp": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:getAsyncDeliveryStateForAcp":
 		"internal ACP lifecycle quiescence plumbing, not a user-facing control seam",
@@ -62,10 +73,7 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 	"agent_session:hasForegroundBashBackgroundRequestHandler":
 		"internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:requestForegroundBashBackground": "internal accessor/plumbing, not a user-facing control seam",
-	"agent_session:isMCPDiscoveryEnabled": "internal accessor/plumbing, not a user-facing control seam",
-	"agent_session:getDiscoverableMCPSearchIndex": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:getSelectedMCPToolNames": "internal accessor/plumbing, not a user-facing control seam",
-	"agent_session:activateDiscoveredMCPTools": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:isToolDiscoveryEnabled": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:getDiscoverableToolSearchIndex": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:getSelectedDiscoveredToolNames": "internal accessor/plumbing, not a user-facing control seam",
@@ -81,6 +89,7 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 	"agent_session:setPlanModeState": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:getGoalModeState": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:setGoalModeState": "internal accessor/plumbing, not a user-facing control seam",
+	"agent_session:setSdkPlanModeHandler": "internal host lifecycle plumbing for mode.plan.set",
 	"agent_session:getWorkflowGateEmitter": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:getAskAnswerSource": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:setWorkflowGateEmitter": "internal accessor/plumbing, not a user-facing control seam",
@@ -101,6 +110,7 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 	"agent_session:purgeQueuedCustomMessages": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:clearQueue": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:popLastQueuedMessage": "internal accessor/plumbing, not a user-facing control seam",
+	"agent_session:cancelAndSubmit": "interactive queue transaction plumbing, not an independent SDK control seam",
 	"agent_session:applyCompactionPostAppendForTests": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:continuePersistedHistory": "internal startup lifecycle plumbing, not a user-facing control seam",
 	"agent_session:setActiveModelProfile": "internal accessor/plumbing, not a user-facing control seam",
@@ -108,7 +118,21 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 	"agent_session:getSessionDefaultModelSelector": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:recordResumeDefaultModel": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:setModelTemporary": "internal accessor/plumbing, not a user-facing control seam",
+	"agent_session:setModelTemporaryForControl":
+		"internal Telegram control wrapper over the reviewed model.set seam, not an independent public SDK operation",
+	"agent_session:setThinkingLevelForControl":
+		"internal Telegram control wrapper over the reviewed thinking.set seam, not an independent public SDK operation",
+	"agent_session:getThinkingScopeForControl":
+		"internal Telegram control status accessor, not a user-facing SDK operation seam",
+	"agent_session:getThinkingVisibility":
+		"internal extension and Telegram display accessor, not a user-facing SDK operation seam",
+	"agent_session:setThinkingVisibility": "internal extension display mutation without a public SDK registry operation",
+	"agent_session:setThinkingVisibilityForControl":
+		"internal Telegram control wrapper over display state, not an independent public SDK operation",
+	"agent_session:fetchUsageReportsForControl":
+		"internal Telegram control wrapper over the reviewed usage.get seam, not an independent public SDK operation",
 	"agent_session:cycleRoleModels": "internal accessor/plumbing, not a user-facing control seam",
+	"agent_session:getRoleModelCycleCandidateCount": "internal role-model display accessor, not a user-facing SDK seam",
 	"agent_session:isFastModeEnabled": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:isFastForProvider": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:isFastForSubagentProvider": "internal accessor/plumbing, not a user-facing control seam",
@@ -140,6 +164,20 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 	"agent_session:hasExtensionHandlers": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:registerBeforeAgentStartContributor": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:setSdkPermissionProvider": "internal reverse-provider plumbing, not a user-facing SDK control seam",
+	"agent_session:beginTemporaryProviderSessionScope":
+		"internal temporary model/provider restoration scope, not a user-facing SDK control seam",
+	"agent_session:restoreTemporaryProviderSessionScope":
+		"internal temporary model/provider restoration scope, not a user-facing SDK control seam",
+	"agent_session:commitTemporaryProviderSessionScope":
+		"internal temporary model/provider restoration scope, not a user-facing SDK control seam",
+	"agent_session:getConfiguredModelChain":
+		"internal profile and fallback-chain state, not a user-facing SDK control seam",
+	"agent_session:setConfiguredModelChain":
+		"internal profile and fallback-chain state, not a user-facing SDK control seam",
+	"agent_session:setDefaultFallbackRuntimeModel":
+		"internal fallback runtime bookkeeping, not a user-facing SDK control seam",
+	"agent_session:seedDefaultFallbackResolution":
+		"internal fallback resolution bookkeeping, not a user-facing SDK control seam",
 };
 /** Maps reviewed source seams to registry SDK operation IDs. */
 const SEAM_TO_SDK: Readonly<Record<string, string>> = {
@@ -190,7 +228,6 @@ const SEAM_TO_SDK: Readonly<Record<string, string>> = {
 	"agent_session:setTodoPhases": "todo.replace",
 	"agent_session:getQueuedMessageEntries": "queue.messages.list",
 	"agent_session:getAllToolNames": "tools.list",
-	"agent_session:getDiscoverableMCPTools": "tools.list",
 	"agent_session:getDiscoverableTools": "tools.list",
 	"agent_session:sendUserMessage": "turn.steer",
 	"agent_session:reload": "runtime.reload",
@@ -239,16 +276,29 @@ export interface SourceSeam {
 	sourceFile: string;
 	sourceKind: SourceKind;
 }
-interface InventoryRecord {
+interface IncludedInventoryRecord {
 	sourceId: string;
 	sourceFile: string;
 	sourceKind: SourceKind;
-	decision: "include" | "exclude";
-	rationale?: string;
-	sdkId?: string;
+	decision: "include";
+	sdkId: string;
 	adapterMappings: Operation["adapterDispositions"];
 	testIds: string[];
 }
+
+interface ExcludedInventoryRecord {
+	sourceId: string;
+	sourceFile: string;
+	sourceKind: SourceKind;
+	decision: "exclude";
+	rationale: string;
+	exclusionMetadata: {
+		adapterMappings: "not_applicable";
+		testIds: "not_applicable";
+	};
+}
+
+type InventoryRecord = IncludedInventoryRecord | ExcludedInventoryRecord;
 
 function repoPath(file: string): string {
 	return path.relative(repoRoot, file).split(path.sep).join("/");
@@ -260,7 +310,10 @@ function collectCaseSeams(source: string, prefix: string): string[] {
 }
 
 export function scanSlashCommands(sourceText: string): string[] {
-	const builtinRegistry = sourceText.slice(sourceText.indexOf("const BUILTIN_SLASH_COMMAND_REGISTRY"));
+	const anchor = "const BUILTIN_SLASH_COMMAND_REGISTRY";
+	const anchorIndex = sourceText.indexOf(anchor);
+	if (anchorIndex === -1) throw new Error(`SDK operation inventory scanner: required anchor ${anchor} was not found.`);
+	const builtinRegistry = sourceText.slice(anchorIndex);
 	return [...builtinRegistry.matchAll(/^\t\tname:\s*["']([^"']+)["']/gm)].map(match => `slash_command:${match[1]}`);
 }
 
@@ -573,6 +626,22 @@ function nextMemberStart(tokens: readonly Token[], start: number, classEnd: numb
 
 type MethodDeclaration = { end: number; name?: string };
 
+type ParsedMemberName = { computed: boolean; end: number; name?: string };
+
+function parseMemberName(tokens: readonly Token[], start: number): ParsedMemberName | undefined {
+	const direct = tokens[start];
+	if (isMemberName(direct)) return { computed: false, end: start + 1, name: memberName(direct!) };
+	if (direct?.text !== "[" || tokens[start + 2]?.text !== "]") return undefined;
+	const computed = tokens[start + 1];
+	if (computed?.kind === "string" || computed?.kind === "number") {
+		return { computed: true, end: start + 3, name: memberName(computed) };
+	}
+	if (computed?.kind === "template" && !computed.hasSubstitution) {
+		return { computed: true, end: start + 3, name: computed.value };
+	}
+	return undefined;
+}
+
 function scanMethodDeclaration(
 	tokens: readonly Token[],
 	start: number,
@@ -583,20 +652,29 @@ function scanMethodDeclaration(
 	if (tokens[index]?.text === "async" && tokens[index + 1]?.text !== "(") index++;
 	if (tokens[index]?.text === "*") index++;
 	const candidate = tokens[index];
-	if (!isMemberName(candidate)) return undefined;
-
-	const afterName = skipTypeParameters(tokens, index + 1);
-	if ((candidate!.text === "get" || candidate!.text === "set") && isMemberName(tokens[afterName])) {
-		const accessorEnd = skipTypeParameters(tokens, afterName + 1);
-		if (tokens[accessorEnd]?.text === "(") {
-			const close = matchingToken(tokens, accessorEnd, "(", ")");
-			if (close !== undefined) return { end: memberEnd(tokens, close + 1, classEnd) };
-		}
+	if (candidate?.text === "get" || candidate?.text === "set") {
+		const accessor = parseMemberName(tokens, index + 1);
+		if (!accessor) return undefined;
+		const accessorEnd = skipTypeParameters(tokens, accessor.end);
+		if (tokens[accessorEnd]?.text !== "(") return undefined;
+		const close = matchingToken(tokens, accessorEnd, "(", ")");
+		if (close === undefined) return undefined;
+		return {
+			end: memberEnd(tokens, close + 1, classEnd),
+			name: accessor.name?.endsWith("ForTests") ? accessor.name : undefined,
+		};
 	}
+
+	const method = parseMemberName(tokens, index);
+	if (!method) return undefined;
+	const afterName = skipTypeParameters(tokens, method.end);
 	if (tokens[afterName]?.text !== "(") return undefined;
 	const close = matchingToken(tokens, afterName, "(", ")");
 	if (close === undefined) return undefined;
-	return { end: memberEnd(tokens, close + 1, classEnd), name: memberName(candidate!) };
+	return {
+		end: memberEnd(tokens, close + 1, classEnd),
+		name: method.computed && !method.name?.endsWith("ForTests") ? undefined : method.name,
+	};
 }
 
 export function scanAgentSessionMethods(sourceText: string): string[] {
@@ -608,14 +686,17 @@ export function scanAgentSessionMethods(sourceText: string): string[] {
 		for (let bodyIndex = index + 2; bodyIndex < tokens.length; bodyIndex++) {
 			if (tokens[bodyIndex]!.text === "<") angleDepth++;
 			else if (tokens[bodyIndex]!.text === ">" && angleDepth > 0) angleDepth--;
+			else if (tokens[bodyIndex]!.text === ";" && angleDepth === 0) break;
 			else if (tokens[bodyIndex]!.text === "{" && angleDepth === 0) {
 				bodyStart = bodyIndex;
 				break;
 			}
 		}
-		if (bodyStart === undefined) return [];
+		if (bodyStart === undefined)
+			throw new Error("SDK operation inventory scanner: AgentSession class is missing its opening body delimiter.");
 		const bodyEnd = matchingToken(tokens, bodyStart, "{", "}");
-		if (bodyEnd === undefined) return [];
+		if (bodyEnd === undefined)
+			throw new Error("SDK operation inventory scanner: AgentSession class body is unbalanced.");
 
 		const methods: string[] = [];
 		for (let memberStart = bodyStart + 1; memberStart < bodyEnd; ) {
@@ -629,7 +710,7 @@ export function scanAgentSessionMethods(sourceText: string): string[] {
 		}
 		return methods;
 	}
-	return [];
+	throw new Error("SDK operation inventory scanner: required AgentSession class declaration was not found.");
 }
 
 export function scanAcpMethods(sourceText: string): string[] {
@@ -720,14 +801,24 @@ function generatedRecords(seams: Awaited<ReturnType<typeof scanSeams>>): Invento
 		const sdkId = SEAM_TO_SDK[seam.sourceId];
 		const rationale = lockedExclusion(seam.sourceId);
 		if (!sdkId && !rationale) continue;
-		const operation = sdkId ? OPERATIONS.find(candidate => candidate.sdkId === sdkId) : undefined;
-		if (sdkId && !operation) throw new Error(`SEAM_TO_SDK maps ${seam.sourceId} to unknown SDK ID: ${sdkId}`);
+		if (!sdkId) {
+			if (!rationale) continue;
+			records.push({
+				...seam,
+				decision: "exclude",
+				rationale,
+				exclusionMetadata: { adapterMappings: "not_applicable", testIds: "not_applicable" },
+			});
+			continue;
+		}
+		const operation = OPERATIONS.find(candidate => candidate.sdkId === sdkId);
+		if (!operation) throw new Error(`SEAM_TO_SDK maps ${seam.sourceId} to unknown SDK ID: ${sdkId}`);
 		records.push({
 			...seam,
-			decision: (sdkId ? "include" : "exclude") as "include" | "exclude",
-			...(sdkId ? { sdkId } : { rationale }),
-			adapterMappings: operation?.adapterDispositions ?? OPERATIONS[0]!.adapterDispositions,
-			testIds: operation?.testIds ?? ["packages/coding-agent/test/sdk-operation-inventory.test.ts"],
+			decision: "include",
+			sdkId,
+			adapterMappings: operation.adapterDispositions,
+			testIds: operation.testIds,
 		});
 	}
 	return records;
@@ -748,8 +839,17 @@ function validateRegistry(records: InventoryRecord[]): string[] {
 		if (operation.testIds.length === 0) errors.push(`${operation.id} is missing test IDs.`);
 	}
 	for (const record of records) {
-		if (record.decision === "exclude" && !record.rationale)
-			errors.push(`${record.sourceId} exclusion lacks a locked rationale.`);
+		if (record.decision === "exclude") {
+			if (!record.rationale) errors.push(`${record.sourceId} exclusion lacks a locked rationale.`);
+			if (
+				record.exclusionMetadata.adapterMappings !== "not_applicable" ||
+				record.exclusionMetadata.testIds !== "not_applicable"
+			)
+				errors.push(
+					`${record.sourceId} exclusion metadata must mark adapter mappings and test IDs as not applicable.`,
+				);
+			continue;
+		}
 		if (ADAPTERS.some(adapter => !record.adapterMappings[adapter]))
 			errors.push(`${record.sourceId} is missing adapter mappings.`);
 		if (record.testIds.length === 0) errors.push(`${record.sourceId} is missing test IDs.`);

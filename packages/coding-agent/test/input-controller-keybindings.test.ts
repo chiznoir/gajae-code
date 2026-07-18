@@ -1,11 +1,13 @@
-import { beforeAll, describe, expect, it, vi } from "bun:test";
+import { beforeAll, describe, expect, it, type Mock, vi } from "bun:test";
+
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+
 import { QueuedMessageSelectorComponent } from "../src/modes/components/queued-message-selector";
 import { InputController } from "../src/modes/controllers/input-controller";
 import { initTheme } from "../src/modes/theme/theme";
-import type { CompactionQueuedMessage, InteractiveModeContext } from "../src/modes/types";
+import type { CompactionQueuedMessage, ComposerSubmissionOptions, InteractiveModeContext } from "../src/modes/types";
 import type { QueuedMessageEditEntry } from "../src/session/agent-session";
 
 type FakeEditor = {
@@ -66,12 +68,15 @@ async function createContext(options?: {
 	const onInputCallback = vi.fn();
 	const toggleIrcSidebar = vi.fn();
 	const startPendingSubmission = vi.fn(
-		(input: {
-			text: string;
-			images?: InteractiveModeContext["pendingImages"];
-			customType?: string;
-			display?: boolean;
-		}) => ({
+		(
+			input: {
+				text: string;
+				images?: InteractiveModeContext["pendingImages"];
+				customType?: string;
+				display?: boolean;
+			},
+			_options?: ComposerSubmissionOptions,
+		) => ({
 			...input,
 			cancelled: false,
 			started: true,
@@ -172,6 +177,7 @@ async function createContext(options?: {
 			getQueuedMessageEntries,
 			removeQueuedMessageForEditing,
 			moveQueuedMessageForEditing,
+			getRoleModelCycleCandidateCount: vi.fn(() => 0),
 		} as unknown as InteractiveModeContext["session"],
 		keybindings: {
 			getKeys(action: string) {
@@ -246,6 +252,8 @@ async function createContext(options?: {
 		handleBashCommand,
 		showWarning: vi.fn(),
 		showStatus,
+		showError: vi.fn(),
+
 		hasActiveBtw: vi.fn(() => false),
 	} as unknown as InteractiveModeContext;
 
@@ -283,6 +291,55 @@ beforeAll(() => {
 });
 
 describe("InputController keybinding setup", () => {
+	it("reports model, streaming, and unfinished action availability", async () => {
+		const { InputController, ctx } = await createContext();
+		const session = ctx.session as unknown as {
+			isStreaming: boolean;
+			model: { reasoning?: boolean } | undefined;
+			getRoleModelCycleCandidateCount: Mock<() => number>;
+		};
+		const controller = new InputController(ctx);
+
+		expect(controller.actionRegistry.isAvailable("app.thinking.cycle")).toBe(false);
+		expect(controller.actionRegistry.isAvailable("app.model.cycleForward")).toBe(false);
+		expect(controller.actionRegistry.isAvailable("app.message.queue")).toBe(false);
+		expect(controller.actionRegistry.isAvailable("app.session.togglePath")).toBe(false);
+		expect(controller.actionRegistry.isAvailable("app.transcript.browse")).toBe(false);
+
+		session.model = { reasoning: true };
+		session.getRoleModelCycleCandidateCount.mockReturnValue(2);
+		session.isStreaming = true;
+		await Promise.resolve();
+		expect(controller.actionRegistry.isAvailable("app.thinking.cycle")).toBe(true);
+		expect(controller.actionRegistry.isAvailable("app.model.cycleForward")).toBe(true);
+
+		expect(controller.actionRegistry.isAvailable("app.message.queue")).toBe(true);
+	});
+
+	it("enables model cycling from configured role candidates without a model scope", async () => {
+		const { InputController, ctx } = await createContext();
+		const session = ctx.session as unknown as {
+			scopedModels: unknown[];
+			getRoleModelCycleCandidateCount: Mock<() => number>;
+		};
+		session.scopedModels = [];
+		session.getRoleModelCycleCandidateCount.mockReturnValue(2);
+
+		expect(new InputController(ctx).actionRegistry.isAvailable("app.model.cycleForward")).toBe(true);
+	});
+
+	it("disables model cycling when a model scope has one cycleable candidate", async () => {
+		const { InputController, ctx } = await createContext();
+		const session = ctx.session as unknown as {
+			scopedModels: unknown[];
+			getRoleModelCycleCandidateCount: Mock<() => number>;
+		};
+		session.scopedModels = [{}, {}];
+		session.getRoleModelCycleCandidateCount.mockReturnValue(1);
+
+		expect(new InputController(ctx).actionRegistry.isAvailable("app.model.cycleBackward")).toBe(false);
+	});
+
 	it("registers temporary and persisted model selector actions separately", async () => {
 		const { InputController, ctx, editor, spies } = await createContext();
 		const controller = new InputController(ctx);
@@ -296,7 +353,9 @@ describe("InputController keybinding setup", () => {
 		expect(editor.onSelectModelTemporary).not.toBe(editor.onSelectModel);
 
 		editor.onSelectModelTemporary?.();
+		await Bun.sleep(0);
 		editor.onSelectModel?.();
+		await Bun.sleep(0);
 
 		expect(spies.showModelSelector).toHaveBeenNthCalledWith(1, { temporaryOnly: true });
 		expect(spies.showModelSelector).toHaveBeenNthCalledWith(2);
@@ -437,8 +496,9 @@ describe("InputController keybinding setup", () => {
 
 	it("queues explicit message action during compaction", async () => {
 		const { InputController, ctx, editor, spies } = await createContext();
-		const session = ctx.session as unknown as { isCompacting: boolean };
+		const session = ctx.session as unknown as { isCompacting: boolean; isStreaming: boolean };
 		session.isCompacting = true;
+		session.isStreaming = true;
 		editor.setText("queue while compacting via shortcut");
 		const controller = new InputController(ctx);
 
@@ -650,10 +710,11 @@ describe("InputController keybinding setup", () => {
 
 		await editor.onSubmit?.("send text after deleting the pasted image");
 
-		expect(spies.startPendingSubmission).toHaveBeenCalledWith({
+		expect(spies.startPendingSubmission.mock.calls[0]?.[0]).toEqual({
 			text: "send text after deleting the pasted image",
 			images: undefined,
 		});
+		expect(spies.startPendingSubmission.mock.calls[0]?.[1]).toEqual({ ownsComposer: true, editor: ctx.editor });
 		expect(spies.onInputCallback).toHaveBeenCalledWith({
 			text: "send text after deleting the pasted image",
 			images: undefined,
@@ -681,10 +742,11 @@ describe("InputController keybinding setup", () => {
 
 		await editor.onSubmit?.("describe only [image 2]");
 
-		expect(spies.startPendingSubmission).toHaveBeenCalledWith({
+		expect(spies.startPendingSubmission.mock.calls[0]?.[0]).toEqual({
 			text: "describe only [image 2]",
 			images: [secondImage],
 		});
+		expect(spies.startPendingSubmission.mock.calls[0]?.[1]).toEqual({ ownsComposer: true, editor: ctx.editor });
 		expect(spies.onInputCallback).toHaveBeenCalledWith({
 			text: "describe only [image 2]",
 			images: [secondImage],
@@ -710,10 +772,11 @@ describe("InputController keybinding setup", () => {
 		editor.onChange?.("");
 		await editor.onSubmit?.("describe [image 1]");
 
-		expect(spies.startPendingSubmission).toHaveBeenCalledWith({
+		expect(spies.startPendingSubmission.mock.calls[0]?.[0]).toEqual({
 			text: "describe [image 1]",
 			images: [image],
 		});
+		expect(spies.startPendingSubmission.mock.calls[0]?.[1]).toEqual({ ownsComposer: true, editor: ctx.editor });
 		expect(spies.onInputCallback).toHaveBeenCalledWith({
 			text: "describe [image 1]",
 			images: [image],
@@ -762,17 +825,19 @@ describe("InputController keybinding setup", () => {
 
 		extension.resolve();
 		await firstSubmit;
-		expect(spies.startPendingSubmission).toHaveBeenNthCalledWith(1, {
+		expect(spies.startPendingSubmission.mock.calls[0]?.[0]).toEqual({
 			text: "describe [image 1]",
 			images: [firstImage],
 		});
+		expect(spies.startPendingSubmission.mock.calls[0]?.[1]).toEqual({ ownsComposer: true, editor: ctx.editor });
 		expect(ctx.pendingImages).toEqual([firstImage, secondImage]);
 
 		await editor.onSubmit?.("follow up [image 2]");
-		expect(spies.startPendingSubmission).toHaveBeenNthCalledWith(2, {
+		expect(spies.startPendingSubmission.mock.calls[1]?.[0]).toEqual({
 			text: "follow up [image 2]",
 			images: [secondImage],
 		});
+		expect(spies.startPendingSubmission.mock.calls[1]?.[1]).toEqual({ ownsComposer: true, editor: ctx.editor });
 		expect(ctx.pendingImages).toEqual([]);
 	});
 

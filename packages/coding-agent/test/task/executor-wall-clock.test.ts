@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
-import type { ModelRegistry } from "../../src/config/model-registry";
+import { kNoAuth, type ModelRegistry } from "../../src/config/model-registry";
 import { Settings } from "../../src/config/settings";
 import type { LoadExtensionsResult } from "../../src/extensibility/extensions/types";
 import type { CreateAgentSessionResult } from "../../src/sdk";
@@ -24,11 +24,13 @@ import { EventBus } from "../../src/utils/event-bus";
 interface HangingSessionHandle {
 	session: AgentSession;
 	abortCalls: () => number;
+	promptStarted: Promise<void>;
 }
 
 function createHangingSession(): HangingSessionHandle {
 	let abortCount = 0;
 	const { promise: hang, resolve: releaseHang } = Promise.withResolvers<void>();
+	const { promise: promptStarted, resolve: markPromptStarted } = Promise.withResolvers<void>();
 	const session: Partial<AgentSession> = {
 		state: { messages: [] } as never,
 		agent: { state: { systemPrompt: ["test"] } } as never,
@@ -38,8 +40,12 @@ function createHangingSession(): HangingSessionHandle {
 		} as never,
 		getActiveToolNames: () => ["read", "yield"],
 		setActiveToolsByName: async (_names: string[]) => {},
+		setConfiguredModelChain: () => {},
+		getConfiguredModelChain: () => undefined,
+		seedDefaultFallbackResolution: () => {},
 		subscribe: (_listener: (event: AgentSessionEvent) => void) => () => {},
 		prompt: async (_text: string, _options?: PromptOptions) => {
+			markPromptStarted();
 			await hang;
 		},
 		waitForIdle: async () => {
@@ -55,6 +61,7 @@ function createHangingSession(): HangingSessionHandle {
 	return {
 		session: session as AgentSession,
 		abortCalls: () => abortCount,
+		promptStarted,
 	};
 }
 
@@ -75,6 +82,9 @@ function createUsageSession(usages: unknown | readonly unknown[]): AgentSession 
 		sessionManager: { appendSessionInit: () => {} } as never,
 		getActiveToolNames: () => ["read", "yield"],
 		setActiveToolsByName: async () => {},
+		setConfiguredModelChain: () => {},
+		getConfiguredModelChain: () => undefined,
+		seedDefaultFallbackResolution: () => {},
 		subscribe: (listener: (event: AgentSessionEvent) => void) => {
 			queueMicrotask(() => {
 				for (const usage of Array.isArray(usages) ? usages : [usages]) {
@@ -140,6 +150,7 @@ const invalidRawCostCases: ReadonlyArray<{
 
 describe("runSubprocess wall clock (task.maxRuntimeMs)", () => {
 	afterEach(() => {
+		vi.useRealTimers();
 		vi.restoreAllMocks();
 	});
 
@@ -156,21 +167,29 @@ describe("runSubprocess wall clock (task.maxRuntimeMs)", () => {
 		task: "do work",
 		index: 0,
 		id: "subagent-walltime",
-		modelRegistry: { refresh: async () => {} } as unknown as ModelRegistry,
+		modelRegistry: {
+			refresh: async () => {},
+			getAvailable: () => [],
+			getApiKey: async () => kNoAuth,
+		} as unknown as ModelRegistry,
 		enableLsp: false,
 	};
 
 	it("aborts a stalled subagent and surfaces a runtime-limit reason", async () => {
+		vi.useFakeTimers();
 		const settings = Settings.isolated({ "task.maxRuntimeMs": 50 });
 		const handle = createHangingSession();
 		mockCreateAgentSession(handle.session);
 
 		const startedAt = Date.now();
-		const result = await runSubprocess({
+		const pending = runSubprocess({
 			...baseOptions,
 			id: "subagent-timeout",
 			settings,
 		});
+		await handle.promptStarted;
+		vi.advanceTimersByTime(50);
+		const result = await pending;
 		const elapsedMs = Date.now() - startedAt;
 
 		expect(result.aborted).toBe(true);
@@ -194,6 +213,9 @@ describe("runSubprocess wall clock (task.maxRuntimeMs)", () => {
 			sessionManager: { appendSessionInit: () => {} } as never,
 			getActiveToolNames: () => ["read", "yield"],
 			setActiveToolsByName: async () => {},
+			setConfiguredModelChain: () => {},
+			getConfiguredModelChain: () => undefined,
+			seedDefaultFallbackResolution: () => {},
 			subscribe: (listener: (event: AgentSessionEvent) => void) => {
 				// Fire a synthetic yield on the next tick to drive runSubprocess to
 				// completion without depending on the real agent loop.
@@ -283,6 +305,9 @@ describe("runSubprocess wall clock (task.maxRuntimeMs)", () => {
 			sessionManager: { appendSessionInit: () => {} } as never,
 			getActiveToolNames: () => ["read", "yield"],
 			setActiveToolsByName: async () => {},
+			setConfiguredModelChain: () => {},
+			getConfiguredModelChain: () => undefined,
+			seedDefaultFallbackResolution: () => {},
 			subscribe: (listener: (event: AgentSessionEvent) => void) => {
 				listenerRef = listener;
 				return () => {};
@@ -342,6 +367,9 @@ describe("runSubprocess wall clock (task.maxRuntimeMs)", () => {
 			sessionManager: { appendSessionInit: () => {} } as never,
 			getActiveToolNames: () => ["read", "yield"],
 			setActiveToolsByName: async () => {},
+			setConfiguredModelChain: () => {},
+			getConfiguredModelChain: () => undefined,
+			seedDefaultFallbackResolution: () => {},
 			subscribe: (listener: (event: AgentSessionEvent) => void) => {
 				queueMicrotask(() => {
 					listener({

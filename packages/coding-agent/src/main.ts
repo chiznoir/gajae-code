@@ -26,9 +26,10 @@ import { buildInitialMessage } from "./cli/initial-message";
 import { runListModelsCommand } from "./cli/list-models";
 import { selectSession } from "./cli/session-picker";
 import { findConfigFile } from "./config";
-import { activateModelProfile } from "./config/model-profile-activation";
+import { activateModelProfile, ModelProfileCredentialError } from "./config/model-profile-activation";
 import { ModelRegistry, ModelsConfigFile } from "./config/model-registry";
 import { resolveCliModel, resolveModelRoleValue, resolveModelScope, type ScopedModel } from "./config/model-resolver";
+import { selectorHead } from "./config/model-selector-value";
 import { getDefault, type SettingPath, Settings, settings } from "./config/settings";
 import { BUNDLED_GROK_BUILD_EXTENSION_ID, getBundledGrokBuildExtensionFactory } from "./defaults/gjc-grok-cli";
 import { initializeWithSettings } from "./discovery";
@@ -56,6 +57,7 @@ import type { AgentSession } from "./session/agent-session";
 import {
 	type ResumeSessionIdentity,
 	resolveResumableSession,
+	type SessionDirectoryMigrationPolicy,
 	type SessionInfo,
 	SessionManager,
 	type StrictSessionOpenResult,
@@ -192,6 +194,7 @@ export function resolveAcpStartupOptions(
 		| "hooks"
 		| "messages"
 		| "mpreset"
+		| "mcpConfig"
 		| "model"
 		| "models"
 		| "noLsp"
@@ -233,6 +236,7 @@ export function resolveAcpStartupOptions(
 		...(parsed.hooks?.length ? ["--hook"] : []),
 		...(parsed.messages.length > 0 ? ["initial prompt"] : []),
 		...(parsed.models?.length ? ["--models"] : []),
+		...(parsed.mcpConfig !== undefined ? ["--mcp-config"] : []),
 		...(parsed.noLsp ? ["--no-lsp"] : []),
 		...(parsed.noPty ? ["--no-pty"] : []),
 		...(parsed.noRules ? ["--no-rules"] : []),
@@ -365,23 +369,36 @@ type CreateSessionForMain = (
 	context?: { skipPostCreateModelRefresh?: boolean },
 ) => Promise<CreateAgentSessionResult>;
 
-export async function applyStartupModelProfiles(args: {
+type StartupModelProfileArgs = {
 	session: AgentSession;
 	settings: Settings;
 	modelRegistry: ModelRegistry;
 	parsedArgs: Pick<Args, "default" | "model" | "mpreset" | "thinking">;
 	startupModel?: CreateAgentSessionOptions["model"];
 	startupThinkingLevel?: CreateAgentSessionOptions["thinkingLevel"];
-}): Promise<void> {
+};
+
+async function applyStartupModelProfilesWithPolicy(
+	args: StartupModelProfileArgs,
+	onCredentialError?: (error: ModelProfileCredentialError) => void,
+): Promise<void> {
 	const applyProfile = async (
 		profileName: string,
 		persistDefault: boolean,
 		options: { thinkingLevelOverride?: CreateAgentSessionOptions["thinkingLevel"] } = {},
 	): Promise<void> => {
-		await activateModelProfile(
-			{ session: args.session, modelRegistry: args.modelRegistry, settings: args.settings, profileName },
-			{ persistDefault, thinkingLevelOverride: options.thinkingLevelOverride },
-		);
+		try {
+			await activateModelProfile(
+				{ session: args.session, modelRegistry: args.modelRegistry, settings: args.settings, profileName },
+				{ persistDefault, thinkingLevelOverride: options.thinkingLevelOverride },
+			);
+		} catch (error) {
+			if (onCredentialError && error instanceof ModelProfileCredentialError) {
+				onCredentialError(error);
+				return;
+			}
+			throw error;
+		}
 	};
 
 	// Capture the explicitly-selected startup model BEFORE profile activation can
@@ -404,24 +421,76 @@ export async function applyStartupModelProfiles(args: {
 		await applyProfile(args.parsedArgs.mpreset, args.parsedArgs.default === true);
 	}
 
-	// Explicit CLI --model/--thinking must win over any activated profile.
+	// Explicit CLI --model/--thinking must win over any activated or skipped profile.
 	if (explicitModel) {
-		await args.session.setModelTemporary(explicitModel, args.startupThinkingLevel ?? args.parsedArgs.thinking);
+		await args.session.setModelTemporary(explicitModel, args.startupThinkingLevel ?? args.parsedArgs.thinking, {
+			persistAsSessionDefault: true,
+			cause: "startup-override",
+		});
+		const selector = `${explicitModel.provider}/${explicitModel.id}`;
+		args.session.setConfiguredModelChain("default", [selector], "startup-override", undefined, true);
+		args.session.seedDefaultFallbackResolution(0, []);
 	} else if (args.parsedArgs.thinking && args.session.model) {
-		await args.session.setModelTemporary(args.session.model, args.parsedArgs.thinking);
+		await args.session.setModelTemporary(args.session.model, args.parsedArgs.thinking, { cause: "startup-override" });
 	}
 }
 
-export async function applyStartupModelProfilesOrExit(
-	args: Parameters<typeof applyStartupModelProfiles>[0],
-): Promise<void> {
+export async function applyStartupModelProfiles(args: StartupModelProfileArgs): Promise<void> {
+	await applyStartupModelProfilesWithPolicy(args);
+}
+
+async function exitForStartupModelProfileError(args: StartupModelProfileArgs, error: unknown): Promise<never> {
+	const message = error instanceof Error ? error.message : String(error);
+	process.stderr.write(`${chalk.red(`Error: ${message}`)}\n`);
+	await args.session.dispose();
+	process.exit(1);
+}
+
+export async function applyStartupModelProfilesOrExit(args: StartupModelProfileArgs): Promise<void> {
 	try {
 		await applyStartupModelProfiles(args);
 	} catch (error) {
-		const message = error instanceof Error ? error.message : String(error);
-		process.stderr.write(`${chalk.red(`Error: ${message}`)}\n`);
-		process.exit(1);
+		await exitForStartupModelProfileError(args, error);
 	}
+}
+
+export function isStartupModelProfileCredentialRecoveryEligible(options: {
+	isInteractive: boolean;
+	hasInteractiveTerminal: boolean;
+	initialMessage: string | undefined;
+	initialMessages: readonly string[];
+	resumeAction: "continue-tail" | "open-idle" | undefined;
+}): boolean {
+	return (
+		options.isInteractive &&
+		options.hasInteractiveTerminal &&
+		options.initialMessage === undefined &&
+		options.initialMessages.length === 0 &&
+		options.resumeAction !== "continue-tail"
+	);
+}
+
+export async function applyStartupModelProfilesForRoot(
+	args: StartupModelProfileArgs & {
+		isInteractive: boolean;
+		hasInteractiveTerminal: boolean;
+		initialMessage: string | undefined;
+		initialMessages: readonly string[];
+		resumeAction: "continue-tail" | "open-idle" | undefined;
+	},
+): Promise<{ recoverableErrors: string[] }> {
+	if (!isStartupModelProfileCredentialRecoveryEligible(args)) {
+		await applyStartupModelProfilesOrExit(args);
+		return { recoverableErrors: [] };
+	}
+
+	const recoverableErrors: string[] = [];
+	try {
+		await applyStartupModelProfilesWithPolicy(args, error => recoverableErrors.push(error.message));
+	} catch (error) {
+		await exitForStartupModelProfileError(args, error);
+	}
+	return { recoverableErrors };
 }
 
 interface InteractiveModeFactoryOptions {
@@ -442,6 +511,7 @@ type SelectResumeSession = (sessions: SessionInfo[]) => Promise<SessionSelection
 type OpenExistingSessionStrict = (
 	identity: ResumeSessionIdentity,
 	sessionDir?: string,
+	migrationPolicy?: SessionDirectoryMigrationPolicy,
 ) => Promise<StrictSessionOpenResult>;
 
 export const BARE_RESUME_CONFLICT_ERROR =
@@ -626,6 +696,7 @@ export async function createSessionManager(
 	cwd: string,
 	activeSettings: Settings = settings,
 ): Promise<SessionManager | undefined> {
+	const migrationPolicy = activeSettings.get("session.directoryMigration") === "disabled" ? "disabled" : "copy-retain";
 	if (parsed.resume === true) {
 		return undefined;
 	}
@@ -635,13 +706,13 @@ export async function createSessionManager(
 		}
 		const forkSource = parsed.fork;
 		if (forkSource.includes("/") || forkSource.includes("\\") || forkSource.endsWith(".jsonl")) {
-			return await SessionManager.forkFrom(forkSource, cwd, parsed.sessionDir);
+			return await SessionManager.forkFrom(forkSource, cwd, parsed.sessionDir, undefined, migrationPolicy);
 		}
 		const match = await resolveResumableSession(forkSource, cwd, parsed.sessionDir);
 		if (!match) {
 			throw new Error(`Session "${forkSource}" not found.`);
 		}
-		return await SessionManager.forkFrom(match.session.path, cwd, parsed.sessionDir);
+		return await SessionManager.forkFrom(match.session.path, cwd, parsed.sessionDir, undefined, migrationPolicy);
 	}
 
 	if (parsed.noSession) {
@@ -650,7 +721,7 @@ export async function createSessionManager(
 	if (typeof parsed.resume === "string") {
 		const sessionArg = parsed.resume;
 		if (sessionArg.includes("/") || sessionArg.includes("\\") || sessionArg.endsWith(".jsonl")) {
-			return await SessionManager.open(sessionArg, parsed.sessionDir);
+			return await SessionManager.open(sessionArg, parsed.sessionDir, undefined, migrationPolicy);
 		}
 		const match = await resolveResumableSession(sessionArg, cwd, parsed.sessionDir);
 		if (!match) {
@@ -664,13 +735,19 @@ export async function createSessionManager(
 				if (!shouldFork) {
 					throw new Error(`Session "${sessionArg}" is in another project (${match.session.cwd}).`);
 				}
-				return await SessionManager.forkFrom(match.session.path, cwd, parsed.sessionDir);
+				return await SessionManager.forkFrom(
+					match.session.path,
+					cwd,
+					parsed.sessionDir,
+					undefined,
+					migrationPolicy,
+				);
 			}
 		}
-		return await SessionManager.open(match.session.path, parsed.sessionDir);
+		return await SessionManager.open(match.session.path, parsed.sessionDir, undefined, migrationPolicy);
 	}
 	if (parsed.continue) {
-		return await SessionManager.continueRecent(cwd, parsed.sessionDir);
+		return await SessionManager.continueRecent(cwd, parsed.sessionDir, undefined, migrationPolicy);
 	}
 	// --resume without value is handled separately (needs picker UI)
 	// If --session-dir provided without --continue/--resume, create new session there
@@ -693,7 +770,7 @@ export async function createSessionManager(
 	// buildSessionOptions restores the session's model/thinking instead of
 	// overriding them with CLI defaults.
 	if (activeSettings.get("autoResume")) {
-		const manager = await SessionManager.continueRecent(cwd, parsed.sessionDir);
+		const manager = await SessionManager.continueRecent(cwd, parsed.sessionDir, undefined, migrationPolicy);
 		if (manager.getEntries().length > 0) {
 			parsed.continue = true;
 		}
@@ -776,6 +853,7 @@ async function buildSessionOptions(
 	const options: CreateAgentSessionOptions = {
 		cwd: parsed.cwd ?? getProjectDir(),
 	};
+	if (parsed.mcpConfig !== undefined) options.mcpConfigPath = parsed.mcpConfig;
 
 	const systemPromptSource = parsed.systemPrompt;
 	const resolvedSystemPrompt = await resolvePromptInput(systemPromptSource, "system prompt");
@@ -842,7 +920,9 @@ async function buildSessionOptions(
 							scopedModel.model.provider === rememberedResolvedModel.provider &&
 							scopedModel.model.id === rememberedResolvedModel.id,
 					)
-				: scopedModels.find(scopedModel => scopedModel.model.id.toLowerCase() === remembered.toLowerCase());
+				: scopedModels.find(
+						scopedModel => scopedModel.model.id.toLowerCase() === selectorHead(remembered)?.toLowerCase(),
+					);
 			if (rememberedModel) {
 				options.model = rememberedModel.model;
 				// Apply explicit thinking level from remembered role value
@@ -943,6 +1023,7 @@ export interface RunRootCommandDependencies {
 	selectResumeSession?: SelectResumeSession;
 	openExistingSessionStrict?: OpenExistingSessionStrict;
 	initializeSettings?: typeof Settings.init;
+	loadSettingsForScope?: typeof Settings.loadForScope;
 }
 
 export async function runRootCommand(
@@ -983,15 +1064,25 @@ export async function runRootCommand(
 			process.stdout.write(`${chalk.dim("No sessions found")}\n`);
 			return;
 		}
-		const selection = await (deps.selectResumeSession ?? selectSession)(sessions);
+		const selection = deps.selectResumeSession
+			? await deps.selectResumeSession(sessions)
+			: await selectSession(sessions, parsedArgs.sessionDir);
 		if (selection.kind === "cancelled") {
 			return;
 		}
+		const resumeMigrationPolicy =
+			(await (deps.loadSettingsForScope ?? Settings.loadForScope)({ cwd: resumeCwd })).get(
+				"session.directoryMigration",
+			) === "disabled"
+				? "disabled"
+				: "copy-retain";
 		let opened: StrictSessionOpenResult;
 		try {
 			opened = await (deps.openExistingSessionStrict ?? SessionManager.openExistingStrict)(
 				selection.identity,
 				parsedArgs.sessionDir,
+				undefined,
+				resumeMigrationPolicy,
 			);
 		} catch {
 			process.stderr.write(`${BARE_RESUME_OPEN_ERROR}\n`);
@@ -1030,7 +1121,7 @@ export async function runRootCommand(
 	}
 
 	if (parsedArgs.listModels !== undefined) {
-		await modelRegistry.refresh("online");
+		await modelRegistry.refresh("online-if-uncached");
 		const searchPattern = typeof parsedArgs.listModels === "string" ? parsedArgs.listModels : undefined;
 		await runListModelsCommand({
 			modelRegistry,
@@ -1227,6 +1318,7 @@ export async function runRootCommand(
 	sessionOptions.authStorage = authStorage;
 	sessionOptions.modelRegistry = modelRegistry;
 	sessionOptions.hasUI = isInteractive;
+	sessionOptions.notificationHostModeSupported = isInteractive;
 	sessionOptions.settings = settingsInstance;
 	const hasRootStartupProfile = Boolean(settingsInstance.get("modelProfile.default") || parsedArgs.mpreset);
 
@@ -1286,17 +1378,36 @@ export async function runRootCommand(
 
 		// Research-mode (RLM) preset: hard tool-boundary assertion after the registry is assembled.
 		if (deps.rlmPreset?.onSessionCreated) {
-			await deps.rlmPreset.onSessionCreated(session);
+			try {
+				await deps.rlmPreset.onSessionCreated(session);
+			} catch (error) {
+				try {
+					await session.dispose();
+				} catch {
+					logger.warn("Failed to dispose session after RLM post-create error");
+				}
+				throw error;
+			}
 		}
 
-		await applyStartupModelProfilesOrExit({
-			session,
-			settings: settingsInstance,
-			modelRegistry,
-			parsedArgs,
-			startupModel: sessionOptions.model,
-			startupThinkingLevel: sessionOptions.thinkingLevel,
-		});
+		if (!(parsedArgs.authBootstrap === true && isInteractive)) {
+			const { recoverableErrors } = await applyStartupModelProfilesForRoot({
+				session,
+				settings: settingsInstance,
+				modelRegistry,
+				parsedArgs,
+				startupModel: sessionOptions.model,
+				startupThinkingLevel: sessionOptions.thinkingLevel,
+				isInteractive,
+				hasInteractiveTerminal: hasResumePickerTerminal(),
+				initialMessage,
+				initialMessages: parsedArgs.messages,
+				resumeAction: bareResumeAction,
+			});
+			for (const recoverableError of recoverableErrors) {
+				notifs.push({ kind: "error", message: recoverableError });
+			}
+		}
 
 		if (modelFallbackMessage) {
 			notifs.push({ kind: "warn", message: modelFallbackMessage });
@@ -1326,52 +1437,70 @@ export async function runRootCommand(
 			process.stderr.write(
 				`${chalk.yellow(`\nAdvanced manual config remains available at ${ModelsConfigFile.path()}`)}\n`,
 			);
+			await session.dispose();
+			stopThemeWatcher();
+			await postmortem.quit(1);
 			process.exit(1);
 		}
 
 		if (isInteractive) {
-			startupUpdate.startBeforeInteractiveInitialization();
-			const changelogMarkdown = await logger.time(
-				"main:getChangelogForDisplay",
-				deps.getChangelogForDisplay ?? getChangelogForDisplay,
-				parsedArgs,
-			);
+			let exitForTiming = false;
+			try {
+				startupUpdate.startBeforeInteractiveInitialization();
+				const changelogMarkdown = await logger.time(
+					"main:getChangelogForDisplay",
+					deps.getChangelogForDisplay ?? getChangelogForDisplay,
+					parsedArgs,
+				);
 
-			const scopedModelsForDisplay = sessionOptions.scopedModels ?? scopedModels;
-			if (scopedModelsForDisplay.length > 0) {
-				const modelList = scopedModelsForDisplay
-					.map(scopedModel => {
-						const thinkingStr = !scopedModel.thinkingLevel ? `:${scopedModel.thinkingLevel}` : "";
-						return `${scopedModel.model.id}${thinkingStr}`;
-					})
-					.join(", ");
-				process.stdout.write(`${chalk.dim(`Model scope: ${modelList} ${chalk.gray("(Alt+N to cycle)")}`)}\n`);
-			}
-
-			if ($env.PI_TIMING) {
-				logger.printTimings();
-				if ($env.PI_TIMING === "x") {
-					process.exit(0);
+				const scopedModelsForDisplay = sessionOptions.scopedModels ?? scopedModels;
+				if (scopedModelsForDisplay.length > 0) {
+					const modelList = scopedModelsForDisplay
+						.map(scopedModel => {
+							const thinkingStr = !scopedModel.thinkingLevel ? `:${scopedModel.thinkingLevel}` : "";
+							return `${scopedModel.model.id}${thinkingStr}`;
+						})
+						.join(", ");
+					process.stdout.write(`${chalk.dim(`Model scope: ${modelList} ${chalk.gray("(Alt+N to cycle)")}`)}\n`);
 				}
+
+				if ($env.PI_TIMING) {
+					logger.printTimings();
+					exitForTiming = $env.PI_TIMING === "x";
+				}
+
+				if (!exitForTiming) {
+					logger.endTiming();
+					await runInteractiveMode(
+						session,
+						VERSION,
+						changelogMarkdown,
+						notifs,
+						startupUpdate,
+						parsedArgs.messages,
+						setToolUIContext,
+						lspServers,
+						mcpManager,
+						eventBus,
+						initialMessage,
+						initialImages,
+						deps.createInteractiveMode,
+						bareResumeAction,
+					);
+				}
+			} catch (error) {
+				try {
+					await session.dispose();
+				} catch {
+					logger.warn("Failed to dispose session after interactive error");
+				}
+				throw error;
 			}
 
-			logger.endTiming();
-			await runInteractiveMode(
-				session,
-				VERSION,
-				changelogMarkdown,
-				notifs,
-				startupUpdate,
-				parsedArgs.messages,
-				setToolUIContext,
-				lspServers,
-				mcpManager,
-				eventBus,
-				initialMessage,
-				initialImages,
-				deps.createInteractiveMode,
-				bareResumeAction,
-			);
+			if (exitForTiming) {
+				await session.dispose();
+				process.exit(0);
+			}
 		} else {
 			const runPrint = deps.runPrintMode ?? (await import("./modes/print-mode")).runPrintMode;
 			await runPrint(session, {

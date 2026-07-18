@@ -86,7 +86,10 @@ export function classifyCgroup(input: { platform: NodeJS.Platform; cgroupText?: 
 			diagnostic: "service_cgroup_inheritance",
 		};
 	const scope = paths.find(value => /(?:^|\/)(?:user|session|app|init|gjc)[^/]*\.scope(?:\/|$)/.test(value));
-	if (scope) return { classification: "safe", scope };
+	const vteScope = paths.find(value =>
+		/^\/user\.slice\/user-(\d+)\.slice\/user@\1\.service(?:\/[^/]+)*\/vte-spawn-[A-Za-z0-9_.-]+\.scope$/.test(value),
+	);
+	if (scope || vteScope) return { classification: "safe", scope: scope ?? vteScope };
 	if (paths.every(value => value === "/")) return { classification: "safe", scope: "/" };
 	return {
 		classification: "unverifiable",
@@ -309,7 +312,7 @@ function validArgv(argv: unknown): argv is string[] {
 	);
 }
 
-function isSafeServerProof(
+export function isSafeServerProof(
 	server: TmuxServerProof,
 	platform: NodeJS.Platform = "linux",
 ): server is TmuxServerProof & {
@@ -326,6 +329,17 @@ function isSafeServerProof(
 		nonEmpty(server.startTime) &&
 		(server.cgroup?.classification === "safe" ||
 			(platform !== "linux" && server.cgroup?.classification === "not_applicable"))
+	);
+}
+
+/** Compares the stable identity fields of independently observed tmux servers. */
+export function sameServerIdentity(left: TmuxServerProof, right: TmuxServerProof): boolean {
+	return (
+		left.pid === right.pid &&
+		left.startTime === right.startTime &&
+		left.cgroup?.classification === right.cgroup?.classification &&
+		left.cgroup?.scope === right.cgroup?.scope &&
+		left.cgroup?.diagnostic === right.cgroup?.diagnostic
 	);
 }
 /**

@@ -1,7 +1,7 @@
-import { Container, PET_SKIN_IDS, PET_SKINS, type SelectItem, SelectList } from "@gajae-code/tui";
-import { getSelectListTheme } from "../theme/theme";
-import { DynamicBorder } from "./dynamic-border";
+import { Container, PET_SKIN_IDS, PET_SKINS, type SelectList } from "@gajae-code/tui";
+import { FramedSelect } from "./chrome";
 import type { PetMode } from "./gajae-pet-widget";
+import { createPetSelectItems } from "./pet-capability";
 
 const PET_OPTIONS: { value: PetMode; label: string; description: string }[] = [
 	{ value: "off", label: "Off", description: "No pet" },
@@ -24,29 +24,21 @@ export class PetSelectorComponent extends Container {
 		onSelect: (mode: PetMode) => void,
 		onCancel: () => void,
 		onPreview: (mode: PetMode) => void,
+		available: boolean,
 	) {
 		super();
 
-		const items: SelectItem[] = PET_OPTIONS.map(option => ({
-			value: option.value,
-			label: option.label,
-			description: option.value === current ? `${option.description} (current)` : option.description,
-		}));
+		const items = createPetSelectItems(PET_OPTIONS, current, available);
 
-		this.addChild(new DynamicBorder());
-
-		this.#selectList = new SelectList(items, 10, getSelectListTheme());
-		const currentIndex = PET_OPTIONS.findIndex(option => option.value === current);
-		if (currentIndex !== -1) {
-			this.#selectList.setSelectedIndex(currentIndex);
-		}
-
-		this.#selectList.onSelect = item => onSelect(item.value as PetMode);
-		this.#selectList.onCancel = () => onCancel();
-		this.#selectList.onSelectionChange = item => onPreview(item.value as PetMode);
-
-		this.addChild(this.#selectList);
-		this.addChild(new DynamicBorder());
+		const framed = FramedSelect(undefined, items, {
+			maxVisible: 10,
+			selectedValue: current,
+			onSelect: item => onSelect(item.value as PetMode),
+			onCancel,
+			onSelectionChange: item => onPreview(item.value as PetMode),
+		});
+		this.#selectList = framed.selectList;
+		this.addChild(framed.container);
 	}
 
 	getSelectList(): SelectList {

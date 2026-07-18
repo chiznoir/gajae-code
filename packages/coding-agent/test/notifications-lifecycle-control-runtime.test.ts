@@ -3,21 +3,40 @@ import { describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-
 import { parseLaunchWorktreeMode } from "@gajae-code/coding-agent/gjc-runtime/launch-worktree";
 import type { SessionCreateFrame } from "@gajae-code/coding-agent/sdk/bus/index";
 import {
 	attachLifecycleControl,
 	buildCreateArgv,
+	buildOrchestratorDeps,
 	type ControlServerLike,
 	createRateLimiter,
 	daemonCloseSession,
 	daemonResumeSession,
 	daemonSpawnCreate,
 	fileLedgerStore,
+	type LifecycleControlServer,
+	type LifecycleControlServerFactory,
 	outcomeToResponse,
 } from "@gajae-code/coding-agent/sdk/bus/lifecycle-control-runtime";
 import type { LedgerEntry, OrchestratorDeps } from "@gajae-code/coding-agent/sdk/bus/lifecycle-orchestrator";
+import { startDaemonLifecycleControl } from "@gajae-code/coding-agent/sdk/bus/telegram-daemon";
+import { Settings } from "../src/config/settings";
+import { acquireDaemonOwnership, TelegramNotificationDaemon } from "../src/sdk/bus/telegram-daemon";
+import {
+	prepareManagedSessionScopeForWriteSync,
+	resolveManagedScope,
+} from "../src/session/internal/managed-session-scope";
+
+function writeManagedSession(sessionsRoot: string, cwd: string, sessionId: string): void {
+	const resolved = resolveManagedScope({ cwd, agentDir: path.dirname(sessionsRoot), sessionsRoot });
+	if (resolved.kind !== "resolved") throw new Error(resolved.message);
+	const prepared = prepareManagedSessionScopeForWriteSync(resolved.scope);
+	if (prepared.kind !== "resolved") throw new Error(prepared.message);
+	const file = path.join(prepared.scope.directoryPath, `${sessionId}.jsonl`);
+	fs.writeFileSync(file, `${JSON.stringify({ type: "session", id: sessionId, cwd })}\n`, { mode: 0o600 });
+	fs.chmodSync(file, 0o600);
+}
 
 const PAIRED = "42";
 
@@ -49,9 +68,10 @@ function createFrame(over: Partial<SessionCreateFrame> = {}): SessionCreateFrame
 }
 
 function stubDeps(): OrchestratorDeps {
-	let n = 0;
 	return {
 		pairedChatId: PAIRED,
+		auditRedactionKey: new Uint8Array(32).fill(7),
+		isPsmuxProvider: () => false,
 		now: () => 1000,
 		store: { read: async () => ({ version: 1, entries: {} }), write: async () => {} },
 		audit: () => {},
@@ -71,10 +91,189 @@ function stubDeps(): OrchestratorDeps {
 			topicThreadId: "",
 			mode: "reattached",
 		}),
-		newLifecycleRequestId: () => `lc-${++n}`,
-		newSessionId: () => `sess-${++n}`,
 	};
 }
+it("requires exactly a 32-byte audit redaction key for production deps", () => {
+	expect(() =>
+		buildOrchestratorDeps({
+			pairedChatId: PAIRED,
+			agentNotificationsDir: "C:\\temporary\\notifications",
+			auditRedactionKey: new Uint8Array(31),
+		}),
+	).toThrow("invalid_audit_redaction_key");
+});
+it("forwards the supplied 32-byte audit key unchanged and rejects invalid or missing keys before wiring", () => {
+	let registered = 0;
+	const controlServer: ControlServerLike = {
+		onLifecycleRequest: () => {
+			registered += 1;
+		},
+		respond: () => {},
+	};
+	const key = new Uint8Array(32).fill(0xa5);
+	const deps = startDaemonLifecycleControl({
+		controlServer,
+		pairedChatId: PAIRED,
+		agentDir: "C:\\temporary\\notifications-forwarding",
+		auditRedactionKey: key,
+	});
+	expect(deps.auditRedactionKey).toBe(key);
+	expect(registered).toBe(1);
+
+	const invalidAgentDir = path.join(os.tmpdir(), `gjc-invalid-audit-key-${Date.now()}`);
+	const auditPath = path.join(invalidAgentDir, "notifications", "telegram-lifecycle-audit.jsonl");
+	for (const auditRedactionKey of [new Uint8Array(31), undefined as unknown as Uint8Array]) {
+		registered = 0;
+		expect(() =>
+			startDaemonLifecycleControl({
+				controlServer,
+				pairedChatId: PAIRED,
+				agentDir: invalidAgentDir,
+				auditRedactionKey,
+			}),
+		).toThrow();
+		expect(registered).toBe(0);
+		expect(fs.existsSync(auditPath)).toBe(false);
+	}
+});
+it("fails closed without creating files when startup prompt capability transport is unavailable", async () => {
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-startup-prompt-unsupported-"));
+	const deps = buildOrchestratorDeps({
+		pairedChatId: PAIRED,
+		agentNotificationsDir: root,
+		auditRedactionKey: new Uint8Array(32).fill(7),
+	});
+	try {
+		await expect(deps.writeStartupPrompt("request", undefined, async () => {})).resolves.toBeUndefined();
+		await expect(deps.writeStartupPrompt("request", "SECRET", async () => {})).rejects.toThrow(
+			"startup_prompt_capability_transport_unavailable",
+		);
+		expect(fs.readdirSync(root)).toEqual([]);
+	} finally {
+		fs.rmSync(root, { recursive: true, force: true });
+	}
+});
+
+function daemonSettings(agentDir: string): Settings {
+	const base = Settings.isolated({
+		"notifications.enabled": true,
+		"notifications.telegram.botToken": "123456:secret-token",
+		"notifications.telegram.chatId": PAIRED,
+	}) as Settings;
+	return new Proxy(base, {
+		get(target, prop) {
+			if (prop === "getAgentDir") return () => agentDir;
+			const value = Reflect.get(target, prop, target);
+			return typeof value === "function" ? value.bind(target) : value;
+		},
+	}) as Settings;
+}
+
+function immediateTimeout(): typeof setTimeout {
+	return ((callback: () => void) => {
+		callback();
+		return 0;
+	}) as unknown as typeof setTimeout;
+}
+
+async function startAsOwner(settings: Settings, ownerId: string): Promise<void> {
+	await acquireDaemonOwnership({
+		settings,
+		tokenFingerprint: "fingerprint",
+		chatId: PAIRED,
+		pid: process.pid,
+		randomId: () => ownerId,
+	});
+}
+
+it("passes the daemon-derived audit key through real lifecycle startup without a fallback", async () => {
+	const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-daemon-audit-key-"));
+	const settings = daemonSettings(agentDir);
+	await startAsOwner(settings, "audit-key-owner");
+
+	let capturedKey: Uint8Array | undefined;
+	let registered = 0;
+	const factory: LifecycleControlServerFactory = () =>
+		({
+			onLifecycleRequest: () => {
+				registered++;
+			},
+			respond: () => {},
+			start: async () => undefined,
+			stop: () => {},
+		}) as LifecycleControlServer;
+	const daemon = new TelegramNotificationDaemon({
+		settings,
+		ownerId: "audit-key-owner",
+		botToken: "bot-token",
+		chatId: PAIRED,
+		botApi: { call: async () => ({ ok: true, result: [] }) } as never,
+		idleTimeoutMs: 10,
+		now: (() => {
+			let now = 0;
+			return () => (now += 11);
+		})(),
+		setTimeoutImpl: immediateTimeout(),
+		createLifecycleControlServer: factory,
+		createLifecycleOrchestratorDeps: input => {
+			capturedKey = input.auditRedactionKey;
+			return { ...stubDeps(), auditRedactionKey: input.auditRedactionKey };
+		},
+	});
+
+	await daemon.run();
+
+	expect(Buffer.from(capturedKey ?? []).toString("hex")).toBe(
+		"03936c8324cc679ecdc4bca97b2a88acaedf993ec45a8e6b3196033a6f9727a6",
+	);
+	expect(registered).toBe(1);
+});
+
+it("does not attach lifecycle audit dependencies or fall back when daemon key derivation has no token", async () => {
+	const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-daemon-missing-audit-key-"));
+	const settings = daemonSettings(agentDir);
+	await startAsOwner(settings, "missing-audit-key-owner");
+
+	let dependenciesBuilt = 0;
+	let registered = 0;
+	let started = 0;
+	let stopped = 0;
+	const factory: LifecycleControlServerFactory = () =>
+		({
+			onLifecycleRequest: () => {
+				registered++;
+			},
+			respond: () => {},
+			start: async () => {
+				started++;
+			},
+			stop: () => {
+				stopped++;
+			},
+		}) as LifecycleControlServer;
+	const daemon = new TelegramNotificationDaemon({
+		settings,
+		ownerId: "missing-audit-key-owner",
+		botToken: undefined as unknown as string,
+		chatId: PAIRED,
+		botApi: { call: async () => ({ ok: true, result: [] }) } as never,
+		idleTimeoutMs: 10,
+		now: (() => {
+			let now = 0;
+			return () => (now += 11);
+		})(),
+		setTimeoutImpl: immediateTimeout(),
+		createLifecycleControlServer: factory,
+		createLifecycleOrchestratorDeps: () => {
+			dependenciesBuilt++;
+			return stubDeps();
+		},
+	});
+
+	await daemon.run();
+
+	expect([dependenciesBuilt, registered, started, stopped]).toEqual([0, 0, 0, 1]);
+});
 
 describe("lifecycle control runtime", () => {
 	it("buildCreateArgv emits only launcher-supported flags (no --session-id)", () => {
@@ -276,6 +475,30 @@ describe("lifecycle control runtime", () => {
 		expect(responses.join("\n")).not.toContain("control-token");
 	});
 
+	it("migrates legacy successful resume entries without resumeMode", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-lifecycle-legacy-resume-"));
+		const ledgerPath = path.join(root, "ledger.json");
+		const legacyEntry: LedgerEntry = {
+			requestHash: "legacy-hash",
+			state: "success",
+			requestId: "legacy-resume",
+			verb: "session_resume",
+			sessionId: "session-1",
+			tmuxSession: "gjc-session-1",
+			endpointUrl: "ws://127.0.0.1:1",
+			createdAt: 1,
+			updatedAt: 2,
+			targetSummary: { kind: "session_resume" },
+		};
+		delete legacyEntry.resumeMode;
+		fs.writeFileSync(ledgerPath, JSON.stringify({ version: 1, entries: { "42:7": legacyEntry } }), { mode: 0o600 });
+		try {
+			const doc = await fileLedgerStore(ledgerPath).read();
+			expect(doc.entries["42:7"]?.resumeMode).toBe("reattached");
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
 	it("distinguishes a missing ledger from corrupt or unreadable durable state", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-lifecycle-ledger-"));
 		const ledgerPath = path.join(root, "ledger.json");
@@ -877,17 +1100,24 @@ describe("lifecycle control runtime", () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-resume-"));
 		const proj = path.join(root, "proj");
 		fs.mkdirSync(proj, { recursive: true });
-		// Two saved histories sharing the prefix "abc".
-		fs.writeFileSync(path.join(proj, "abc111.jsonl"), `${JSON.stringify({ type: "session" })}\n`);
-		fs.writeFileSync(path.join(proj, "abc222.jsonl"), `${JSON.stringify({ type: "session" })}\n`);
+		await writeManagedSession(root, proj, "abc111");
+		await writeManagedSession(root, proj, "abc222");
+		fs.writeFileSync(
+			path.join(root, "raw-legacy.jsonl"),
+			`${JSON.stringify({ type: "session", id: "abc333", cwd: proj })}\n`,
+			{ mode: 0o600 },
+		);
 
 		// No live tmux match for these unique ids, so resolution falls to history.
 		const resume = daemonResumeSession(process.env, { sessionsRoot: root });
 
-		const missing = await resume({ sessionIdOrPrefix: "zzz-no-such" });
+		const missing = await resume({ sessionIdOrPrefix: "zzz-no-such", path: proj });
 		expect(missing).toEqual({ notFound: true });
 
-		const ambiguous = await resume({ sessionIdOrPrefix: "abc" });
+		const rawDirectoryCandidate = await resume({ sessionIdOrPrefix: "abc333", path: proj });
+		expect(rawDirectoryCandidate).toEqual({ notFound: true });
+
+		const ambiguous = await resume({ sessionIdOrPrefix: "abc", path: proj });
 		expect("ambiguous" in ambiguous).toBe(true);
 		if ("ambiguous" in ambiguous) {
 			expect(ambiguous.ambiguous.map(c => c.sessionId).sort()).toEqual(["abc111", "abc222"]);
@@ -899,13 +1129,11 @@ describe("lifecycle control runtime", () => {
 	it("daemonResumeSession cold-restarts saved sessions from their recorded cwd", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-resume-cwd-"));
 		const proj = path.join(root, "saved-project");
-		const sessionsDir = path.join(root, "encoded-project");
 		const callsFile = path.join(root, "tmux-calls.log");
 		const serverState = path.join(root, "tmux-server-started");
 		const tmux = path.join(root, "fake-tmux.sh");
 		fs.mkdirSync(proj, { recursive: true });
-		fs.mkdirSync(sessionsDir, { recursive: true });
-		fs.writeFileSync(path.join(sessionsDir, "abc123.jsonl"), `${JSON.stringify({ id: "abc123", cwd: proj })}\n`);
+		await writeManagedSession(root, proj, "abc123");
 		fs.writeFileSync(
 			tmux,
 			[
@@ -1258,15 +1486,10 @@ describe("lifecycle control runtime", () => {
 	it("refuses unsafe or unverifiable servers before daemon create or cold-resume can mutate tmux", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-pre-mutation-refusal-"));
 		const project = path.join(root, "project");
-		const sessions = path.join(root, "sessions");
 		const callsFile = path.join(root, "tmux-calls.log");
 		const tmux = path.join(root, "fake-tmux.sh");
 		fs.mkdirSync(project, { recursive: true });
-		fs.mkdirSync(sessions, { recursive: true });
-		fs.writeFileSync(
-			path.join(sessions, "resume-123.jsonl"),
-			`${JSON.stringify({ id: "resume-123", cwd: project })}\n`,
-		);
+		await writeManagedSession(root, project, "resume-123");
 		fs.writeFileSync(tmux, ["#!/usr/bin/env bash", 'printf "%s\\n" "$*" >> "$TMUX_CALLS"', "exit 0", ""].join("\n"));
 		fs.chmodSync(tmux, 0o755);
 		try {
@@ -1299,7 +1522,7 @@ describe("lifecycle control runtime", () => {
 					daemonResumeSession(
 						{ ...process.env, GJC_TMUX_COMMAND: tmux, TMUX_CALLS: callsFile },
 						{ sessionsRoot: root, listSessions: () => [], ownerIsolationProbe: probe },
-					)({ sessionIdOrPrefix: "resume-123" }),
+					)({ sessionIdOrPrefix: "resume-123", path: project }),
 				).rejects.toThrow(`gjc_lifecycle_owner_server_${state}`);
 			}
 			expect(fs.existsSync(callsFile) ? fs.readFileSync(callsFile, "utf8") : "").toBe("");
@@ -1368,15 +1591,10 @@ describe("lifecycle control runtime", () => {
 	it("writes no cold-resume ownership tags when a replacement server reuses the native session before metadata", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-cold-resume-metadata-"));
 		const project = path.join(root, "project");
-		const history = path.join(root, "history");
 		const callsFile = path.join(root, "tmux-calls.log");
 		const tmux = path.join(root, "fake-tmux.sh");
 		fs.mkdirSync(project, { recursive: true });
-		fs.mkdirSync(history, { recursive: true });
-		fs.writeFileSync(
-			path.join(history, "resume-replacement.jsonl"),
-			`${JSON.stringify({ id: "resume-replacement", cwd: project })}\n`,
-		);
+		await writeManagedSession(root, project, "resume-replacement");
 		fs.writeFileSync(
 			tmux,
 			[
@@ -1413,7 +1631,7 @@ describe("lifecycle control runtime", () => {
 							},
 						},
 					},
-				)({ sessionIdOrPrefix: "resume-replacement" }),
+				)({ sessionIdOrPrefix: "resume-replacement", path: project }),
 			).rejects.toThrow("gjc_lifecycle_cleanup_uncertain");
 			const calls = fs.readFileSync(callsFile, "utf8").trim().split("\n");
 			const guarded = calls.filter(call => call.startsWith("-L default if-shell "));
@@ -1431,15 +1649,10 @@ describe("lifecycle control runtime", () => {
 	it("refuses psmux before create or cold-resume can mutate lifecycle state", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-lifecycle-psmux-"));
 		const project = path.join(root, "project");
-		const sessions = path.join(root, "sessions");
 		const psmux = path.join(root, "psmux");
 		const plain = path.join(root, "plain");
 		fs.mkdirSync(project, { recursive: true });
-		fs.mkdirSync(sessions, { recursive: true });
-		fs.writeFileSync(
-			path.join(sessions, "resume-123.jsonl"),
-			`${JSON.stringify({ id: "resume-123", cwd: project })}\n`,
-		);
+		await writeManagedSession(root, project, "resume-123");
 		fs.writeFileSync(psmux, "#!/usr/bin/env bash\nexit 99\n");
 		fs.chmodSync(psmux, 0o755);
 		const env = { ...process.env, GJC_TMUX_COMMAND: psmux, GJC_PSMUX_COMMAND: psmux };
@@ -1451,6 +1664,19 @@ describe("lifecycle control runtime", () => {
 				}),
 			).rejects.toThrow("gjc_lifecycle_psmux_unsupported");
 			let listSessionsCalled = false;
+			await expect(
+				daemonResumeSession(env, {
+					sessionsRoot: root,
+					listSessions: () => {
+						listSessionsCalled = true;
+						return [];
+					},
+				})({
+					sessionIdOrPrefix: "resume-123",
+					path: project,
+				}),
+			).rejects.toThrow("gjc_lifecycle_psmux_unsupported");
+			expect(listSessionsCalled).toBe(false);
 			await expect(
 				daemonResumeSession(env, {
 					sessionsRoot: root,

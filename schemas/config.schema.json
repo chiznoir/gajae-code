@@ -26,6 +26,20 @@
 			},
 			"additionalProperties": false
 		},
+		"session": {
+			"type": "object",
+			"properties": {
+				"directoryMigration": {
+					"type": "string",
+					"enum": [
+						"copy-retain",
+						"disabled"
+					],
+					"default": "copy-retain"
+				}
+			},
+			"additionalProperties": false
+		},
 		"notifications": {
 			"type": "object",
 			"properties": {
@@ -42,11 +56,17 @@
 						"chatId": {
 							"type": "string"
 						},
+						"activation": {
+							"type": "object",
+							"additionalProperties": true,
+							"default": {}
+						},
 						"rich": {
 							"type": "object",
 							"properties": {
 								"enabled": {
 									"type": "boolean",
+									"description": "Format Telegram notifications with rich message content.",
 									"default": true
 								}
 							},
@@ -57,6 +77,7 @@
 							"properties": {
 								"enabled": {
 									"type": "boolean",
+									"description": "Include rich draft updates in Telegram notifications.",
 									"default": false
 								}
 							},
@@ -115,14 +136,17 @@
 				},
 				"redact": {
 					"type": "boolean",
+					"description": "Redact sensitive content before notifications are delivered.",
 					"default": false
 				},
 				"verbosity": {
 					"type": "string",
+					"description": "Choose concise or detailed notification messages.",
 					"default": "lean"
 				},
 				"sessionScope": {
 					"type": "string",
+					"description": "Send notifications from all sessions or only the primary session.",
 					"default": "all"
 				},
 				"daemon": {
@@ -229,7 +253,24 @@
 		},
 		"modelRoles": {
 			"type": "object",
-			"additionalProperties": true,
+			"additionalProperties": {
+				"anyOf": [
+					{
+						"type": "string",
+						"minLength": 1,
+						"pattern": "\\S"
+					},
+					{
+						"type": "array",
+						"minItems": 1,
+						"items": {
+							"type": "string",
+							"minLength": 1,
+							"pattern": "\\S"
+						}
+					}
+				]
+			},
 			"default": {}
 		},
 		"modelProfile": {
@@ -401,6 +442,11 @@
 					"type": "number",
 					"description": "Tool output above this size is saved as an artifact; tail is kept inline",
 					"default": 50
+				},
+				"preAdmissionArtifactSpill": {
+					"type": "boolean",
+					"description": "Experimental opt-in: save oversized tool results before provider context construction, retaining a UTF-8-safe head, tail, digest, and artifact receipt inline",
+					"default": false
 				},
 				"readArtifactSpillThreshold": {
 					"type": "number",
@@ -745,8 +791,35 @@
 				},
 				"agentModelOverrides": {
 					"type": "object",
-					"additionalProperties": true,
+					"additionalProperties": {
+						"anyOf": [
+							{
+								"type": "string",
+								"minLength": 1,
+								"pattern": "\\S"
+							},
+							{
+								"type": "array",
+								"minItems": 1,
+								"items": {
+									"type": "string",
+									"minLength": 1,
+									"pattern": "\\S"
+								}
+							}
+						]
+					},
 					"default": {}
+				}
+			},
+			"additionalProperties": false
+		},
+		"fallback": {
+			"type": "object",
+			"properties": {
+				"maxAttempts": {
+					"type": "number",
+					"default": 3
 				}
 			},
 			"additionalProperties": false
@@ -769,7 +842,7 @@
 				},
 				"maxDelayMs": {
 					"type": "number",
-					"description": "Maximum wait between retries, in ms. When the provider asks us to wait longer than this and no credential or model fallback succeeds, the request fails fast instead of sleeping (e.g. 3-hour Anthropic rate-limit windows).",
+					"description": "Maximum wait between retries, in ms. Legacy retries clamp provider Retry-After hints to this value; managed fallback honors typed Retry-After hints even when they exceed it.",
 					"default": 300000
 				},
 				"requestMaxRetries": {
@@ -795,6 +868,17 @@
 					],
 					"description": "When to return to the primary model after a fallback",
 					"default": "cooldown-expiry"
+				}
+			},
+			"additionalProperties": false
+		},
+		"mouse": {
+			"type": "object",
+			"properties": {
+				"enabled": {
+					"type": "boolean",
+					"description": "Enable SGR mouse wheel scrolling and overlay row selection. Disabled in tmux and screen.",
+					"default": false
 				}
 			},
 			"additionalProperties": false
@@ -1903,6 +1987,25 @@
 					"type": "string",
 					"description": "Directory to save screenshots. If unset, screenshots go to a temp file. Supports ~. Examples: ~/Downloads, ~/Desktop, /sdcard/Download (Android)"
 				},
+				"profileReuse": {
+					"type": "string",
+					"description": "'auto' (default): when a usable real Chrome profile is available, the browser tool uses an isolated copy of it (cookies/session/cache) for stronger stealth, warns, and falls back to synthetic. 'opt-in': stay synthetic unless a real profile is explicitly requested.",
+					"default": "auto"
+				},
+				"geo": {
+					"type": "object",
+					"properties": {
+						"timezone": {
+							"type": "string",
+							"description": "Optional IANA timezone (e.g. 'America/New_York') for headless sessions. Default unset preserves the real timezone. Only set this to a value coherent with your egress (e.g. a proxy region); an incoherent timezone increases bot detection."
+						},
+						"locale": {
+							"type": "string",
+							"description": "Optional UI locale (e.g. 'en-US') for headless sessions. Default unset preserves the real locale. Only set this coherently with your egress region."
+						}
+					},
+					"additionalProperties": false
+				},
 				"gc": {
 					"type": "object",
 					"properties": {
@@ -2051,6 +2154,17 @@
 				"notificationDebounceMs": {
 					"type": "number",
 					"default": 500
+				}
+			},
+			"additionalProperties": false
+		},
+		"tasksPane": {
+			"type": "object",
+			"properties": {
+				"defaultVisible": {
+					"type": "boolean",
+					"description": "Open the unified tasks pane when the interactive UI starts",
+					"default": false
 				}
 			},
 			"additionalProperties": false

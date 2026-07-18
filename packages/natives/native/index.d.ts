@@ -124,6 +124,11 @@ export declare class NotificationServer {
    */
   onSdkFrame(callback: (err: null | Error, frame: SdkFrameEvent) => void): void
   /**
+   * Register the negotiated-capabilities callback. Must be called before
+   * [`Self::start`].
+   */
+  onNegotiatedCapabilities(callback: (err: null | Error, connectionId: string, capabilities: string[]) => void): void
+  /**
    * Register the connection-close callback. Must be called before
    * [`Self::start`].
    */
@@ -147,6 +152,25 @@ export declare class NotificationServer {
    */
   registerAsk(neededJson: string, repliable: boolean): void
   /**
+   * Register a correlated workflow-gate ask. `workflow_json` must be an
+   * `action_needed` wire frame carrying a nonempty `workflowGateId`.
+   */
+  registerWorkflowGateAsk(workflowJson: string, repliable: boolean): void
+  /**
+   * Register an ask and return an opaque in-process capability. Pass it
+   * unchanged to [`Self::retire_if_unclaimed`]; do not construct, persist,
+   * inspect, or treat it as workflow-gate authority. A supplied
+   * `workflowGateId` is preserved.
+   */
+  registerArbitratedAsk(neededJson: string, repliable: boolean): PresentationLease
+  /**
+   * Atomically terminalize the exact presentation named by an opaque lease.
+   * The typed status proves whether it retired, was already terminal, was
+   * claimed, or became stale without exposing claims, receipts, registration
+   * state, or workflow-gate authority.
+   */
+  retireIfUnclaimed(lease: PresentationLease): RetireIfUnclaimedResult
+  /**
    * Broadcast an ephemeral `action_needed` idle ping. `needed_json` is JSON
    * `ActionNeeded`.
    *
@@ -164,7 +188,23 @@ export declare class NotificationServer {
    * Fails if not started or `frame_json` is not a valid `ServerMessage`.
    */
   pushFrame(frameJson: string): void
-  /** Send raw JSON to one connected v3 SDK client. */
+  /**
+   * Broadcast a TypeScript-constructed turn frame without re-parsing JSON.
+   * External frames must continue through [`Self::push_frame`] for serde
+   * validation.
+   */
+  pushTurnStreamUnchecked(sessionId: string, phase: string, text: string, finalAnswer?: boolean | undefined | null, messageRef?: string | undefined | null): void
+  /**
+   * Broadcast a file attachment from raw N-API bytes, encoding the unchanged
+   * base64 wire field only in Rust.
+   */
+  pushFileAttachmentUnchecked(sessionId: string, name: string, mime: string | undefined | null, data: Buffer, caption?: string | undefined | null): void
+  /**
+   * Return counters guarding the known-good frame crossing against
+   * regressions.
+   */
+  knownGoodFrameStats(): KnownGoodFrameStats
+  /** Send a validated, bounded JSON envelope to one connected v3 SDK client. */
   sendTo(connectionId: string, json: string): void
   /**
    * Publish a replayable `session_ready` readiness signal. `ready_json` is a
@@ -178,11 +218,10 @@ export declare class NotificationServer {
    */
   pushSessionReady(readyJson: string): void
   /**
-   * Resolve an action locally (the CLI/TUI answered). `answer_json` is an
-   * optional JSON `ReplyAnswer`.
-   *
-   * # Errors
-   * Fails if not started or `answer_json` is invalid.
+   * Resolve a legacy/non-arbitrated action locally (the CLI/TUI answered).
+   * Arbitrated presentations require their opaque exact lease to be passed to
+   * [`Self::retire_if_unclaimed`], so an id-only local resolution fails
+   * closed.
    */
   resolveLocal(id: string, answerJson?: string | undefined | null): void
   /**
@@ -230,6 +269,8 @@ export declare class NotificationServer {
   clientCount(): number
   /** Stop the server (idempotent) and remove the endpoint discovery file. */
   stop(): void
+  /** Stop the server and resolve only after all native socket owners exit. */
+  stopAndWait(): Promise<void>
 }
 
 /** Stable process reference. */
@@ -240,6 +281,8 @@ export declare class Process {
   static fromPath(path: string): Array<Process>
   /** Operating-system process identifier for this process reference. */
   get pid(): number
+  /** Kernel-derived identity evidence for this exact process incarnation. */
+  get incarnation(): string
   /** Parent process id for this process, when available. */
   get ppid(): number | null
   /** Launch arguments for this process. */
@@ -329,7 +372,7 @@ export declare class Shell {
  * `packages/natives/native/index.js` (which derives the name from
  * `package.json#version`).
  */
-export declare function __piNativesV0_10_0(): void
+export declare function __piNativesV0_11_1(): void
 
 /**
  * Apply conservative pre-execution rewrites to a bash command.
@@ -339,6 +382,8 @@ export declare function __piNativesV0_10_0(): void
  * `pi_shell::fixup`. Synchronous and cheap (one parse pass over the input).
  */
 export declare function applyBashFixups(command: string): BashFixupResult
+
+export declare function applyOwnerOnlyPathSecurity(path: string, kind: "directory" | "file"): NativeOwnerOnlySecurityResult
 
 /** Typed terminal acknowledgement result returned by acknowledgement promises. */
 export interface AskSelectedAckOutcomeEvent {
@@ -549,6 +594,8 @@ export interface BuildInfo {
   languageSet: string
 }
 
+export declare function canonicalExistingDirectoryIdentity(path: string | Uint8Array): NativeCanonicalDirectoryIdentity
+
 /** Clipboard image payload encoded as PNG bytes. */
 export interface ClipboardImage {
   /** PNG-encoded image bytes. */
@@ -660,6 +707,29 @@ export declare enum Ellipsis {
  * Returns an error if decoding, resizing, or SIXEL encoding fails.
  */
 export declare function encodeSixel(bytes: Uint8Array, targetWidthPx: number, targetHeightPx: number): string
+
+/**
+ * Remove an already durably planned detached directory only when a fresh
+ * descriptor-relative snapshot exactly equals the persisted snapshot. The
+ * caller-planned root remains in place while its opened descriptor is
+ * authoritative throughout recursive removal.
+ */
+export declare function exactRemoveDirectoryTree(path: string, snapshot: NativeDirectoryTreeSnapshot): NativeExactUnlinkResult
+
+/**
+ * Restore only the detached object that still has the supplied platform
+ * identity. The detached and original paths must retain the same validated
+ * parent, and restoration never replaces an existing original path.
+ */
+export declare function exactRestore(detachedPath: string, originalPath: string, identity: NativeExactFileIdentity): NativeExactUnlinkResult
+
+/**
+ * Delete only the regular file that still has the supplied platform identity.
+ *
+ * This never follows a symlink or reparse point in the target path and reports
+ * validation failures as typed results rather than deleting a replacement.
+ */
+export declare function exactUnlink(path: string, identity: NativeExactFileIdentity): NativeExactUnlinkResult
 
 /**
  * Execute a brush shell command.
@@ -1194,6 +1264,19 @@ export declare enum KeyEventType {
   Release = 3
 }
 
+/** Observable counters for the internal known-good N-API frame lane. */
+export interface KnownGoodFrameStats {
+  /** Frames constructed as `TurnStream` without parsing a JSON string. */
+  knownGoodTurnStreamFrames: number
+  /** JSON serde parses of externally supplied `turn_stream` frames. */
+  turnStreamSerdeValidationParses: number
+  /**
+   * Base64 characters encoded in Rust for `file_attachment` frames (the JS
+   * side crosses raw `Buffer` bytes and never allocates the base64 string).
+   */
+  fileAttachmentRustBase64Chars: number
+}
+
 /** A lifecycle request forwarded to the TypeScript daemon for orchestration. */
 export interface LifecycleRequestEvent {
   /** One of `"session_create"`, `"session_close"`, `"session_resume"`. */
@@ -1393,6 +1476,101 @@ export interface MinimizerResult {
 
 export declare function nativeBuildInfo(): BuildInfo
 
+/** Result of resolving an existing directory to its stable platform identity. */
+export type NativeCanonicalDirectoryIdentity =
+	| { ok: true; platform: "posix" | "win32"; canonicalPath: string; code?: never }
+	| {
+			ok: false;
+			platform?: never;
+			canonicalPath?: never;
+			code: "not_found" | "not_directory" | "not_utf8" | "network_unsupported" | "identity_unavailable" | "io_error";
+	  }
+
+/**
+ * A deterministic, no-follow description of a directory tree. `relative_path`
+ * is UTF-8, uses `/` separators, and is empty only for the root entry.
+ */
+export interface NativeDirectoryTreeEntry {
+  relativePath: string
+  kind: string
+  dev: string
+  ino: string
+  size: string
+  mtimeNs: string
+  sha256?: string
+}
+
+export interface NativeDirectoryTreeResult {
+  ok: boolean
+  code?: string
+  snapshot?: NativeDirectoryTreeSnapshot
+}
+
+/**
+ * Stable evidence returned by `snapshot_directory_tree` and consumed verbatim
+ * by `exact_remove_directory_tree`.
+ */
+export interface NativeDirectoryTreeSnapshot {
+  rootDev: string
+  rootIno: string
+  entries: Array<NativeDirectoryTreeEntry>
+}
+
+/**
+ * Caller-supplied identity and preauthorized quarantine evidence for exact
+ * deletion.
+ */
+export interface NativeExactFileIdentity {
+  dev: bigint
+  ino: bigint
+  size: bigint
+  mtimeNs: bigint
+  /**
+   * When true, atomically detach a directory rather than deleting a regular
+   * file.
+   */
+  directory?: boolean
+  /**
+   * Keep a regular file in quarantine after its identity has been verified
+   * instead of unlinking it. This makes cross-device retirement recoverable.
+   */
+  detachOnly?: boolean
+  /**
+   * A caller-persisted, single-component no-replace quarantine destination.
+   * Required for every exact deletion so authority survives a post-detach
+   * crash.
+   */
+  quarantineName?: string
+  /**
+   * SHA-256 of regular-file bytes. Required for regular-file deletion and
+   * verified from the detached object before unlinking it.
+   */
+  sha256?: string
+}
+
+/** Typed result of an identity-bound regular-file deletion or directory detach. */
+export interface NativeExactUnlinkResult {
+  ok: boolean
+  code?: string
+  detachedPath?: string
+}
+
+/** Result of applying or checking owner-only path security. */
+export type NativeOwnerOnlySecurityResult =
+	| { ok: true; code?: never }
+	| {
+			ok: false;
+			code:
+				| "not_found"
+				| "not_directory"
+				| "network_unsupported"
+				| "reparse_point"
+				| "acl_unavailable"
+				| "acl_apply_failed"
+				| "acl_verify_failed"
+				| "io_error";
+	  }
+
 /** Bound endpoint info returned from [`NotificationServer::start`]. */
 export interface NotificationEndpoint {
   /** Bind host (loopback). */
@@ -1432,6 +1610,18 @@ export declare function parseKey(data: string, kittyProtocolActive: boolean): st
  * Returns a structured parse result when the input is a valid Kitty sequence.
  */
 export declare function parseKittySequence(data: string): ParsedKittyResult | null
+
+/**
+ * Opaque in-process presentation capability.
+ *
+ * Returned by [`NotificationServer::register_arbitrated_ask`]. Pass it
+ * unchanged to [`NotificationServer::retire_if_unclaimed`]; do not construct,
+ * persist, inspect, or treat it as workflow-gate authority.
+ */
+export interface PresentationLease {
+  actionId: string
+  registrationEpoch: number
+}
 
 /** Current state of a process reference. */
 export declare enum ProcessStatus {
@@ -1509,9 +1699,14 @@ export declare function ptyTimeoutCount(): bigint
  */
 export declare function readImageFromClipboard(): Promise<ClipboardImage | undefined | null>
 
+export declare function renameNoReplacePath(sourcePath: string, destinationPath: string): NativeExactUnlinkResult
+
 /** A client reply forwarded to the TypeScript host for gate resolution. */
 export interface ReplyEvent {
-  /** The action id being answered (the real broker `gate_id` for asks). */
+  /**
+   * The transient action/presentation id being answered. This is not the
+   * durable workflow gate id.
+   */
   id: string
   /** JSON-encoded `ReplyAnswer` (number, string, or `{selected,custom}`). */
   answerJson: string
@@ -1519,6 +1714,11 @@ export interface ReplyEvent {
   idempotencyKey?: string
   /** One-shot receipt binding this callback to the atomically claimed reply. */
   replyReceiptId: string
+}
+
+/** Public status of exact direct retirement. Claims and receipts remain native. */
+export interface RetireIfUnclaimedResult {
+  status: 'retired' | 'already_terminal' | 'claimed' | 'stale'
 }
 
 /** A raw v3 SDK frame paired with its actual WebSocket connection id. */
@@ -1656,6 +1856,13 @@ export interface SliceResult {
  */
 export declare function sliceWithWidth(line: string, startCol: number, length: number, strict: boolean | undefined | null, tabWidth: number): SliceResult
 
+/**
+ * Capture a deterministic, descriptor-relative snapshot of a regular-file and
+ * directory-only tree. Symlinks, special files, non-UTF-8 names, and topology
+ * changes are rejected rather than followed.
+ */
+export declare function snapshotDirectoryTree(path: string): NativeDirectoryTreeResult
+
 export declare function summarizeCode(options: SummaryOptions): SummaryResult
 
 export interface SummaryOptions {
@@ -1706,6 +1913,8 @@ export declare function supportsLanguage(lang: string): boolean
 export declare function truncateLinesToWidth(lines: Array<string>, maxWidth: number, ellipsisKind: Ellipsis | undefined | null, pad: boolean | undefined | null, tabWidth: number): Array<string>
 
 export declare function truncateToWidth(text: string, maxWidth: number, ellipsisKind: Ellipsis | undefined | null, pad: boolean | undefined | null, tabWidth: number): string
+
+export declare function verifyOwnerOnlyPathSecurity(path: string, kind: "directory" | "file"): NativeOwnerOnlySecurityResult
 
 /**
  * Calculate visible width of text, excluding ANSI escape sequences.

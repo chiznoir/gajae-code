@@ -11,12 +11,20 @@
 //! Call order: construct, [`NotificationServer::on_reply`] (optional), then
 //! [`NotificationServer::start`]. `on_reply` must be registered before `start`.
 
-use std::path::PathBuf;
+use std::{
+	path::PathBuf,
+	sync::atomic::{AtomicU64, Ordering},
+};
 
 use gjc_sdk::{
-	ActionNeeded, ClientMessage, ControlServerConfig, ControlServerHandle, LifecycleClientMessage,
-	LifecycleServerMessage, ReplyAnswer, ServerConfig, ServerHandle, ServerMessage, Verbosity,
-	protocol::SessionReady, start_control,
+	ActionIdentity, ActionNeeded, ClientMessage, ControlServerConfig, ControlServerHandle,
+	LifecycleClientMessage, LifecycleServerMessage, ReplyAnswer, ServerConfig, ServerHandle,
+	ServerMessage, Verbosity,
+	actions::RetireIfUnclaimed,
+	protocol::{
+		FileAttachment, SessionReady, TurnPhase, TurnStream, decode_workflow_gate_action_needed,
+	},
+	start_control,
 };
 use napi::{
 	bindgen_prelude::*,
@@ -25,6 +33,9 @@ use napi::{
 use napi_derive::napi;
 use parking_lot::Mutex;
 
+fn saturating_increment(counter: &AtomicU64) {
+	let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| value.checked_add(1));
+}
 /// Bound endpoint info returned from [`NotificationServer::start`].
 #[napi(object)]
 pub struct NotificationEndpoint {
@@ -41,7 +52,8 @@ pub struct NotificationEndpoint {
 /// A client reply forwarded to the TypeScript host for gate resolution.
 #[napi(object)]
 pub struct ReplyEvent {
-	/// The action id being answered (the real broker `gate_id` for asks).
+	/// The transient action/presentation id being answered. This is not the
+	/// durable workflow gate id.
 	pub id:               String,
 	/// JSON-encoded `ReplyAnswer` (number, string, or `{selected,custom}`).
 	pub answer_json:      String,
@@ -49,6 +61,24 @@ pub struct ReplyEvent {
 	pub idempotency_key:  Option<String>,
 	/// One-shot receipt binding this callback to the atomically claimed reply.
 	pub reply_receipt_id: String,
+}
+
+/// Opaque in-process presentation capability.
+///
+/// Returned by [`NotificationServer::register_arbitrated_ask`]. Pass it
+/// unchanged to [`NotificationServer::retire_if_unclaimed`]; do not construct,
+/// persist, inspect, or treat it as workflow-gate authority.
+#[napi(object)]
+pub struct PresentationLease {
+	pub action_id:          String,
+	pub registration_epoch: i64,
+}
+
+/// Public status of exact direct retirement. Claims and receipts remain native.
+#[napi(object)]
+pub struct RetireIfUnclaimedResult {
+	#[napi(ts_type = "'retired' | 'already_terminal' | 'claimed' | 'stale'")]
+	pub status: String,
 }
 
 /// Typed terminal acknowledgement result returned by acknowledgement promises.
@@ -137,15 +167,42 @@ pub struct SdkFrameEvent {
 	pub json:          String,
 }
 
+/// Callback delivering a connection's negotiated v3 capabilities
+/// (`connection_id`, `capabilities`) to TypeScript. Aliased to keep the
+/// `ThreadsafeFunction` payload out of complex nested type positions
+/// (`clippy::type_complexity`).
+type NegotiatedCapabilitiesFn = ThreadsafeFunction<(String, Vec<String>)>;
+
 /// In-process notification server handle exposed to TypeScript.
 #[napi]
 pub struct NotificationServer {
-	config:              Mutex<Option<ServerConfig>>,
-	handle:              Mutex<Option<ServerHandle>>,
-	on_reply:            Mutex<Option<ThreadsafeFunction<ReplyEvent>>>,
-	on_inbound:          Mutex<Option<ThreadsafeFunction<InboundEvent>>>,
-	on_frame:            Mutex<Option<ThreadsafeFunction<SdkFrameEvent>>>,
+	config: Mutex<Option<ServerConfig>>,
+	handle: Mutex<Option<ServerHandle>>,
+	/// The one current presentation that may be retired only by its exact lease.
+	/// This is private routing state, never workflow-gate authority.
+	arbitrated_presentation: Mutex<Option<ActionIdentity>>,
+	on_reply: Mutex<Option<ThreadsafeFunction<ReplyEvent>>>,
+	on_inbound: Mutex<Option<ThreadsafeFunction<InboundEvent>>>,
+	on_frame: Mutex<Option<ThreadsafeFunction<SdkFrameEvent>>>,
+	on_negotiated_capabilities: Mutex<Option<NegotiatedCapabilitiesFn>>,
 	on_connection_close: Mutex<Option<ThreadsafeFunction<String>>>,
+	pump_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+	stop_wait: tokio::sync::Mutex<()>,
+	known_good_turn_stream_frames: AtomicU64,
+	turn_stream_serde_validation_parses: AtomicU64,
+	file_attachment_base64_chars: AtomicU64,
+}
+
+/// Observable counters for the internal known-good N-API frame lane.
+#[napi(object)]
+pub struct KnownGoodFrameStats {
+	/// Frames constructed as `TurnStream` without parsing a JSON string.
+	pub known_good_turn_stream_frames:       f64,
+	/// JSON serde parses of externally supplied `turn_stream` frames.
+	pub turn_stream_serde_validation_parses: f64,
+	/// Base64 characters encoded in Rust for `file_attachment` frames (the JS
+	/// side crosses raw `Buffer` bytes and never allocates the base64 string).
+	pub file_attachment_rust_base64_chars:   f64,
 }
 
 #[napi]
@@ -168,12 +225,19 @@ impl NotificationServer {
 		// TS always owns gate resolution, so the core forwards replies.
 		config.forward_replies = true;
 		Self {
-			config:              Mutex::new(Some(config)),
-			handle:              Mutex::new(None),
-			on_reply:            Mutex::new(None),
-			on_inbound:          Mutex::new(None),
-			on_frame:            Mutex::new(None),
+			config: Mutex::new(Some(config)),
+			handle: Mutex::new(None),
+			arbitrated_presentation: Mutex::new(None),
+			on_reply: Mutex::new(None),
+			on_inbound: Mutex::new(None),
+			on_frame: Mutex::new(None),
+			on_negotiated_capabilities: Mutex::new(None),
 			on_connection_close: Mutex::new(None),
+			pump_tasks: Mutex::new(Vec::new()),
+			stop_wait: tokio::sync::Mutex::new(()),
+			known_good_turn_stream_frames: AtomicU64::new(0),
+			turn_stream_serde_validation_parses: AtomicU64::new(0),
+			file_attachment_base64_chars: AtomicU64::new(0),
 		}
 	}
 
@@ -195,6 +259,14 @@ impl NotificationServer {
 	#[napi(ts_args_type = "callback: (err: null | Error, frame: SdkFrameEvent) => void")]
 	pub fn on_sdk_frame(&self, callback: ThreadsafeFunction<SdkFrameEvent>) {
 		*self.on_frame.lock() = Some(callback);
+	}
+
+	/// Register the negotiated-capabilities callback. Must be called before
+	/// [`Self::start`].
+	#[napi(ts_args_type = "callback: (err: null | Error, connectionId: string, capabilities: \
+	                       string[]) => void")]
+	pub fn on_negotiated_capabilities(&self, callback: NegotiatedCapabilitiesFn) {
+		*self.on_negotiated_capabilities.lock() = Some(callback);
 	}
 
 	/// Register the connection-close callback. Must be called before
@@ -237,7 +309,7 @@ impl NotificationServer {
 			let mut rx = handle
 				.take_reply_receiver()
 				.ok_or_else(|| Error::from_reason("notification reply receiver unavailable"))?;
-			napi::tokio::spawn(async move {
+			let task = napi::tokio::spawn(async move {
 				while let Some(reply) = rx.recv().await {
 					let event = ReplyEvent {
 						id:               reply.reply.id,
@@ -249,13 +321,14 @@ impl NotificationServer {
 					tsfn.call(Ok(event), ThreadsafeFunctionCallMode::NonBlocking);
 				}
 			});
+			self.pump_tasks.lock().push(task);
 		}
 
 		// Pump forwarded inbound messages (injections / config commands) to TS.
 		let inbound_tsfn = self.on_inbound.lock().take();
 		let inbound_rx = handle.take_inbound_receiver();
 		if let (Some(tsfn), Some(mut rx)) = (inbound_tsfn, inbound_rx) {
-			napi::tokio::spawn(async move {
+			let task = napi::tokio::spawn(async move {
 				while let Some(msg) = rx.recv().await {
 					let event = match msg {
 						ClientMessage::UserMessage(u) => InboundEvent {
@@ -313,15 +386,30 @@ impl NotificationServer {
 					tsfn.call(Ok(event), ThreadsafeFunctionCallMode::NonBlocking);
 				}
 			});
+			self.pump_tasks.lock().push(task);
 		}
 
 		let frame_tsfn = self.on_frame.lock().take();
 		let frame_rx = handle.take_frame_receiver();
 		if let (Some(tsfn), Some(mut rx)) = (frame_tsfn, frame_rx) {
-			napi::tokio::spawn(async move {
+			let task = napi::tokio::spawn(async move {
 				while let Some((connection_id, json)) = rx.recv().await {
 					tsfn.call(
 						Ok(SdkFrameEvent { connection_id, json }),
+						ThreadsafeFunctionCallMode::NonBlocking,
+					);
+				}
+			});
+			self.pump_tasks.lock().push(task);
+		}
+
+		let capability_tsfn = self.on_negotiated_capabilities.lock().take();
+		let capability_rx = handle.take_capability_receiver();
+		if let (Some(tsfn), Some(mut rx)) = (capability_tsfn, capability_rx) {
+			napi::tokio::spawn(async move {
+				while let Some(update) = rx.recv().await {
+					tsfn.call(
+						Ok((update.connection_id, update.capabilities)),
 						ThreadsafeFunctionCallMode::NonBlocking,
 					);
 				}
@@ -331,11 +419,12 @@ impl NotificationServer {
 		let close_tsfn = self.on_connection_close.lock().take();
 		let close_rx = handle.take_close_receiver();
 		if let (Some(tsfn), Some(mut rx)) = (close_tsfn, close_rx) {
-			napi::tokio::spawn(async move {
+			let task = napi::tokio::spawn(async move {
 				while let Some(connection_id) = rx.recv().await {
 					tsfn.call(Ok(connection_id), ThreadsafeFunctionCallMode::NonBlocking);
 				}
 			});
+			self.pump_tasks.lock().push(task);
 		}
 
 		*self.handle.lock() = Some(handle);
@@ -352,7 +441,100 @@ impl NotificationServer {
 	#[napi]
 	pub fn register_ask(&self, needed_json: String, repliable: bool) -> Result<()> {
 		let needed = parse_needed(&needed_json)?;
-		self.with_handle(|h| h.register_ask(needed, repliable))
+		let handle = self.handle()?;
+		ensure_not_current_arbitrated_presentation(
+			self.arbitrated_presentation.lock().as_ref(),
+			handle.current_identity().as_ref(),
+			"registerAsk",
+		)?;
+		handle
+			.try_register_ask(needed, repliable)
+			.map_err(|error| Error::from_reason(error.to_string()))?;
+		Ok(())
+	}
+
+	/// Register a correlated workflow-gate ask. `workflow_json` must be an
+	/// `action_needed` wire frame carrying a nonempty `workflowGateId`.
+	#[napi]
+	pub fn register_workflow_gate_ask(&self, workflow_json: String, repliable: bool) -> Result<()> {
+		let workflow = decode_workflow_gate_action_needed(&workflow_json)
+			.map_err(|e| Error::from_reason(format!("invalid correlated ActionNeeded: {e}")))?
+			.ok_or_else(|| Error::from_reason("workflowGateId is required and must be nonempty"))?;
+		let handle = self.handle()?;
+		ensure_not_current_arbitrated_presentation(
+			self.arbitrated_presentation.lock().as_ref(),
+			handle.current_identity().as_ref(),
+			"registerWorkflowGateAsk",
+		)?;
+		handle
+			.register_workflow_gate_ask(workflow.action, workflow.workflow_gate_id, repliable)
+			.map_err(|error| Error::from_reason(error.to_string()))?;
+		Ok(())
+	}
+
+	/// Register an ask and return an opaque in-process capability. Pass it
+	/// unchanged to [`Self::retire_if_unclaimed`]; do not construct, persist,
+	/// inspect, or treat it as workflow-gate authority. A supplied
+	/// `workflowGateId` is preserved.
+
+	#[napi]
+	pub fn register_arbitrated_ask(
+		&self,
+		needed_json: String,
+		repliable: bool,
+	) -> Result<PresentationLease> {
+		let workflow = decode_workflow_gate_action_needed(&needed_json)
+			.map_err(|e| Error::from_reason(format!("invalid arbitrated ActionNeeded: {e}")))?;
+		let handle = self.handle()?;
+		let mut arbitrated_presentation = self.arbitrated_presentation.lock();
+		if is_current_arbitrated_presentation(
+			arbitrated_presentation.as_ref(),
+			handle.current_identity().as_ref(),
+		) {
+			return Err(Error::from_reason(
+				"registerArbitratedAsk cannot supersede an active arbitrated presentation; use \
+				 retireIfUnclaimed with its exact lease",
+			));
+		}
+		if let Some(workflow) = workflow {
+			handle
+				.register_workflow_gate_ask(workflow.action, workflow.workflow_gate_id, repliable)
+				.map_err(|error| Error::from_reason(error.to_string()))?;
+		} else {
+			handle
+				.try_register_ask(parse_needed(&needed_json)?, repliable)
+				.map_err(|error| Error::from_reason(error.to_string()))?;
+		}
+		let identity = handle.current_identity();
+		let lease = presentation_lease(identity.clone())?;
+		*arbitrated_presentation = identity;
+		Ok(lease)
+	}
+
+	/// Atomically terminalize the exact presentation named by an opaque lease.
+	/// The typed status proves whether it retired, was already terminal, was
+	/// claimed, or became stale without exposing claims, receipts, registration
+	/// state, or workflow-gate authority.
+	#[napi]
+	pub fn retire_if_unclaimed(&self, lease: PresentationLease) -> Result<RetireIfUnclaimedResult> {
+		let epoch = u64::try_from(lease.registration_epoch)
+			.map_err(|_| Error::from_reason("registrationEpoch must be nonnegative"))?;
+		let identity = ActionIdentity { id: lease.action_id, epoch };
+		let mut arbitrated_presentation = self.arbitrated_presentation.lock();
+		if arbitrated_presentation.as_ref() != Some(&identity) {
+			return Ok(RetireIfUnclaimedResult { status: "stale".to_owned() });
+		}
+		let outcome = self.with_handle(|h| h.terminalize_if_current(&identity))?;
+		let status = match &outcome {
+			RetireIfUnclaimed::Retired(_) => "retired",
+			RetireIfUnclaimed::AlreadyTerminal => "already_terminal",
+			RetireIfUnclaimed::Claimed => "claimed",
+			RetireIfUnclaimed::Stale => "stale",
+		};
+		if matches!(outcome, RetireIfUnclaimed::Retired(_) | RetireIfUnclaimed::AlreadyTerminal) {
+			*arbitrated_presentation = None;
+		}
+		Ok(RetireIfUnclaimedResult { status: status.to_owned() })
 	}
 
 	/// Broadcast an ephemeral `action_needed` idle ping. `needed_json` is JSON
@@ -381,19 +563,99 @@ impl NotificationServer {
 		// N-API `index.d.ts` signature/docs remain byte-stable for issue #2029.
 		let msg: ServerMessage = serde_json::from_str(&frame_json)
 			.map_err(|e| Error::from_reason(format!("invalid frame json: {e}")))?;
+		if matches!(msg, ServerMessage::TurnStream(_)) {
+			saturating_increment(&self.turn_stream_serde_validation_parses);
+		}
 		self
 			.with_handle(|h| h.push_frame(msg))?
 			.map_err(|error| Error::from_reason(error.to_string()))
 	}
 
-	/// Send raw JSON to one connected v3 SDK client.
+	/// Broadcast a TypeScript-constructed turn frame without re-parsing JSON.
+	/// External frames must continue through [`Self::push_frame`] for serde
+	/// validation.
+	#[napi]
+	pub fn push_turn_stream_unchecked(
+		&self,
+		session_id: String,
+		phase: String,
+		text: String,
+		final_answer: Option<bool>,
+		message_ref: Option<String>,
+	) -> Result<()> {
+		let phase = match phase.as_str() {
+			"live" => TurnPhase::Live,
+			"finalized" => TurnPhase::Finalized,
+			_ => return Err(Error::from_reason("invalid turn stream phase")),
+		};
+		saturating_increment(&self.known_good_turn_stream_frames);
+		self
+			.with_handle(|h| {
+				h.push_frame(ServerMessage::TurnStream(TurnStream {
+					session_id,
+					phase,
+					text,
+					final_answer,
+					message_ref,
+				}))
+			})?
+			.map_err(|error| Error::from_reason(error.to_string()))
+	}
+
+	/// Broadcast a file attachment from raw N-API bytes, encoding the unchanged
+	/// base64 wire field only in Rust.
+	#[napi]
+	pub fn push_file_attachment_unchecked(
+		&self,
+		session_id: String,
+		name: String,
+		mime: Option<String>,
+		data: Buffer,
+		caption: Option<String>,
+	) -> Result<()> {
+		self
+			.with_handle(|h| {
+				h.push_frame(ServerMessage::FileAttachment(FileAttachment {
+					session_id,
+					name,
+					mime,
+					data: encode_base64(&data, &self.file_attachment_base64_chars),
+					caption,
+				}))
+			})?
+			.map_err(|error| Error::from_reason(error.to_string()))
+	}
+
+	/// Return counters guarding the known-good frame crossing against
+	/// regressions.
+	#[napi]
+	#[must_use]
+	pub fn known_good_frame_stats(&self) -> KnownGoodFrameStats {
+		let known_good_turn_stream_frames =
+			self.known_good_turn_stream_frames.load(Ordering::Relaxed);
+		let turn_stream_serde_validation_parses = self
+			.turn_stream_serde_validation_parses
+			.load(Ordering::Relaxed);
+		let file_attachment_rust_base64_chars =
+			self.file_attachment_base64_chars.load(Ordering::Relaxed);
+		KnownGoodFrameStats {
+			known_good_turn_stream_frames:       known_good_turn_stream_frames as f64,
+			turn_stream_serde_validation_parses: turn_stream_serde_validation_parses as f64,
+			file_attachment_rust_base64_chars:   file_attachment_rust_base64_chars as f64,
+		}
+	}
+
+	/// Send a validated, bounded JSON envelope to one connected v3 SDK client.
 	#[napi]
 	pub fn send_to(&self, connection_id: String, json: String) -> Result<()> {
 		let handle = self.handle()?;
 		if handle.send_to(&connection_id, json) {
 			Ok(())
 		} else {
-			Err(Error::from_reason("SDK connection is not available"))
+			Err(Error::from_reason(
+				"SDK connection is unavailable or directed frame is invalid, oversized, or \
+				 unauthorized",
+			))
 		}
 	}
 
@@ -412,15 +674,21 @@ impl NotificationServer {
 		self.with_handle(|h| h.push_session_ready(ready))
 	}
 
-	/// Resolve an action locally (the CLI/TUI answered). `answer_json` is an
-	/// optional JSON `ReplyAnswer`.
-	///
-	/// # Errors
-	/// Fails if not started or `answer_json` is invalid.
+	/// Resolve a legacy/non-arbitrated action locally (the CLI/TUI answered).
+	/// Arbitrated presentations require their opaque exact lease to be passed to
+	/// [`Self::retire_if_unclaimed`], so an id-only local resolution fails
+	/// closed.
 	#[napi]
 	pub fn resolve_local(&self, id: String, answer_json: Option<String>) -> Result<()> {
 		let answer = parse_answer(answer_json.as_deref())?;
-		self.with_handle(|h| h.resolve_local(&id, answer))
+		let handle = self.handle()?;
+		ensure_not_current_arbitrated_presentation(
+			self.arbitrated_presentation.lock().as_ref(),
+			handle.current_identity().as_ref(),
+			"resolveLocal",
+		)?;
+		handle.resolve_local(&id, answer);
+		Ok(())
 	}
 
 	/// Resolve an unclaimed legacy action. Forward-mode replies are
@@ -436,7 +704,13 @@ impl NotificationServer {
 		idempotency_key: Option<String>,
 	) -> Result<()> {
 		let answer = parse_answer(answer_json.as_deref())?;
-		if !self.with_handle(|h| h.resolve_client(&id, answer, idempotency_key))? {
+		let handle = self.handle()?;
+		ensure_not_current_arbitrated_presentation(
+			self.arbitrated_presentation.lock().as_ref(),
+			handle.current_identity().as_ref(),
+			"resolveClient",
+		)?;
+		if !handle.resolve_client(&id, answer, idempotency_key) {
 			return Err(Error::from_reason("claimed action requires resolveClaim with its receipt"));
 		}
 		Ok(())
@@ -574,6 +848,22 @@ impl NotificationServer {
 		if let Ok(handle) = self.handle() {
 			handle.stop();
 		}
+	}
+
+	/// Stop the server and resolve only after all native socket owners exit.
+	#[napi]
+	pub async fn stop_and_wait(&self) -> Result<()> {
+		let _stop = self.stop_wait.lock().await;
+		let handle = self.handle.lock().take();
+		if let Some(handle) = handle {
+			handle.stop_and_wait().await;
+			drop(handle);
+		}
+		let tasks = std::mem::take(&mut *self.pump_tasks.lock());
+		for task in tasks {
+			let _ = task.await;
+		}
+		Ok(())
 	}
 
 	fn with_handle<T, F: FnOnce(&ServerHandle) -> T>(&self, f: F) -> Result<T> {
@@ -750,8 +1040,161 @@ impl NotificationControlServer {
 	}
 }
 
+fn presentation_lease(identity: Option<ActionIdentity>) -> Result<PresentationLease> {
+	let identity =
+		identity.ok_or_else(|| Error::from_reason("action registration did not produce a lease"))?;
+	let registration_epoch = i64::try_from(identity.epoch).map_err(|_| {
+		Error::from_reason("action registration epoch exceeds JavaScript integer range")
+	})?;
+	Ok(PresentationLease { action_id: identity.id, registration_epoch })
+}
+
+fn is_current_arbitrated_presentation(
+	arbitrated: Option<&ActionIdentity>,
+	current: Option<&ActionIdentity>,
+) -> bool {
+	matches!((arbitrated, current), (Some(arbitrated), Some(current)) if arbitrated == current)
+}
+
+fn ensure_not_current_arbitrated_presentation(
+	arbitrated: Option<&ActionIdentity>,
+	current: Option<&ActionIdentity>,
+	method: &str,
+) -> Result<()> {
+	if is_current_arbitrated_presentation(arbitrated, current) {
+		return Err(Error::from_reason(format!(
+			"{method} is unsafe for an arbitrated presentation; use retireIfUnclaimed with its exact \
+			 lease"
+		)));
+	}
+	Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+	use super::{ActionIdentity, PresentationLease, ensure_not_current_arbitrated_presentation};
+
+	#[test]
+	fn exact_arbitrated_presentation_blocks_local_and_client_id_only_resolution() {
+		let arbitrated = ActionIdentity { id: "presentation".to_owned(), epoch: 2 };
+		for method in ["resolveLocal", "resolveClient"] {
+			let error = ensure_not_current_arbitrated_presentation(
+				Some(&arbitrated),
+				Some(&arbitrated),
+				method,
+			)
+			.expect_err("exact arbitrated presentation must reject id-only resolution");
+			assert!(error.reason.contains(method));
+		}
+	}
+
+	#[test]
+	fn stale_or_missing_arbitrated_presentation_does_not_block_legacy_resolution() {
+		let arbitrated = ActionIdentity { id: "presentation".to_owned(), epoch: 2 };
+		assert!(
+			ensure_not_current_arbitrated_presentation(
+				Some(&arbitrated),
+				Some(&ActionIdentity { id: "presentation".to_owned(), epoch: 3 }),
+				"resolveClient",
+			)
+			.is_ok()
+		);
+		assert!(
+			ensure_not_current_arbitrated_presentation(Some(&arbitrated), None, "resolveLocal")
+				.is_ok()
+		);
+	}
+
+	#[tokio::test]
+	async fn active_arbitrated_lease_rejects_legacy_replacement_without_clearing_the_fence() {
+		let server =
+			super::NotificationServer::new("session".to_owned(), "token".to_owned(), None, Some(true));
+		server.start().await.expect("server starts");
+		let arbitrated = r#"{"id":"presentation","kind":"ask","sessionId":"session","question":"question","controls":[]}"#;
+		let lease = server
+			.register_arbitrated_ask(arbitrated.to_owned(), true)
+			.expect("initial arbitrated registration succeeds");
+
+		let superseding = r#"{"id":"superseding","kind":"ask","sessionId":"session","question":"question","controls":[]}"#;
+		let error = match server.register_arbitrated_ask(superseding.to_owned(), true) {
+			Ok(_) => panic!("a distinct arbitrated registration cannot supersede an active lease"),
+			Err(error) => error,
+		};
+		assert!(error.reason.contains("registerArbitratedAsk"));
+		assert_eq!(
+			server
+				.retire_if_unclaimed(PresentationLease {
+					action_id:          "presentation".to_owned(),
+					registration_epoch: lease.registration_epoch + 1,
+				})
+				.expect("forged lease is rejected without touching the registry")
+				.status,
+			"stale"
+		);
+		assert!(
+			server
+				.resolve_client("presentation".to_owned(), None, None)
+				.is_err(),
+			"a forged lease cannot retire the active arbitrated presentation"
+		);
+		for (method, result) in [
+			(
+				"registerAsk",
+				server.register_ask(
+					r#"{"id":"legacy","kind":"ask","sessionId":"session","question":"question","controls":[]}"#.to_owned(),
+					true,
+				),
+			),
+			(
+				"registerWorkflowGateAsk",
+				server.register_workflow_gate_ask(
+					r#"{"type":"action_needed","id":"legacy-workflow","kind":"ask","sessionId":"session","question":"question","controls":[],"workflowGateId":"gate"}"#.to_owned(),
+					true,
+				),
+			),
+		] {
+			let error = result.expect_err("legacy registration cannot replace an active arbitrated lease");
+			assert!(error.reason.contains(method));
+		}
+		assert!(
+			server
+				.resolve_client("presentation".to_owned(), None, None)
+				.is_err(),
+			"rejected legacy registrations preserve the arbitrated fence"
+		);
+
+		assert_eq!(
+			server
+				.retire_if_unclaimed(lease)
+				.expect("exact lease retires")
+				.status,
+			"retired"
+		);
+		server
+			.register_ask(
+				r#"{"id":"legacy","kind":"ask","sessionId":"session","question":"question","controls":[]}"#.to_owned(),
+				true,
+			)
+			.expect("legacy registration succeeds after the arbitrated lease is no longer active");
+		assert!(
+			server
+				.resolve_client("legacy".to_owned(), None, None)
+				.is_ok()
+		);
+		server.stop();
+	}
+}
+
 fn parse_needed(json: &str) -> Result<ActionNeeded> {
-	serde_json::from_str(json).map_err(|e| Error::from_reason(format!("invalid ActionNeeded: {e}")))
+	let value: serde_json::Value = serde_json::from_str(json)
+		.map_err(|e| Error::from_reason(format!("invalid ActionNeeded: {e}")))?;
+	if value.get("workflowGateId").is_some() {
+		return Err(Error::from_reason(
+			"registerAsk does not accept workflowGateId; use registerWorkflowGateAsk",
+		));
+	}
+	serde_json::from_value(value)
+		.map_err(|e| Error::from_reason(format!("invalid ActionNeeded: {e}")))
 }
 
 /// Serialize a lifecycle request for the JS callback with the raw control token
@@ -786,4 +1229,30 @@ fn parse_reason(reason: Option<&str>) -> gjc_sdk::RejectReason {
 		Some("unauthorized") => RejectReason::Unauthorized,
 		_ => RejectReason::InvalidAnswer,
 	}
+}
+
+/// Encode bytes for the unchanged JSON WebSocket wire schema without allocating
+/// a JavaScript base64 string at the N-API boundary.
+fn encode_base64(bytes: &[u8], chars_counter: &AtomicU64) -> String {
+	const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+	let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
+	for chunk in bytes.chunks(3) {
+		let first = chunk[0];
+		let second = *chunk.get(1).unwrap_or(&0);
+		let third = *chunk.get(2).unwrap_or(&0);
+		encoded.push(char::from(TABLE[usize::from(first >> 2)]));
+		encoded.push(char::from(TABLE[usize::from((first & 0b0000_0011) << 4 | second >> 4)]));
+		encoded.push(if chunk.len() > 1 {
+			char::from(TABLE[usize::from((second & 0b0000_1111) << 2 | third >> 6)])
+		} else {
+			'='
+		});
+		encoded.push(if chunk.len() > 2 {
+			char::from(TABLE[usize::from(third & 0b0011_1111)])
+		} else {
+			'='
+		});
+	}
+	chars_counter.fetch_add(encoded.len() as u64, Ordering::Relaxed);
+	encoded
 }

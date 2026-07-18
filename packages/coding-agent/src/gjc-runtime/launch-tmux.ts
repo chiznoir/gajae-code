@@ -7,7 +7,10 @@ import { safeStderrWrite } from "@gajae-code/utils/safe-stderr";
 import type { Args } from "../cli/args";
 import { tmuxRuntimeSessionPath } from "./session-layout";
 import {
+	GJC_COORDINATOR_SESSION_BRANCH_ENV,
 	GJC_COORDINATOR_SESSION_ID_ENV,
+	GJC_COORDINATOR_SESSION_LAUNCH_ID_ENV,
+	GJC_COORDINATOR_SESSION_READINESS_FILE_ENV,
 	GJC_COORDINATOR_SESSION_STATE_FILE_ENV,
 	GJC_TMUX_OWNER_GENERATION_ENV,
 	GJC_TMUX_OWNER_SERVER_KEY_ENV,
@@ -46,18 +49,25 @@ import {
 	type GjcTmuxSessionStatus,
 	proveGjcTmuxSessionMutationTarget,
 } from "./tmux-sessions";
+import {
+	buildWindowsPowerShellInnerCommand,
+	GJC_TMUX_LAUNCHED_ENV,
+	type WindowsPowerShellInnerCommandOptions,
+} from "./windows-powershell-command";
 
+export type { WindowsPowerShellInnerCommandOptions };
 export {
 	buildGjcTmuxExactSessionTarget,
 	buildGjcTmuxProfileCommands,
+	buildWindowsPowerShellInnerCommand,
 	GJC_DEFAULT_TMUX_SESSION,
 	GJC_TMUX_COMMAND_ENV,
+	GJC_TMUX_LAUNCHED_ENV,
 	GJC_TMUX_MOUSE_ENV,
 	GJC_TMUX_PROFILE_ENV,
 	GJC_TMUX_SESSION_PREFIX,
 };
 
-export const GJC_TMUX_LAUNCHED_ENV = "GJC_TMUX_LAUNCHED";
 export const GJC_LAUNCH_POLICY_ENV = "GJC_LAUNCH_POLICY";
 export const GJC_TMUX_WINDOW_LABEL_MAX_WIDTH = 48;
 
@@ -163,6 +173,108 @@ function allowsExistingTmuxAttach(parsed: Args, env: NodeJS.ProcessEnv): boolean
 	// value-less resume can show the session picker and valued resume can honor the target.
 	return Boolean(parsed.continue || explicitTmuxSessionName(env));
 }
+type WindowsPsmuxCompatibilityState = "fresh" | "continuation" | "managed";
+
+function windowsPsmuxCompatibilityState(plan: TmuxLaunchPlan, env: NodeJS.ProcessEnv): WindowsPsmuxCompatibilityState {
+	const marker = (value: string | undefined): boolean => Boolean(value?.trim());
+	if (
+		marker(env.GJC_SESSION_ID) ||
+		marker(env[GJC_COORDINATOR_SESSION_ID_ENV]) ||
+		marker(env[GJC_COORDINATOR_SESSION_BRANCH_ENV]) ||
+		marker(env[GJC_COORDINATOR_SESSION_LAUNCH_ID_ENV]) ||
+		marker(env[GJC_COORDINATOR_SESSION_READINESS_FILE_ENV]) ||
+		marker(env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]) ||
+		marker(env[GJC_TMUX_ACTIVE_SESSION_ENV]) ||
+		marker(env[GJC_TMUX_OWNER_GENERATION_ENV]) ||
+		marker(env[GJC_TMUX_OWNER_STATE_DIR_ENV]) ||
+		marker(env[GJC_TMUX_OWNER_SERVER_KEY_ENV]) ||
+		Object.entries(env).some(([key, value]) => key.startsWith("GJC_TEAM_") && marker(value))
+	)
+		return "managed";
+	return plan.attachSessionName ? "continuation" : "fresh";
+}
+
+type PsmuxSessionInventory =
+	| { kind: "available"; names: ReadonlySet<string> }
+	| { kind: "no-server" }
+	| { kind: "unverifiable"; result: TmuxSpawnResult };
+
+function classifyPsmuxSessionInventory(result: TmuxSpawnResult): PsmuxSessionInventory {
+	if (result.exitCode === 0) {
+		const names = new Set(
+			(result.stdout ?? "")
+				.split(/\r?\n/)
+				.map(name => name.trim())
+				.filter(Boolean),
+		);
+		return { kind: "available", names };
+	}
+	const stderr = result.stderr?.trim() ?? "";
+	if (/\bno server running\b/i.test(stderr)) return { kind: "no-server" };
+	return { kind: "unverifiable", result };
+}
+
+function launchWindowsPsmuxCompatibilitySession(
+	plan: TmuxLaunchPlan,
+	env: NodeJS.ProcessEnv,
+	spawnSync: TmuxSpawnSync,
+	diagnostic: (message: string) => void,
+): boolean {
+	const options: TmuxSpawnOptions = {
+		cwd: plan.cwd,
+		env,
+		stdin: "pipe",
+		stdout: "pipe",
+		stderr: "pipe",
+		captureStderr: true,
+	};
+	const attachOptions: TmuxSpawnOptions = { ...options, stdin: "inherit", stdout: "inherit", stderr: "inherit" };
+	const state = windowsPsmuxCompatibilityState(plan, env);
+	if (state === "managed") {
+		diagnostic("psmux cannot provide immutable owner identity; refusing managed session creation.\n");
+		throw new Error("gjc_tmux_owner_isolation_native_session_identity_unavailable");
+	}
+
+	const targetName = plan.attachSessionName ?? plan.sessionName;
+	const inventory = (): PsmuxSessionInventory =>
+		classifyPsmuxSessionInventory(spawnSync(plan.tmuxCommand, ["list-sessions", "-F", "#{session_name}"], options));
+
+	if (state === "continuation") {
+		const existing = inventory();
+		const detail = existing.kind === "unverifiable" ? existing.result.stderr : undefined;
+		diagnostic(
+			formatTmuxLaunchDiagnostic(
+				existing.kind === "available" && existing.names.has(targetName)
+					? "existing psmux session is name-only and cannot be attached safely"
+					: "existing session target not found",
+				detail,
+			),
+		);
+		return true;
+	}
+
+	const before = inventory();
+	if (before.kind === "unverifiable") {
+		diagnostic(formatTmuxLaunchDiagnostic("fresh session inventory failed", before.result.stderr));
+		return true;
+	}
+	if (before.kind === "available" && before.names.has(targetName)) {
+		diagnostic("tmux fresh session target already exists; preserving session without mutation.\n");
+		return true;
+	}
+	const detachedIndex = plan.newSessionArgs.indexOf("-d");
+	const foregroundArgs =
+		detachedIndex < 0
+			? plan.newSessionArgs
+			: [...plan.newSessionArgs.slice(0, detachedIndex), ...plan.newSessionArgs.slice(detachedIndex + 1)];
+	const created = spawnSync(plan.tmuxCommand, foregroundArgs, attachOptions);
+	if (created.exitCode !== 0) {
+		const wrapperWarning = detectCorruptedGjcWrapper();
+		const suffix = wrapperWarning ? ` Wrapper warning: ${wrapperWarning}` : "";
+		diagnostic(formatTmuxLaunchDiagnostic("foreground new-session failed", created.stderr) + suffix);
+	}
+	return true;
+}
 
 function findExistingSessionForLaunch(context: {
 	env: NodeJS.ProcessEnv;
@@ -214,20 +326,6 @@ function buildPosixTmuxExitMarkerPrefix(markerPath: string): string {
 	].join("; ");
 }
 
-function buildPowerShellTmuxExitMarkerFinally(markerPath: string): string {
-	const markerDir = path.win32.dirname(markerPath);
-	return [
-		"} finally {",
-		"\ttry {",
-		`\t\tNew-Item -ItemType Directory -Force -Path ${powershellQuote(markerDir)} -ErrorAction Stop | Out-Null`,
-		"\t\t$__gjcTmuxExitMarker = @{ schema_version = 1; source = 'tmux_inner_shell'; ended_at = (Get-Date).ToUniversalTime().ToString('o'); exit_code = $__gjcTmuxExitCode } | ConvertTo-Json -Compress",
-		`\t\tSet-Content -LiteralPath ${powershellQuote(markerPath)} -Value $__gjcTmuxExitMarker -Encoding UTF8 -ErrorAction Stop`,
-		"\t} catch {",
-		"\t}",
-		"}",
-	].join("\n");
-}
-
 interface CommandResolutionContext {
 	cwd: string;
 	argv: string[];
@@ -258,7 +356,13 @@ function isInteractiveRootLaunch(parsed: Args, tty: TtyState): boolean {
 }
 
 function isBunVirtualPath(value: string | undefined): boolean {
-	return value?.startsWith("/$bunfs/") === true;
+	const normalized = value?.trim().replace(/\\/g, "/").toLowerCase();
+	return (
+		normalized === "/$bunfs" ||
+		normalized?.startsWith("/$bunfs/") === true ||
+		normalized === "b:/~bun" ||
+		normalized?.startsWith("b:/~bun/") === true
+	);
 }
 
 const MAX_TMUX_DIAGNOSTIC_DETAIL_CODE_POINTS = 240;
@@ -347,53 +451,8 @@ function buildEnvAssignments(values: Record<string, string> | undefined): string
 	const entries = Object.entries(values ?? {});
 	return entries.length === 0 ? "" : ` ${entries.map(([key, value]) => `${key}=${shellQuote(value)}`).join(" ")}`;
 }
-function powershellQuote(value: string): string {
-	return `'${value.replace(/'/g, "''")}'`;
-}
 function stripRootTmuxFlag(rawArgs: string[]): string[] {
 	return rawArgs.filter(arg => arg !== "--tmux");
-}
-
-function buildWindowsPowerShellInnerCommand(context: CommandResolutionContext, rawArgs: string[]): string {
-	const command = resolveCurrentGjcCommand(context);
-	const envLines = Object.entries({ [GJC_TMUX_LAUNCHED_ENV]: "1", ...(context.extraEnv ?? {}) }).map(
-		([key, value]) => `$env:${key} = ${powershellQuote(value)}`,
-	);
-	// Resolve the inner command and arguments. PowerShell's `&` call operator
-	// accepts a single command followed by its arguments directly (no script
-	// block needed). Wrapping the call in `& { ... }` would be invalid because
-	// adjacent single-quoted tokens inside a script block body are a parser
-	// error: `& { 'a' 'b' }` fails with "Unexpected token 'b'" because PowerShell
-	// only concatenates adjacent *double-quoted* strings, and even then only in
-	// expression position. Emitting the arguments as a comma-separated array
-	// (`& 'cmd' @('a','b')`) is also rejected because arrays are not valid as
-	// the second-and-later positional arguments to `&` in command position. The
-	// correct form is `& 'cmd' 'arg1' 'arg2'` — exactly what the joined
-	// resolvedCommand + innerArgs produces below.
-	const resolvedCommand = command.map(powershellQuote).join(" ");
-	const innerArgs = stripRootTmuxFlag(rawArgs).map(powershellQuote).join(" ");
-	const invocation = `& ${resolvedCommand} ${innerArgs}`;
-	const exitLine = "if ($null -ne $LASTEXITCODE) { exit $LASTEXITCODE } else { exit 1 }";
-	const script = context.tmuxExitMarkerPath
-		? [
-				...envLines,
-				"$__gjcTmuxExitCode = 1",
-				"try {",
-				`\t${invocation}`,
-				"\tif ($null -ne $LASTEXITCODE) { $__gjcTmuxExitCode = $LASTEXITCODE } else { $__gjcTmuxExitCode = 1 }",
-				buildPowerShellTmuxExitMarkerFinally(context.tmuxExitMarkerPath),
-				"exit $__gjcTmuxExitCode",
-			].join("\n")
-		: [...envLines, invocation, exitLine].join("\n");
-	// Encode the script as UTF-16LE base64 for pwsh -EncodedCommand. Do NOT
-	// prepend a UTF-16LE BOM (0xFF 0xFE): the BOM survives the decode and is
-	// inserted as a literal U+FEFF character in front of the first script
-	// token, which pwsh then reports as a "term not recognized" parse error
-	// (e.g. "﻿$env:GJC_TMUX_LAUNCHED"). pwsh expects the decoded buffer to
-	// start with the first character of the script, not with a BOM.
-	const body = Buffer.from(script, "utf16le");
-	const encodedCommand = body.toString("base64");
-	return `pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand ${encodedCommand}`;
 }
 
 export function applyGjcTmuxProfile(context: GjcTmuxProfileContext): GjcTmuxProfileResult {
@@ -441,19 +500,41 @@ export function applyGjcTmuxProfile(context: GjcTmuxProfileContext): GjcTmuxProf
 }
 
 function resolveCurrentGjcCommand(context: CommandResolutionContext): string[] {
-	const entrypoint = context.argv[1];
-	if (!entrypoint) return ["gjc"];
-	if (isBunVirtualPath(entrypoint)) {
-		return isBunVirtualPath(context.execPath) ? ["gjc"] : [context.execPath];
-	}
 	const pathModule = pathModuleForPlatform(context.platform);
-	const resolvedEntrypoint = pathModule.isAbsolute(entrypoint)
-		? entrypoint
-		: pathModule.resolve(context.cwd, entrypoint);
-	if (entrypoint.endsWith(".ts") || entrypoint.endsWith(".js") || entrypoint.endsWith(".mjs")) {
-		return [context.execPath, resolvedEntrypoint];
+	const isRealAbsolutePath = (value: string | undefined): value is string => {
+		const normalized = value?.trim();
+		if (!normalized || isBunVirtualPath(normalized)) return false;
+		return pathModule.isAbsolute(normalized) || path.isAbsolute(normalized);
+	};
+	const isGjcExecutable = (value: string | undefined): value is string =>
+		isRealAbsolutePath(value) && /^gjc(?:[._-]|$)/i.test(pathModule.basename(value.trim()));
+
+	const runtime = context.argv[0]?.trim();
+	const entrypoint = context.argv[1]?.trim();
+	if (entrypoint && !isBunVirtualPath(entrypoint) && /\.(?:[cm]?[jt]s)$/i.test(entrypoint)) {
+		const executable = isRealAbsolutePath(runtime)
+			? runtime
+			: isRealAbsolutePath(context.execPath)
+				? context.execPath.trim()
+				: undefined;
+		if (!executable)
+			throw new Error(
+				"Unable to determine the current GJC source runtime for tmux launch; invoke GJC through an absolute runtime path.",
+			);
+		const resolvedEntrypoint = pathModule.isAbsolute(entrypoint)
+			? entrypoint
+			: pathModule.resolve(context.cwd, entrypoint);
+		return [executable, resolvedEntrypoint];
 	}
-	return [resolvedEntrypoint];
+
+	const executable =
+		(isGjcExecutable(entrypoint) ? entrypoint : undefined) ??
+		(isGjcExecutable(runtime) ? runtime : undefined) ??
+		(isGjcExecutable(context.execPath) ? context.execPath.trim() : undefined);
+	if (executable) return [executable];
+	throw new Error(
+		"Unable to determine the current GJC executable for tmux launch; Bun virtual paths and PATH fallback are not accepted.",
+	);
 }
 function isWindowsPlatform(platform: NodeJS.Platform | undefined): boolean {
 	return platform === "win32";
@@ -463,7 +544,13 @@ function pathModuleForPlatform(platform: NodeJS.Platform | undefined): typeof pa
 }
 
 function buildInnerCommand(context: CommandResolutionContext, rawArgs: string[]): string {
-	if (isWindowsPlatform(context.platform)) return buildWindowsPowerShellInnerCommand(context, rawArgs);
+	if (isWindowsPlatform(context.platform))
+		return buildWindowsPowerShellInnerCommand({
+			command: resolveCurrentGjcCommand(context),
+			args: stripRootTmuxFlag(rawArgs),
+			environment: context.extraEnv,
+			tmuxExitMarkerPath: context.tmuxExitMarkerPath,
+		});
 	const command = resolveCurrentGjcCommand(context);
 	const quoted = [...command, ...stripRootTmuxFlag(rawArgs)].map(shellQuote).join(" ");
 	const invocation = `env ${GJC_TMUX_LAUNCHED_ENV}=1${buildEnvAssignments(context.extraEnv)} ${quoted}`;
@@ -1175,12 +1262,17 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 	// window rename and provider refusal so inapplicable root launches reach main
 	// unchanged, while unsupported managed launches fail before any tmux mutation.
 	const plan = buildDefaultTmuxLaunchPlan(context);
-	if (plan?.isPsmux) {
-		(context.diagnosticWriter ?? safeStderrWrite)(
-			"psmux cannot provide immutable owner identity; refusing managed session creation.\n",
-		);
-		throw new Error("gjc_tmux_owner_isolation_native_session_identity_unavailable");
+	if (!plan && env.TMUX && (context.platform ?? process.platform) === "win32") {
+		const ambientProvider = resolveGjcTmuxBinary({ platform: "win32", env });
+		if (ambientProvider.isPsmux) return false;
 	}
+	if (plan?.isPsmux && plan.platform === "win32" && !env.TMUX)
+		return launchWindowsPsmuxCompatibilitySession(
+			plan,
+			env,
+			context.spawnSync ?? defaultSpawnSync,
+			context.diagnosticWriter ?? safeStderrWrite,
+		);
 	// Direct launches inside an ambient tmux session retain their existing title
 	// behavior, but only after managed-launch applicability was ruled out.
 	renameExistingTmuxWindowIfNeeded(context);
@@ -1218,14 +1310,6 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 		context.ownerIsolationProbe ?? defaultOwnerIsolationProbe(plan, env, rawSpawnSync, context.callerCgroupReader);
 	const spawnSync = rawSpawnSync;
 	const attachOptions: TmuxSpawnOptions = { ...options };
-	// Psmux is rejected before planning any tmux mutation, including an ambient
-	// TMUX window rename. Keep this defense in depth guard for future plan seams.
-	if (plan.isPsmux) {
-		(context.diagnosticWriter ?? safeStderrWrite)(
-			"psmux cannot provide immutable owner identity; refusing managed session creation.\n",
-		);
-		throw new Error("gjc_tmux_owner_isolation_native_session_identity_unavailable");
-	}
 	const controlOptions: TmuxSpawnOptions = {
 		...options,
 		stdin: "pipe",

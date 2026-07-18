@@ -17,7 +17,7 @@ import { existsSync } from "node:fs";
 import type { AgentWireOwnerObservation } from "../modes/shared/agent-wire/event-contract";
 import { observeAgentWireFrame } from "../modes/shared/agent-wire/event-observation";
 import { classifyRecovery } from "./classifier";
-import { ControlServer, type EndpointRequest } from "./control-endpoint";
+import { ControlServer, type EndpointHandler, type EndpointRequest } from "./control-endpoint";
 import { defaultFinalizeChecks, type FinalizeChecks, runFinalize, type ValidationCommandSpec } from "./finalize";
 import { type OperateResult, operate } from "./operate";
 import { preserveDirtyWorktree } from "./preserve";
@@ -35,11 +35,17 @@ import {
 	canWriteEvents,
 	classifyLeaseStatus,
 	heartbeat,
+	LeaseError,
 	readLease,
 	releaseLease,
 	type SessionLease,
 } from "./session-lease";
-import { type HarnessSessionTransport, type SessionStateSnapshot, singleFlightAccept } from "./session-transport";
+import {
+	type HarnessSessionTransport,
+	type HarnessSessionTransportCloseContext,
+	type SessionStateSnapshot,
+	singleFlightAccept,
+} from "./session-transport";
 import { buildStateView, nextAllowedActions, submitUnavailableReason } from "./state-machine";
 import {
 	appendEvent,
@@ -78,6 +84,22 @@ function reconcileLiveOwnerState(state: SessionState): { state: SessionState; re
 	};
 }
 
+function flattenAggregateCauses(errors: readonly unknown[]): unknown[] {
+	const causes: unknown[] = [];
+	for (const error of errors) {
+		if (error instanceof AggregateError) causes.push(...flattenAggregateCauses(error.errors));
+		else causes.push(error);
+	}
+	return causes;
+}
+
+/**
+ * Nominal sentinel: raised only after #stopOnce has verified teardown so the
+ * retry loop can rethrow it immediately. A private class prevents a lookalike
+ * cleanup AggregateError (message collision) from bypassing verification retries.
+ */
+class FramePumpAfterVerifiedCleanupError extends AggregateError {}
+
 export interface OwnerOptions {
 	root: string;
 	sessionId: string;
@@ -89,6 +111,18 @@ export interface OwnerOptions {
 	clock?: () => number;
 	finalizeChecks?: FinalizeChecks;
 	validationCommands?: ValidationCommandSpec[];
+	/** Test seam for deterministic control-endpoint teardown failures. */
+	controlServerFactory?: (socketPath: string, handler: EndpointHandler) => ControlServer;
+	/** Test seam for deterministic lease-release teardown failures. */
+	leaseRelease?: typeof releaseLease;
+	/** Test seams for frame persistence failures. */
+	framePersistence?: {
+		appendEvent?: typeof appendEvent;
+		writeSessionState?: typeof writeSessionState;
+	};
+	/** Test seams; production retries verified shutdown without a finite limit. */
+	cleanupRetryMs?: number;
+	cleanupRetryLimit?: number;
 }
 
 export interface OwnerStartInfo {
@@ -100,20 +134,35 @@ export interface OwnerStartInfo {
 const DEFAULT_TTL_MS = 30_000;
 const DEFAULT_HEARTBEAT_MS = 10_000;
 const DEFAULT_ACCEPT_TIMEOUT_MS = 60_000;
+const DEFAULT_CLEANUP_RETRY_MS = 500;
+const MAX_RETAINED_CLEANUP_FAILURES = 32;
 
 export class RuntimeOwner {
 	readonly ownerId: string;
-	#opts: Required<Omit<OwnerOptions, "clock" | "finalizeChecks" | "validationCommands">> & { clock?: () => number };
+	#opts: Required<
+		Omit<
+			OwnerOptions,
+			"clock" | "finalizeChecks" | "validationCommands" | "controlServerFactory" | "framePersistence"
+		>
+	> & { clock?: () => number };
 	#server: ControlServer;
 	#cursor = 0;
 	#leaseEpoch = 0;
+	#leaseHeld = false;
 	#heartbeatTimer: NodeJS.Timeout | null = null;
 	#socketPath: string;
 	#finalizeChecks?: FinalizeChecks;
 	#validationCommands?: ValidationCommandSpec[];
 	#unsubscribeFrames: (() => void) | null = null;
 	#framePump: Promise<void> = Promise.resolve();
+	#framePumpFailure: unknown = null;
 	#coalesced = new Map<string, true>();
+	#stopPromise: Promise<void> | null = null;
+	#lastStopFailures: unknown[] = [];
+	#reportedStopFailures = new Set<string>();
+	#transportClosed = false;
+	#serverClosed = false;
+	#framePersistence: Required<NonNullable<OwnerOptions["framePersistence"]>>;
 
 	constructor(opts: OwnerOptions) {
 		this.ownerId = opts.ownerId ?? `owner-${randomUUID()}`;
@@ -127,13 +176,45 @@ export class RuntimeOwner {
 			heartbeatMs: opts.heartbeatMs ?? DEFAULT_HEARTBEAT_MS,
 			acceptanceTimeoutMs: opts.acceptanceTimeoutMs ?? DEFAULT_ACCEPT_TIMEOUT_MS,
 			clock: opts.clock,
+			cleanupRetryMs: opts.cleanupRetryMs ?? DEFAULT_CLEANUP_RETRY_MS,
+			cleanupRetryLimit: opts.cleanupRetryLimit ?? Number.POSITIVE_INFINITY,
+			leaseRelease: opts.leaseRelease ?? releaseLease,
 		};
 		this.#finalizeChecks = opts.finalizeChecks;
 		this.#validationCommands = opts.validationCommands;
-		this.#server = new ControlServer(this.#socketPath, req => this.#handle(req));
+		this.#framePersistence = {
+			appendEvent: opts.framePersistence?.appendEvent ?? appendEvent,
+			writeSessionState: opts.framePersistence?.writeSessionState ?? writeSessionState,
+		};
+		this.#server = (opts.controlServerFactory ?? ((socketPath, handler) => new ControlServer(socketPath, handler)))(
+			this.#socketPath,
+			req => this.#handle(req),
+		);
 	}
 
 	async start(): Promise<OwnerStartInfo> {
+		try {
+			return await this.#startOnce();
+		} catch (startError) {
+			try {
+				await this.stop();
+			} catch (cleanupError) {
+				const cleanupCauses = flattenAggregateCauses([cleanupError]);
+				throw new AggregateError(
+					[startError, ...cleanupCauses],
+					"Runtime owner startup and exact-child rollback failed.",
+				);
+			}
+			if (this.#lastStopFailures.length > 0)
+				throw new AggregateError(
+					[startError, ...flattenAggregateCauses(this.#lastStopFailures)],
+					"Runtime owner startup failed after retrying exact-child rollback.",
+				);
+			throw startError;
+		}
+	}
+
+	async #startOnce(): Promise<OwnerStartInfo> {
 		const { root, sessionId } = this.#opts;
 		const eventsPath = sessionPaths(root, sessionId).events;
 		const existing = await readEvents(root, sessionId, 0);
@@ -146,19 +227,20 @@ export class RuntimeOwner {
 			ttlMs: this.#opts.ttlMs,
 			clock: this.#opts.clock,
 		});
+		this.#leaseHeld = true;
 		this.#leaseEpoch = lease.leaseEpoch;
+		this.#heartbeatTimer = setInterval(() => {
+			void heartbeat(root, sessionId, this.ownerId, this.#opts.ttlMs, this.#opts.clock).catch(err => {
+				// Self-stop if a legitimate dead-owner takeover revoked our lease.
+				if (err instanceof Error && err.message.includes("not_lease_holder")) void this.stop().catch(() => {});
+			});
+		}, this.#opts.heartbeatMs);
+		this.#heartbeatTimer.unref?.();
 		await this.#server.listen();
 		await this.#emit("info", "owner_started", { ownerId: this.ownerId, leaseEpoch: this.#leaseEpoch });
 		if (this.#opts.transport.onEventFrame) {
 			this.#unsubscribeFrames = this.#opts.transport.onEventFrame(frame => this.#handleFrame(frame));
 		}
-		this.#heartbeatTimer = setInterval(() => {
-			void heartbeat(root, sessionId, this.ownerId, this.#opts.ttlMs, this.#opts.clock).catch(err => {
-				// Self-stop if a legitimate dead-owner takeover revoked our lease.
-				if (err instanceof Error && err.message.includes("not_lease_holder")) void this.stop();
-			});
-		}, this.#opts.heartbeatMs);
-		this.#heartbeatTimer.unref?.();
 		return { ownerId: this.ownerId, socketPath: this.#socketPath, leaseEpoch: this.#leaseEpoch };
 	}
 
@@ -179,9 +261,14 @@ export class RuntimeOwner {
 		if (!mapped) return;
 		if (mapped.semantic || (mapped.signal && !mapped.coalesceKey)) {
 			this.#framePump = this.#framePump
-				.then(() => this.#flushCoalesced())
-				.then(() => this.#emitMapped(mapped))
-				.catch(() => {});
+				.then(async () => {
+					if (this.#framePumpFailure !== null) return;
+					await this.#flushCoalesced();
+					await this.#emitMapped(mapped);
+				})
+				.catch(error => {
+					if (this.#framePumpFailure === null) this.#framePumpFailure = error;
+				});
 		} else if (mapped.coalesceKey) {
 			// Coalesce progress-noise by key; never enqueues a per-frame emit, so a message_update
 			// storm cannot starve semantic frames. Bound memory.
@@ -197,7 +284,7 @@ export class RuntimeOwner {
 		if (this.#coalesced.size === 0) return;
 		const coalescedFrames = this.#coalesced.size;
 		this.#coalesced.clear();
-		await this.#emit("info", "rpc_activity", { coalescedFrames });
+		await this.#emit("info", "rpc_activity", { coalescedFrames }, true);
 	}
 
 	async #emitMapped(mapped: AgentWireOwnerObservation): Promise<void> {
@@ -211,13 +298,14 @@ export class RuntimeOwner {
 			) {
 				state.lifecycle = "finalizing";
 				state.updatedAt = new Date(this.#opts.clock ? this.#opts.clock() : Date.now()).toISOString();
-				await writeSessionState(this.#opts.root, state);
+				await this.#framePersistence.writeSessionState(this.#opts.root, state);
 			}
 		}
 		await this.#emit(
 			mapped.severity,
 			mapped.kind,
 			mapped.signal ? { ...mapped.evidence, signal: mapped.signal } : mapped.evidence,
+			true,
 		);
 	}
 
@@ -248,7 +336,12 @@ export class RuntimeOwner {
 		return rpcActive ? "rpc-not-idle" : null;
 	}
 
-	async #emit(severity: Severity, kind: string, evidence: Record<string, unknown>): Promise<void> {
+	async #emit(
+		severity: Severity,
+		kind: string,
+		evidence: Record<string, unknown>,
+		framePersistence = false,
+	): Promise<void> {
 		const lease = await readLease(this.#opts.root, this.#opts.sessionId);
 		// Single-writer guard: only emit while we still hold a live lease.
 		if (!lease || !canWriteEvents(lease, this.ownerId, this.#opts.clock)) return;
@@ -274,7 +367,11 @@ export class RuntimeOwner {
 			nextAllowedActions: nextAllowedActions(view.lifecycle, true, { submitUnavailableReason: submitGateReason }),
 			writer: { ownerId: this.ownerId, leaseEpoch: this.#leaseEpoch },
 		};
-		await appendEvent(this.#opts.root, this.#opts.sessionId, envelope);
+		await (framePersistence ? this.#framePersistence.appendEvent : appendEvent)(
+			this.#opts.root,
+			this.#opts.sessionId,
+			envelope,
+		);
 	}
 
 	#response(
@@ -625,7 +722,31 @@ export class RuntimeOwner {
 	}
 
 	async #observe(): Promise<PrimitiveResponse> {
+		// Observation is a read barrier over every frame accepted before this request.
+		// Without it, a fast poll can read state/event storage while the serial frame
+		// pump is still persisting a terminal event, losing sticky completion evidence.
+		await this.#framePump;
 		const state = await this.#loadState();
+		if (this.#framePumpFailure !== null) {
+			const failedState: SessionState = {
+				...state,
+				lifecycle: "blocked",
+				blockers: [...new Set([...state.blockers, "frame-persistence-failed"])],
+			};
+			return this.#response(
+				failedState,
+				{
+					observation: {
+						lifecycle: "blocked",
+						observedSignals: ["frame-persistence-failed"],
+						rpcLive: this.#opts.transport.isLive?.() ?? true,
+					},
+					framePumpFailure: { severity: "critical", error: String(this.#framePumpFailure) },
+					ownerRouted: true,
+				},
+				false,
+			);
+		}
 		const observation = await this.#observeGit();
 		const submitGateReason =
 			typeof observation.submitUnavailableReason === "string" ? observation.submitUnavailableReason : null;
@@ -638,21 +759,144 @@ export class RuntimeOwner {
 		state.updatedAt = new Date(this.#opts.clock ? this.#opts.clock() : Date.now()).toISOString();
 		await writeSessionState(this.#opts.root, state);
 		await this.#emit("info", "owner_retired", {});
-		queueMicrotask(() => void this.stop());
+		queueMicrotask(() => void this.stop().catch(() => {}));
 		return this.#response(state, { retired: true });
 	}
 
-	async stop(): Promise<void> {
-		this.#unsubscribeFrames?.();
-		this.#unsubscribeFrames = null;
-		await this.#framePump.catch(() => {});
+	stop(): Promise<void> {
+		// Every public caller receives the one truthful shared teardown result. Only
+		// the object capability passed to the exact transport.close() invocation can
+		// break a direct cleanup cycle; ambient synchronous callers have no bypass.
+		if (this.#stopPromise) return this.#stopPromise;
+		const pending = Promise.withResolvers<void>();
+		this.#stopPromise = pending.promise;
+		void this.#stopUntilVerified().then(pending.resolve, pending.reject);
+		return pending.promise;
+	}
+
+	#closeTransport(): Promise<void> {
+		let available = true;
+		// `available` is the authority boundary; freezing the wrapper is only
+		// defense-in-depth against mutation by the receiving transport.
+		const context: HarnessSessionTransportCloseContext = Object.freeze({
+			acknowledgeDirectOwnerStopReentry(): Promise<void> {
+				if (!available) throw new Error("Runtime owner direct stop reentry capability is no longer available.");
+				available = false;
+				return Promise.resolve();
+			},
+		});
+		try {
+			return this.#opts.transport.close(context);
+		} finally {
+			// An async close implementation runs synchronously until it returns its
+			// promise. Expire the capability at that boundary so descendants cannot
+			// acquire completion authority after the direct invocation.
+			available = false;
+		}
+	}
+
+	async #stopUntilVerified(): Promise<void> {
+		this.#lastStopFailures = [];
+		this.#reportedStopFailures.clear();
+		for (let attempt = 1; ; attempt++) {
+			try {
+				await this.#stopOnce();
+				if (this.#framePumpFailure !== null) {
+					throw new FramePumpAfterVerifiedCleanupError(
+						[this.#framePumpFailure, ...flattenAggregateCauses(this.#lastStopFailures)],
+						`Runtime owner frame pump failed after verified cleanup: ${String(this.#framePumpFailure)}`,
+					);
+				}
+				return;
+			} catch (error) {
+				if (error instanceof FramePumpAfterVerifiedCleanupError) throw error;
+				if (this.#lastStopFailures.length === MAX_RETAINED_CLEANUP_FAILURES) this.#lastStopFailures.shift();
+				this.#lastStopFailures.push(error);
+				if (attempt >= this.#opts.cleanupRetryLimit)
+					throw new AggregateError(
+						[
+							...(this.#framePumpFailure === null ? [] : [this.#framePumpFailure]),
+							...flattenAggregateCauses(this.#lastStopFailures),
+						],
+						"Runtime owner cleanup could not be verified.",
+					);
+				await Bun.sleep(this.#opts.cleanupRetryMs);
+			}
+		}
+	}
+
+	async #reportStopFailure(kind: string, error: unknown): Promise<unknown | null> {
+		if (this.#reportedStopFailures.has(kind)) return null;
+		this.#reportedStopFailures.add(kind);
+		try {
+			await this.#emit("critical", kind, { error: String(error) });
+			return null;
+		} catch (reportError) {
+			return reportError;
+		}
+	}
+
+	async #stopOnce(): Promise<void> {
+		const failures: unknown[] = [];
+		const recordFailure = async (kind: string, error: unknown): Promise<void> => {
+			failures.push(error);
+			const reportFailure = await this.#reportStopFailure(kind, error);
+			if (reportFailure !== null) failures.push(reportFailure);
+		};
+		const unsubscribe = this.#unsubscribeFrames;
+		if (unsubscribe) {
+			try {
+				unsubscribe();
+				this.#unsubscribeFrames = null;
+			} catch (error) {
+				await recordFailure("owner_unsubscribe_failed", error);
+			}
+		}
+		await this.#framePump;
+
+		// The transport owns the exact spawned child. Do not surrender the lease while
+		// it is unverified; once each stage succeeds, retain that proof across retries.
+		if (!this.#transportClosed) {
+			try {
+				await this.#closeTransport();
+				this.#transportClosed = true;
+			} catch (error) {
+				await recordFailure("owner_transport_stop_failed", error);
+			}
+		}
+		if (!this.#transportClosed) throw new AggregateError(failures, "Runtime owner transport cleanup failed.");
+
+		if (!this.#serverClosed) {
+			try {
+				await this.#server.close();
+				this.#serverClosed = true;
+			} catch (error) {
+				await recordFailure("owner_server_stop_failed", error);
+			}
+		}
+		if (!this.#serverClosed) throw new AggregateError(failures, "Runtime owner endpoint cleanup failed.");
+
+		if (this.#leaseHeld) {
+			try {
+				await this.#opts.leaseRelease(this.#opts.root, this.#opts.sessionId, this.ownerId);
+				this.#leaseHeld = false;
+			} catch (error) {
+				if (error instanceof LeaseError && error.code === "not_lease_holder") {
+					// A successor already owns the lease. Our transport and endpoint are
+					// verified closed, so there is no old authority left to release.
+					this.#leaseHeld = false;
+				} else {
+					await recordFailure("owner_lease_release_failed", error);
+				}
+			}
+		}
+		if (this.#leaseHeld) throw new AggregateError(failures, "Runtime owner lease cleanup failed.");
+
 		if (this.#heartbeatTimer) {
 			clearInterval(this.#heartbeatTimer);
 			this.#heartbeatTimer = null;
 		}
-		await this.#server.close().catch(() => {});
-		await this.#opts.transport.close().catch(() => {});
-		await releaseLease(this.#opts.root, this.#opts.sessionId, this.ownerId).catch(() => {});
+		if (failures.length > 0) throw new AggregateError(failures, "Runtime owner cleanup failed.");
 	}
 }
 

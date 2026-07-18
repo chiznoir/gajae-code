@@ -12,6 +12,7 @@ import { runExtensionCompact, runExtensionSetModel } from "../extensibility/exte
 import { getSessionSlashCommands } from "../extensibility/extensions/get-commands-handler";
 import type { ExtensionError, ExtensionUIContext } from "../extensibility/extensions/types";
 import type { AgentSession } from "../session/agent-session";
+
 import { parseThinkingLevel } from "../thinking";
 import type { TodoPhase } from "../tools/todo-write";
 
@@ -65,11 +66,25 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 			},
 			getActiveTools: () => session.getActiveToolNames(),
 			getAllTools: () => session.getAllToolNames(),
+			resolveTool: name => {
+				const tool = session.getToolByName(name);
+				return tool ? { safeSummary: tool.safeSummary, safeSummaryFields: tool.safeSummaryFields } : undefined;
+			},
 			setActiveTools: (toolNames: string[]) => session.setActiveToolsByName(toolNames),
 			getCommands: () => getSessionSlashCommands(session),
 			setModel: model => runExtensionSetModel(session, model),
 			getThinkingLevel: () => session.thinkingLevel,
-			setThinkingLevel: level => session.setThinkingLevel(level),
+			setThinkingLevel: (level, persist) => session.setThinkingLevel(level, persist),
+			getThinkingVisibility: () => session.getThinkingVisibility(),
+			setThinkingVisibility: (visibility, persist) => session.setThinkingVisibility(visibility, persist),
+			cycleThinkingLevel: () => session.cycleThinkingLevel(),
+			setThinkingLevelForControl: (level, persist) => session.setThinkingLevelForControl(level, persist),
+			setThinkingVisibilityForControl: (visibility, persist) =>
+				session.setThinkingVisibilityForControl(visibility, persist),
+			setModelTemporaryForControl: (model, expectedSessionId) =>
+				session.setModelTemporaryForControl(model, expectedSessionId),
+			fetchUsageReportsForControl: () => session.fetchUsageReportsForControl(),
+			getThinkingScopeForControl: () => session.getThinkingScopeForControl(),
 			getSessionName: () => session.sessionManager.getSessionName(),
 			setSessionName: async name => {
 				await session.sessionManager.setSessionName(name, "user");
@@ -89,6 +104,10 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 			getQueuedMessages: () => session.getQueuedMessageEntries(),
 			getActiveTools: () => session.getActiveToolNames(),
 			getAllTools: () => session.getAllToolNames(),
+			resolveTool: name => {
+				const tool = session.getToolByName(name);
+				return tool ? { safeSummary: tool.safeSummary, safeSummaryFields: tool.safeSummaryFields } : undefined;
+			},
 			shutdown,
 			getContextUsage: () => session.getContextUsage(),
 			getSystemPrompt: () => session.systemPrompt,

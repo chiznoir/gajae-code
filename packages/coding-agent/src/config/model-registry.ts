@@ -4,6 +4,7 @@ import {
 	type Api,
 	type AssistantMessageEventStream,
 	type AuthCredentialSelector,
+	applyFinalCodexGpt56ContextCap,
 	type CacheRetention,
 	type Context,
 	createModelManager,
@@ -39,11 +40,18 @@ import { isValidThemeColor, type ThemeColor } from "../modes/theme/theme";
 import type { AuthStorage, OAuthCredential } from "../session/auth-storage";
 import type { ActiveSearchModelContext, WebSearchMode } from "../web/search/types";
 import { type ConfigError, ConfigFile } from "./config-file";
+import { isAuthenticated, kNoAuth } from "./model-auth";
+import { ModelBindingsApplier } from "./model-bindings-applier";
+import { ModelDiscoveryManager, type ProviderDiscoveryState } from "./model-discovery-manager";
+
+export type { ProviderDiscoveryState, ProviderDiscoveryStatus } from "./model-discovery-manager";
+
 import {
 	buildCanonicalModelIndex,
 	type CanonicalModelIndex,
 	type CanonicalModelRecord,
 	type CanonicalModelVariant,
+	compareEquivalentModelVariants,
 	formatCanonicalVariantSelector,
 	type ModelEquivalenceConfig,
 } from "./model-equivalence";
@@ -53,6 +61,7 @@ import {
 	mergeModelProfiles,
 } from "./model-profiles";
 import {
+	GJC_MODEL_ASSIGNMENT_TARGET_IDS,
 	type ModelOverride,
 	type ModelProfileConfig,
 	type ModelsConfig,
@@ -65,10 +74,20 @@ import { type Settings, settings } from "./settings";
 
 export type { CanonicalModelIndex, CanonicalModelRecord, CanonicalModelVariant, ModelEquivalenceConfig };
 
-export const kNoAuth = "N/A";
+export { isAuthenticated, kNoAuth };
 
-export function isAuthenticated(apiKey: string | undefined | null): apiKey is string {
-	return Boolean(apiKey) && apiKey !== kNoAuth;
+const MAX_SESSION_CANONICAL_VARIANTS = 64;
+
+function envAvailabilityFingerprint(): string {
+	return Object.entries(process.env)
+		.filter(
+			([name]) =>
+				/(?:_API_KEY|_OAUTH_TOKEN|_ACCESS_TOKEN)$/.test(name) ||
+				/^(?:GH_TOKEN|GITHUB_TOKEN|HF_TOKEN|COPILOT_GITHUB_TOKEN)$/.test(name),
+		)
+		.sort(([left], [right]) => left.localeCompare(right))
+		.map(([name, value]) => `${name}=${value ?? ""}`)
+		.join("\u0000");
 }
 
 export type ModelRole = "default";
@@ -86,20 +105,14 @@ export const MODEL_ROLES: Record<ModelRole, ModelRoleInfo> = {
 export const MODEL_ROLE_IDS: ModelRole[] = ["default"];
 export const MODEL_PROFILE_NAME_PATTERN = /^[a-z0-9][a-z0-9._-]*$/;
 export const MODEL_PROFILE_NAME_PATTERN_DESCRIPTION = "lowercase letters, numbers, dots, underscores, or hyphens";
-export type GjcModelAssignmentTargetId = "default" | "executor" | "architect" | "planner" | "critic";
+export type GjcModelAssignmentTargetId = (typeof GJC_MODEL_ASSIGNMENT_TARGET_IDS)[number];
 
 export interface GjcModelAssignmentTargetInfo extends ModelRoleInfo {
 	id: GjcModelAssignmentTargetId;
 	settingsPath: "modelRoles" | "task.agentModelOverrides";
 }
 
-export const GJC_MODEL_ASSIGNMENT_TARGET_IDS: GjcModelAssignmentTargetId[] = [
-	"default",
-	"executor",
-	"architect",
-	"planner",
-	"critic",
-];
+export { GJC_MODEL_ASSIGNMENT_TARGET_IDS };
 
 export const GJC_MODEL_ASSIGNMENT_TARGETS: Record<GjcModelAssignmentTargetId, GjcModelAssignmentTargetInfo> = {
 	default: { id: "default", tag: "DEFAULT", name: "Default", color: "success", settingsPath: "modelRoles" },
@@ -513,21 +526,11 @@ interface DiscoveryProviderConfig {
 	optional?: boolean;
 }
 
-export type ProviderDiscoveryStatus = "idle" | "ok" | "empty" | "cached" | "unavailable" | "unauthenticated";
-
-export interface ProviderDiscoveryState {
-	provider: string;
-	status: ProviderDiscoveryStatus;
-	optional: boolean;
-	stale: boolean;
-	fetchedAt?: number;
-	models: string[];
-	error?: string;
-}
-
 export interface CanonicalModelQueryOptions {
 	availableOnly?: boolean;
 	candidates?: readonly Model<Api>[];
+	/** Stable session identity used to keep a canonical variant sticky within a session. */
+	sessionId?: string;
 }
 
 /** Result of loading custom models from models.json */
@@ -1006,32 +1009,27 @@ function getConfiguredProviderOrderFromSettings(): string[] {
 export class ModelRegistry {
 	#models: Model<Api>[] = [];
 	#canonicalIndex: CanonicalModelIndex = { records: [], byId: new Map(), bySelector: new Map() };
+	#availableModelsCache: Model<Api>[] | undefined;
+	#availableModelsDisabledProviders: string | undefined;
+	#availableModelsEnvFingerprint: string | undefined;
+	#sessionCanonicalVariants = new Map<string, string>();
 	#customProviderApiKeys: Map<string, string> = new Map();
 	#providerWebSearchModes: Map<string, WebSearchMode> = new Map();
 	#keylessProviders: Set<string> = new Set();
-	#discoverableProviders: DiscoveryProviderConfig[] = [];
+	#discoveryManager = new ModelDiscoveryManager<DiscoveryProviderConfig>();
 	#customModelOverlays: CustomModelOverlay[] = [];
 	#providerOverrides: Map<string, ProviderOverride> = new Map();
 	#modelOverrides: Map<string, Map<string, ModelOverride>> = new Map();
 	#equivalenceConfig: ModelEquivalenceConfig | undefined;
-	#configuredModelBindings: NonNullable<ModelsConfig["modelBindings"]> | undefined;
+	#modelBindingsApplier = new ModelBindingsApplier();
 	#modelProfiles: Map<string, ModelProfileDefinition> = mergeModelProfiles();
-	#modelBindingsTargetSettings: Settings | undefined;
-	#appliedModelBindingRoles = new Set<string>();
-	#appliedAgentModelBindingOverrides = new Set<string>();
-	#modelBindingRoleBaselines = new Map<string, string | undefined>();
-	#agentModelBindingBaselines = new Map<string, string | undefined>();
-	#lastAppliedModelBindingRoles = new Map<string, string>();
-	#lastAppliedAgentModelBindingOverrides = new Map<string, string>();
 	#configError: ConfigError | undefined = undefined;
 	#modelsConfigFile: ConfigFile<ModelsConfig>;
 	#lastStaticLoadMtime: number | null = null;
 	#registeredProviderSources: Set<string> = new Set();
-	#providerDiscoveryStates: Map<string, ProviderDiscoveryState> = new Map();
 	#cacheDbPath?: string;
 	#suppressedSelectors: Map<string, number> = new Map();
 	#backgroundRefresh?: Promise<void>;
-	#lastDiscoveryWarnings: Map<string, string> = new Map();
 	// Runtime extension model overlays — persist across refresh() cycles so that
 	// models registered by extensions survive the model selector's offline reload.
 	#runtimeModelOverlays: CustomModelOverlay[] = [];
@@ -1056,6 +1054,7 @@ export class ModelRegistry {
 			const keyConfig = this.#customProviderApiKeys.get(provider);
 			return keyConfig;
 		});
+		this.authStorage.onGenerationChanged(() => this.#invalidateAvailableModels());
 		// Load models synchronously in constructor
 		this.#loadModels();
 	}
@@ -1069,7 +1068,7 @@ export class ModelRegistry {
 			this.#reloadStaticModels();
 			this.#suppressedSelectors.clear();
 			await this.#refreshRuntimeDiscoveries(strategy);
-			this.#applyConfiguredModelBindingsToTarget();
+			this.#modelBindingsApplier.apply();
 		} finally {
 			this.#resumeRebuild();
 		}
@@ -1103,7 +1102,7 @@ export class ModelRegistry {
 				}
 			}
 			await this.#refreshRuntimeDiscoveries(strategy, new Set([providerId]));
-			this.#applyConfiguredModelBindingsToTarget();
+			this.#modelBindingsApplier.apply();
 		} finally {
 			this.#resumeRebuild();
 		}
@@ -1119,7 +1118,7 @@ export class ModelRegistry {
 		this.#customProviderApiKeys.clear();
 		this.#providerWebSearchModes.clear();
 		this.#keylessProviders.clear();
-		this.#discoverableProviders = [];
+		this.#discoveryManager.reset();
 		// Drop config-sourced apiKeys from AuthStorage before reload; entries
 		// removed from models.yml must actually disappear from the resolver, not
 		// linger from the previous parse. The post-load setters below repopulate.
@@ -1132,9 +1131,8 @@ export class ModelRegistry {
 		this.#providerOverrides.clear();
 		this.#modelOverrides.clear();
 		this.#equivalenceConfig = undefined;
-		this.#configuredModelBindings = undefined;
+		this.#modelBindingsApplier.setBindings(undefined);
 		this.#configError = undefined;
-		this.#providerDiscoveryStates.clear();
 		this.#loadModels();
 	}
 
@@ -1161,12 +1159,12 @@ export class ModelRegistry {
 		} = this.#loadCustomModels();
 		this.#configError = configError;
 		this.#keylessProviders = keylessProviders;
-		this.#discoverableProviders = discoverableProviders;
+		this.#discoveryManager.setProviders(discoverableProviders);
 		this.#customModelOverlays = customModels;
 		this.#providerOverrides = overrides;
 		this.#modelOverrides = modelOverrides;
 		this.#equivalenceConfig = equivalence;
-		this.#configuredModelBindings = modelBindings;
+		this.#modelBindingsApplier.setBindings(modelBindings);
 		this.#modelProfiles = mergeModelProfiles(profiles);
 
 		this.#addImplicitDiscoverableProviders(configuredProviders);
@@ -1181,7 +1179,7 @@ export class ModelRegistry {
 		// Merge runtime extension models so they survive refresh() cycles
 		const combined = this.#mergeCustomModels(withConfigModels, this.#runtimeModelOverlays);
 		const withModelOverrides = this.#applyModelOverrides(combined, this.#modelOverrides);
-		this.#models = this.#applyRuntimeProviderOverrides(withModelOverrides);
+		this.#models = applyFinalCodexGpt56ContextCap(this.#applyRuntimeProviderOverrides(withModelOverrides));
 		this.#rebuildCanonicalIndex();
 		this.#lastStaticLoadMtime = this.#modelsConfigFile.getMtimeMs();
 	}
@@ -1281,7 +1279,7 @@ export class ModelRegistry {
 	}
 
 	#loadCachedStandardProviderModels(): Model<Api>[] {
-		const configuredDiscoveryProviders = new Set(this.#discoverableProviders.map(provider => provider.provider));
+		const configuredDiscoveryProviders = new Set(this.#discoveryManager.providers.map(provider => provider.provider));
 		const cachedModels: Model<Api>[] = [];
 		for (const descriptor of PROVIDER_DESCRIPTORS) {
 			if (configuredDiscoveryProviders.has(descriptor.providerId)) {
@@ -1308,34 +1306,16 @@ export class ModelRegistry {
 
 	#loadCachedDiscoverableModels(): Model<Api>[] {
 		const cachedModels: Model<Api>[] = [];
-		for (const providerConfig of this.#discoverableProviders) {
-			const cache = readModelCache<Api>(providerConfig.provider, 24 * 60 * 60 * 1000, Date.now, this.#cacheDbPath);
-			if (!cache) {
-				this.#providerDiscoveryStates.set(providerConfig.provider, {
-					provider: providerConfig.provider,
-					status: "idle",
-					optional: providerConfig.optional ?? false,
-					stale: false,
-					models: [],
-				});
-				continue;
-			}
-			const models = this.#applyProviderModelOverrides(
+		for (const providerConfig of this.#discoveryManager.providers) {
+			const models = this.#discoveryManager.loadCached(providerConfig, this.#cacheDbPath);
+			const normalized = this.#applyProviderModelOverrides(
 				providerConfig.provider,
 				this.#normalizeDiscoverableModels(
 					providerConfig,
-					this.#applyProviderCompat(providerConfig.compat, cache.models),
+					this.#applyProviderCompat(providerConfig.compat, [...models]),
 				),
 			);
-			cachedModels.push(...models);
-			this.#providerDiscoveryStates.set(providerConfig.provider, {
-				provider: providerConfig.provider,
-				status: "cached",
-				optional: providerConfig.optional ?? false,
-				stale: !cache.fresh || !cache.authoritative,
-				fetchedAt: cache.updatedAt,
-				models: models.map(model => model.id),
-			});
+			cachedModels.push(...normalized);
 		}
 		return cachedModels;
 	}
@@ -1366,7 +1346,7 @@ export class ModelRegistry {
 	#addImplicitDiscoverableProviders(configuredProviders: Set<string>): void {
 		const disabledProviders = getDisabledProviderIdsFromSettings();
 		if (!configuredProviders.has("ollama") && !disabledProviders.has("ollama")) {
-			this.#discoverableProviders.push({
+			this.#discoveryManager.addProvider({
 				provider: "ollama",
 				api: "openai-responses",
 				baseUrl: Bun.env.OLLAMA_BASE_URL || "http://127.0.0.1:11434",
@@ -1376,7 +1356,7 @@ export class ModelRegistry {
 			this.#keylessProviders.add("ollama");
 		}
 		if (!configuredProviders.has("llama.cpp") && !disabledProviders.has("llama.cpp")) {
-			this.#discoverableProviders.push({
+			this.#discoveryManager.addProvider({
 				provider: "llama.cpp",
 				api: "openai-responses",
 				baseUrl: Bun.env.LLAMA_CPP_BASE_URL || "http://127.0.0.1:8080",
@@ -1389,7 +1369,7 @@ export class ModelRegistry {
 			}
 		}
 		if (!configuredProviders.has("lm-studio") && !disabledProviders.has("lm-studio")) {
-			this.#discoverableProviders.push({
+			this.#discoveryManager.addProvider({
 				provider: "lm-studio",
 				api: "openai-completions",
 				baseUrl: Bun.env.LM_STUDIO_BASE_URL || "http://127.0.0.1:1234/v1",
@@ -1694,75 +1674,7 @@ export class ModelRegistry {
 		this.#reloadStaticModels();
 	}
 	applyConfiguredModelBindings(targetSettings: Settings): void {
-		this.#modelBindingsTargetSettings = targetSettings;
-		this.#applyConfiguredModelBindingsToTarget();
-	}
-
-	#applyConfiguredModelBindingsToTarget(): void {
-		const targetSettings = this.#modelBindingsTargetSettings;
-		if (!targetSettings) return;
-		const bindings = this.#configuredModelBindings;
-		const nextModelRoles = { ...targetSettings.get("modelRoles") };
-		const configuredModelRoles = bindings?.modelRoles ?? {};
-		const configuredModelRoleKeys = new Set(Object.keys(configuredModelRoles));
-		for (const role of this.#appliedModelBindingRoles) {
-			if (configuredModelRoleKeys.has(role)) continue;
-			const lastApplied = this.#lastAppliedModelBindingRoles.get(role);
-			if (lastApplied !== undefined && nextModelRoles[role] === lastApplied) {
-				const baseline = this.#modelBindingRoleBaselines.get(role);
-				if (baseline === undefined) {
-					delete nextModelRoles[role];
-				} else {
-					nextModelRoles[role] = baseline;
-				}
-			}
-			this.#modelBindingRoleBaselines.delete(role);
-			this.#lastAppliedModelBindingRoles.delete(role);
-		}
-		for (const [role, modelId] of Object.entries(configuredModelRoles)) {
-			if (!modelId) continue;
-			const previousApplied = this.#lastAppliedModelBindingRoles.get(role);
-			if (!this.#modelBindingRoleBaselines.has(role)) {
-				this.#modelBindingRoleBaselines.set(role, nextModelRoles[role]);
-			}
-			if (previousApplied === undefined || nextModelRoles[role] === previousApplied) {
-				nextModelRoles[role] = modelId;
-				this.#lastAppliedModelBindingRoles.set(role, modelId);
-			}
-		}
-		targetSettings.override("modelRoles", nextModelRoles);
-		this.#appliedModelBindingRoles = new Set(Object.keys(configuredModelRoles));
-
-		const nextAgentModelOverrides = { ...targetSettings.get("task.agentModelOverrides") };
-		const configuredAgentModelOverrides = bindings?.agentModelOverrides ?? {};
-		const configuredAgentModelOverrideKeys = new Set(Object.keys(configuredAgentModelOverrides));
-		for (const agentName of this.#appliedAgentModelBindingOverrides) {
-			if (configuredAgentModelOverrideKeys.has(agentName)) continue;
-			const lastApplied = this.#lastAppliedAgentModelBindingOverrides.get(agentName);
-			if (lastApplied !== undefined && nextAgentModelOverrides[agentName] === lastApplied) {
-				const baseline = this.#agentModelBindingBaselines.get(agentName);
-				if (baseline === undefined) {
-					delete nextAgentModelOverrides[agentName];
-				} else {
-					nextAgentModelOverrides[agentName] = baseline;
-				}
-			}
-			this.#agentModelBindingBaselines.delete(agentName);
-			this.#lastAppliedAgentModelBindingOverrides.delete(agentName);
-		}
-		for (const [agentName, modelId] of Object.entries(configuredAgentModelOverrides)) {
-			if (!modelId) continue;
-			const previousApplied = this.#lastAppliedAgentModelBindingOverrides.get(agentName);
-			if (!this.#agentModelBindingBaselines.has(agentName)) {
-				this.#agentModelBindingBaselines.set(agentName, nextAgentModelOverrides[agentName]);
-			}
-			if (previousApplied === undefined || nextAgentModelOverrides[agentName] === previousApplied) {
-				nextAgentModelOverrides[agentName] = modelId;
-				this.#lastAppliedAgentModelBindingOverrides.set(agentName, modelId);
-			}
-		}
-		targetSettings.override("task.agentModelOverrides", nextAgentModelOverrides);
-		this.#appliedAgentModelBindingOverrides = new Set(Object.keys(configuredAgentModelOverrides));
+		this.#modelBindingsApplier.applyTo(targetSettings);
 	}
 
 	async #refreshRuntimeDiscoveries(
@@ -1772,8 +1684,8 @@ export class ModelRegistry {
 		const disabledProviders = getDisabledProviderIdsFromSettings();
 		const selectedDiscoverableProviders = (
 			providerFilter
-				? this.#discoverableProviders.filter(provider => providerFilter.has(provider.provider))
-				: this.#discoverableProviders
+				? this.#discoveryManager.providers.filter(provider => providerFilter.has(provider.provider))
+				: this.#discoveryManager.providers
 		).filter(provider => !disabledProviders.has(provider.provider));
 		const configuredDiscoveriesPromise =
 			selectedDiscoverableProviders.length === 0
@@ -1803,7 +1715,7 @@ export class ModelRegistry {
 		// Merge runtime extension models so they survive online discovery completion
 		const combined = this.#mergeCustomModels(withConfigModels, this.#runtimeModelOverlays);
 		const withModelOverrides = this.#applyModelOverrides(combined, this.#modelOverrides);
-		this.#models = this.#applyRuntimeProviderOverrides(withModelOverrides);
+		this.#models = applyFinalCodexGpt56ContextCap(this.#applyRuntimeProviderOverrides(withModelOverrides));
 		this.#rebuildCanonicalIndex();
 	}
 
@@ -1811,73 +1723,26 @@ export class ModelRegistry {
 		providerConfig: DiscoveryProviderConfig,
 		strategy: ModelRefreshStrategy,
 	): Promise<Model<Api>[]> {
-		const cached = readModelCache<Api>(providerConfig.provider, 24 * 60 * 60 * 1000, Date.now, this.#cacheDbPath);
-		const requiresAuth = !this.#keylessProviders.has(providerConfig.provider);
-		if (requiresAuth) {
-			const apiKey = await this.#peekApiKeyForProvider(providerConfig.provider);
-			if (!isAuthenticated(apiKey)) {
-				this.#providerDiscoveryStates.set(providerConfig.provider, {
-					provider: providerConfig.provider,
-					status: "unauthenticated",
-					optional: providerConfig.optional ?? false,
-					stale: cached !== null,
-					fetchedAt: cached?.updatedAt,
-					models: cached?.models.map(model => model.id) ?? [],
-				});
-				this.#lastDiscoveryWarnings.delete(providerConfig.provider);
-				return cached?.models ?? [];
-			}
-		}
-
-		const providerId = providerConfig.provider;
-		let discoveryError: string | undefined;
-		const fetchDynamicModels = async (): Promise<readonly Model<Api>[] | null> => {
-			try {
-				const models = await this.#discoverModelsByProviderType(providerConfig);
-				this.#lastDiscoveryWarnings.delete(providerId);
-				return models;
-			} catch (error) {
-				discoveryError = error instanceof Error ? error.message : String(error);
-				return null;
-			}
-		};
-
-		const manager = createModelManager<Api>({
-			providerId,
-			staticModels: [],
+		const mergeInput = await this.#discoveryManager.discover(providerConfig, strategy, {
 			cacheDbPath: this.#cacheDbPath,
-			cacheTtlMs: 24 * 60 * 60 * 1000,
-			fetchDynamicModels,
+			requiresAuth: provider => !this.#keylessProviders.has(provider.provider),
+			peekApiKey: provider => this.#peekApiKeyForProvider(provider.provider),
+			isAuthenticated,
+			fetchModels: provider => this.#discoverModelsByProviderType(provider),
 		});
-		const result = await manager.refresh(strategy);
-		const status = discoveryError
-			? result.models.length > 0
-				? "cached"
-				: "unavailable"
-			: strategy === "offline"
-				? cached
-					? "cached"
-					: "idle"
-				: result.models.length > 0
-					? "ok"
-					: "empty";
-		this.#providerDiscoveryStates.set(providerId, {
-			provider: providerId,
-			status,
-			optional: providerConfig.optional ?? false,
-			stale: result.stale || status === "cached",
-			fetchedAt: discoveryError ? cached?.updatedAt : Date.now(),
-			models: result.models.map(model => model.id),
-			error: discoveryError,
-		});
-		if (discoveryError) {
-			this.#warnProviderDiscoveryFailure(providerConfig, discoveryError);
+		if (!mergeInput.current) return [];
+		if (mergeInput.warning) {
+			logger.warn("model discovery failed for provider", {
+				provider: providerConfig.provider,
+				url: providerConfig.baseUrl,
+				error: mergeInput.warning,
+			});
 		}
 		return this.#applyProviderModelOverrides(
-			providerId,
+			providerConfig.provider,
 			this.#normalizeDiscoverableModels(
 				providerConfig,
-				this.#applyProviderCompat(providerConfig.compat, result.models),
+				this.#applyProviderCompat(providerConfig.compat, [...mergeInput.models]),
 			),
 		);
 	}
@@ -1894,25 +1759,12 @@ export class ModelRegistry {
 		}
 	}
 
-	#warnProviderDiscoveryFailure(providerConfig: DiscoveryProviderConfig, error: string): void {
-		const previous = this.#lastDiscoveryWarnings.get(providerConfig.provider);
-		if (previous === error) {
-			return;
-		}
-		this.#lastDiscoveryWarnings.set(providerConfig.provider, error);
-		logger.warn("model discovery failed for provider", {
-			provider: providerConfig.provider,
-			url: providerConfig.baseUrl,
-			error,
-		});
-	}
-
 	async #discoverBuiltInProviderModels(
 		strategy: ModelRefreshStrategy,
 		providerFilter?: ReadonlySet<string>,
 	): Promise<Model<Api>[]> {
 		// Skip providers already handled by configured discovery (e.g. user-configured ollama with discovery.type)
-		const configuredDiscoveryProviders = new Set(this.#discoverableProviders.map(p => p.provider));
+		const configuredDiscoveryProviders = new Set(this.#discoveryManager.providers.map(p => p.provider));
 		const managerOptions = (await this.#collectBuiltInModelManagerOptions()).filter(opts => {
 			if (configuredDiscoveryProviders.has(opts.providerId)) {
 				return false;
@@ -2401,7 +2253,14 @@ export class ModelRegistry {
 			return;
 		}
 		this.#canonicalIndex = buildCanonicalModelIndex(this.#models, this.#equivalenceConfig);
+		this.#invalidateAvailableModels();
 		this.#rebuildPending = false;
+	}
+
+	#invalidateAvailableModels(): void {
+		this.#availableModelsCache = undefined;
+		this.#availableModelsDisabledProviders = undefined;
+		this.#availableModelsEnvFingerprint = undefined;
 	}
 
 	#suspendRebuild(): void {
@@ -2415,6 +2274,7 @@ export class ModelRegistry {
 		if (this.#rebuildSuspended === 0 && this.#rebuildPending) {
 			this.#rebuildPending = false;
 			this.#canonicalIndex = buildCanonicalModelIndex(this.#models, this.#equivalenceConfig);
+			this.#invalidateAvailableModels();
 		}
 	}
 
@@ -2465,8 +2325,7 @@ export class ModelRegistry {
 		return this.#models;
 	}
 
-	#isModelAvailable(model: Model<Api>): boolean {
-		const disabledProviders = getDisabledProviderIdsFromSettings();
+	#isModelAvailable(model: Model<Api>, disabledProviders = getDisabledProviderIdsFromSettings()): boolean {
 		return (
 			!disabledProviders.has(model.provider) &&
 			(this.#keylessProviders.has(model.provider) || this.authStorage.hasAuth(model.provider))
@@ -2480,13 +2339,10 @@ export class ModelRegistry {
 		const candidateKeys = options?.candidates
 			? new Set(options.candidates.map(candidate => formatCanonicalVariantSelector(candidate)))
 			: undefined;
+		const disabledProviders = options?.availableOnly ? getDisabledProviderIdsFromSettings() : undefined;
 		return record.variants.filter(variant => {
-			if (candidateKeys && !candidateKeys.has(variant.selector)) {
-				return false;
-			}
-			if (options?.availableOnly && !this.#isModelAvailable(variant.model)) {
-				return false;
-			}
+			if (candidateKeys && !candidateKeys.has(variant.selector)) return false;
+			if (options?.availableOnly && !this.#isModelAvailable(variant.model, disabledProviders)) return false;
 			return true;
 		});
 	}
@@ -2514,13 +2370,26 @@ export class ModelRegistry {
 		return result;
 	}
 
+	#rememberCanonicalVariant(sessionId: string, selector: string): void {
+		this.#sessionCanonicalVariants.delete(sessionId);
+		this.#sessionCanonicalVariants.set(sessionId, selector);
+		if (this.#sessionCanonicalVariants.size > MAX_SESSION_CANONICAL_VARIANTS) {
+			this.#sessionCanonicalVariants.delete(this.#sessionCanonicalVariants.keys().next().value!);
+		}
+	}
 	#resolveCanonicalVariant(
 		variants: readonly CanonicalModelVariant[],
 		allCandidates: readonly Model<Api>[],
+		sessionId?: string,
 	): CanonicalModelVariant | undefined {
-		if (variants.length === 0) {
-			return undefined;
+		if (variants.length === 0) return undefined;
+		const stickySelector = sessionId ? this.#sessionCanonicalVariants.get(sessionId) : undefined;
+		const stickyVariant = stickySelector ? variants.find(variant => variant.selector === stickySelector) : undefined;
+		if (stickyVariant) {
+			this.#rememberCanonicalVariant(sessionId!, stickyVariant.selector);
+			return stickyVariant;
 		}
+		if (sessionId && stickySelector) this.#sessionCanonicalVariants.delete(sessionId);
 		const providerRank = this.#providerRank(allCandidates);
 		const modelOrder = new Map<string, number>();
 		for (let index = 0; index < allCandidates.length; index += 1) {
@@ -2532,35 +2401,16 @@ export class ModelRegistry {
 			heuristic: 2,
 			fallback: 3,
 		};
-		return [...variants].sort((left, right) => {
-			// Prefer vision-capable variants over configured provider order so an
-			// ambiguous canonical id never resolves to a text-only namesake when a
-			// vision-capable variant of the same id is available.
-			const leftVision = left.model.input.includes("image") ? 0 : 1;
-			const rightVision = right.model.input.includes("image") ? 0 : 1;
-			if (leftVision !== rightVision) {
-				return leftVision - rightVision;
-			}
-			const leftProviderRank = providerRank.get(left.model.provider.toLowerCase()) ?? Number.MAX_SAFE_INTEGER;
-			const rightProviderRank = providerRank.get(right.model.provider.toLowerCase()) ?? Number.MAX_SAFE_INTEGER;
-			if (leftProviderRank !== rightProviderRank) {
-				return leftProviderRank - rightProviderRank;
-			}
-			const leftExact = left.model.id === left.canonicalId ? 0 : 1;
-			const rightExact = right.model.id === right.canonicalId ? 0 : 1;
-			if (leftExact !== rightExact) {
-				return leftExact - rightExact;
-			}
-			if (sourceRank[left.source] !== sourceRank[right.source]) {
-				return sourceRank[left.source] - sourceRank[right.source];
-			}
-			if (left.model.id.length !== right.model.id.length) {
-				return left.model.id.length - right.model.id.length;
-			}
-			const leftOrder = modelOrder.get(left.selector) ?? Number.MAX_SAFE_INTEGER;
-			const rightOrder = modelOrder.get(right.selector) ?? Number.MAX_SAFE_INTEGER;
-			return leftOrder - rightOrder;
-		})[0];
+		return [...variants].sort((left, right) =>
+			compareEquivalentModelVariants(left.model, right.model, {
+				providerRank,
+				canonicalId: left.canonicalId === right.canonicalId ? left.canonicalId : undefined,
+				leftSourceRank: sourceRank[left.source],
+				rightSourceRank: sourceRank[right.source],
+				includeCost: true,
+				modelOrder,
+			}),
+		)[0];
 	}
 
 	getCanonicalModels(options?: CanonicalModelQueryOptions): CanonicalModelRecord[] {
@@ -2589,11 +2439,11 @@ export class ModelRegistry {
 
 	resolveCanonicalModel(canonicalId: string, options?: CanonicalModelQueryOptions): Model<Api> | undefined {
 		const variants = this.getCanonicalVariants(canonicalId, options);
-		if (variants.length === 0) {
-			return undefined;
-		}
+		if (variants.length === 0) return undefined;
 		const candidates = options?.candidates ?? (options?.availableOnly ? this.getAvailable() : this.getAll());
-		return this.#resolveCanonicalVariant(variants, candidates)?.model;
+		const resolved = this.#resolveCanonicalVariant(variants, candidates, options?.sessionId);
+		if (resolved && options?.sessionId) this.#rememberCanonicalVariant(options.sessionId, resolved.selector);
+		return resolved?.model;
 	}
 
 	getCanonicalId(model: Model<Api>): string | undefined {
@@ -2601,11 +2451,37 @@ export class ModelRegistry {
 	}
 
 	/**
+	 * Seed a child canonical scope from a concrete parent model without touching
+	 * the parent's canonical selection.
+	 */
+	seedCanonicalVariant(sessionId: string, model: Model<Api>): boolean {
+		const scope = sessionId.trim();
+		if (!scope) return false;
+		const selector = formatCanonicalVariantSelector(model);
+		if (!this.#canonicalIndex.bySelector.has(selector.toLowerCase())) return false;
+		this.#rememberCanonicalVariant(scope, selector);
+		return true;
+	}
+
+	/**
 	 * Get only models that have auth configured.
 	 * This is a fast check that doesn't refresh OAuth tokens.
 	 */
 	getAvailable(): Model<Api>[] {
-		return this.#models.filter(model => this.#isModelAvailable(model));
+		const disabledProviders = getDisabledProviderIdsFromSettings();
+		const disabledProviderKey = [...disabledProviders].sort().join("\u0000");
+		const envFingerprint = envAvailabilityFingerprint();
+		if (
+			this.#availableModelsCache &&
+			this.#availableModelsDisabledProviders === disabledProviderKey &&
+			this.#availableModelsEnvFingerprint === envFingerprint
+		) {
+			return this.#availableModelsCache;
+		}
+		this.#availableModelsCache = this.#models.filter(model => this.#isModelAvailable(model, disabledProviders));
+		this.#availableModelsDisabledProviders = disabledProviderKey;
+		this.#availableModelsEnvFingerprint = envFingerprint;
+		return this.#availableModelsCache;
 	}
 
 	/**
@@ -2623,13 +2499,13 @@ export class ModelRegistry {
 
 	getDiscoverableProviders(): string[] {
 		const disabledProviders = getDisabledProviderIdsFromSettings();
-		return this.#discoverableProviders
+		return this.#discoveryManager.providers
 			.filter(provider => !disabledProviders.has(provider.provider))
 			.map(provider => provider.provider);
 	}
 
 	getProviderDiscoveryState(provider: string): ProviderDiscoveryState | undefined {
-		return this.#providerDiscoveryStates.get(provider);
+		return this.#discoveryManager.getState(provider);
 	}
 
 	/**
@@ -2665,6 +2541,13 @@ export class ModelRegistry {
 		};
 	}
 
+	async #getApiKeyOrNoAuth(provider: string, lookup: () => Promise<string | undefined>): Promise<string | undefined> {
+		if (this.#keylessProviders.has(provider) && !this.authStorage.hasAuth(provider)) {
+			return kNoAuth;
+		}
+		return lookup();
+	}
+
 	/**
 	 * Get API key for a model.
 	 */
@@ -2673,14 +2556,13 @@ export class ModelRegistry {
 		sessionId?: string,
 		options: { credentialSelector?: AuthCredentialSelector } = {},
 	): Promise<string | undefined> {
-		if (this.#keylessProviders.has(model.provider) && !this.authStorage.hasAuth(model.provider)) {
-			return kNoAuth;
-		}
-		return this.authStorage.getApiKey(model.provider, sessionId, {
-			baseUrl: model.baseUrl,
-			modelId: model.id,
-			credentialSelector: options.credentialSelector,
-		});
+		return this.#getApiKeyOrNoAuth(model.provider, () =>
+			this.authStorage.getApiKey(model.provider, sessionId, {
+				baseUrl: model.baseUrl,
+				modelId: model.id,
+				credentialSelector: options.credentialSelector,
+			}),
+		);
 	}
 
 	/**
@@ -2692,20 +2574,16 @@ export class ModelRegistry {
 		baseUrl?: string,
 		options: { credentialSelector?: AuthCredentialSelector } = {},
 	): Promise<string | undefined> {
-		if (this.#keylessProviders.has(provider) && !this.authStorage.hasAuth(provider)) {
-			return kNoAuth;
-		}
-		return this.authStorage.getApiKey(provider, sessionId, {
-			baseUrl,
-			credentialSelector: options.credentialSelector,
-		});
+		return this.#getApiKeyOrNoAuth(provider, () =>
+			this.authStorage.getApiKey(provider, sessionId, {
+				baseUrl,
+				credentialSelector: options.credentialSelector,
+			}),
+		);
 	}
 
 	async #peekApiKeyForProvider(provider: string): Promise<string | undefined> {
-		if (this.#keylessProviders.has(provider) && !this.authStorage.hasAuth(provider)) {
-			return kNoAuth;
-		}
-		return this.authStorage.peekApiKey(provider);
+		return this.#getApiKeyOrNoAuth(provider, () => this.authStorage.peekApiKey(provider));
 	}
 
 	/**
@@ -2878,13 +2756,15 @@ export class ModelRegistry {
 			if (config.oauth?.modifyModels) {
 				const credential = this.authStorage.getOAuthCredential(providerName);
 				if (credential) {
-					this.#models = config.oauth.modifyModels(withRuntimeTransportOverride, credential);
+					this.#models = applyFinalCodexGpt56ContextCap(
+						config.oauth.modifyModels(withRuntimeTransportOverride, credential),
+					);
 					this.#rebuildCanonicalIndex();
 					return;
 				}
 			}
 
-			this.#models = withRuntimeTransportOverride;
+			this.#models = applyFinalCodexGpt56ContextCap(withRuntimeTransportOverride);
 			this.#rebuildCanonicalIndex();
 			return;
 		}
@@ -2937,6 +2817,18 @@ export class ModelRegistry {
 			return false;
 		}
 		return true;
+	}
+
+	/** Return whether a selector has an active, expired, or no rate-limit suppression. */
+	getSelectorSuppressionStatus(selector: string): "active" | "expired" | "none" {
+		const normalizedSelector = normalizeSuppressedSelector(selector);
+		const suppressedUntil = this.#suppressedSelectors.get(normalizedSelector);
+		if (!suppressedUntil) return "none";
+		if (suppressedUntil <= Date.now()) {
+			this.#suppressedSelectors.delete(normalizedSelector);
+			return "expired";
+		}
+		return "active";
 	}
 }
 
