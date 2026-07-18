@@ -683,6 +683,18 @@ function isLocalModelEndpoint(model: Model | undefined): boolean {
 
 const IRC_REPLY_MAX_BYTES = 4096;
 const BTW_ESTABLISHMENT_TIMEOUT_MS = 15_000;
+async function awaitWithAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+	if (!signal) return await promise;
+	signal.throwIfAborted();
+	const aborted = Promise.withResolvers<never>();
+	const onAbort = (): void => aborted.reject(signal.reason);
+	signal.addEventListener("abort", onAbort, { once: true });
+	try {
+		return await Promise.race([promise, aborted.promise]);
+	} finally {
+		signal.removeEventListener("abort", onAbort);
+	}
+}
 
 export type EphemeralTurnPurpose = "btw" | "background";
 
@@ -11268,7 +11280,9 @@ export class AgentSession {
 						args.promptText,
 					)
 				: undefined;
-		const sideSessionId = args.purpose === "btw" ? `${this.sessionId}:btw:${crypto.randomUUID()}` : this.sessionId;
+		const providerAffinitySessionId = this.agent.providerSessionId ?? this.agent.sessionId ?? this.sessionId;
+		const sideSessionId =
+			args.purpose === "btw" ? `${providerAffinitySessionId}:btw:${crypto.randomUUID()}` : providerAffinitySessionId;
 		const rosterClaim = args.purpose !== "btw" ? this.#claimIrcRosterCandidate() : null;
 		let rosterClaimDeferred = false;
 		try {
@@ -11276,8 +11290,10 @@ export class AgentSession {
 			if (!model) {
 				throw new Error("No active model on session");
 			}
-			const apiKey = await this.#modelRegistry.getApiKey(model, this.sessionId);
-			args.signal?.throwIfAborted();
+			const apiKey = await awaitWithAbort(
+				this.#modelRegistry.getApiKey(model, providerAffinitySessionId),
+				args.signal,
+			);
 			if (!apiKey) {
 				throw new Error(`No API key for ${model.provider}/${model.id}`);
 			}
@@ -11329,11 +11345,12 @@ export class AgentSession {
 							sideSessionId,
 							model.provider,
 							this.#modelRegistry.authStorage,
-							this.sessionId,
+							providerAffinitySessionId,
 						),
 						reasoning: toReasoningEffort(this.thinkingLevel),
 						hideThinkingSummary: this.agent.hideThinkingSummary,
 						serviceTier: this.serviceTier,
+						onPayload: this.#onPayload,
 						signal: requestSignal,
 						toolChoice: "none",
 						requestMaxRetries: 0,

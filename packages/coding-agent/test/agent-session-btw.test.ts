@@ -112,6 +112,8 @@ interface HarnessOptions {
 	onPayload?: () => void;
 	onResponse?: () => void;
 	onSseEvent?: () => void;
+	providerSessionId?: string;
+	providerCacheSessionId?: string;
 }
 
 function userMessage(text: string): UserMessage {
@@ -169,6 +171,8 @@ function createHarness(options: HarnessOptions = {}): {
 		onPayload: options.onPayload,
 		onResponse: options.onResponse,
 		onSseEvent: options.onSseEvent,
+		providerSessionId: options.providerSessionId,
+		providerCacheSessionId: options.providerCacheSessionId,
 	});
 	sessions.push(session);
 	return { session, model, committed, live, getApiKey, sessionManager };
@@ -208,11 +212,13 @@ describe("AgentSession /btw isolation", () => {
 		expect(call?.options?.requestMaxRetries).toBe(0);
 		expect(call?.options?.streamMaxRetries).toBe(0);
 		expect(call?.options?.streamFirstEventTimeoutMs).toBe(0);
-		expect(harness.getApiKey.mock.calls[0]?.[1]).toBe(harness.session.sessionId);
+		expect(harness.getApiKey.mock.calls[0]?.[1]).toBe(
+			harness.session.agent.providerSessionId ?? harness.session.agent.sessionId ?? harness.session.sessionId,
+		);
 		expect(call?.options?.sessionId).toContain(":btw:");
 		expect(call?.options?.sessionId).not.toBe(harness.session.sessionId);
 		expect(call?.options?.metadata?.user_id).toContain(call?.options?.sessionId);
-		expect(call?.options?.onPayload).toBeUndefined();
+		expect(call?.options?.onPayload).toBe(onPayload);
 		expect(call?.options?.onResponse).toBeUndefined();
 		expect(call?.options?.onSseEvent).toBeUndefined();
 		expect(onPayload).not.toHaveBeenCalled();
@@ -225,6 +231,19 @@ describe("AgentSession /btw isolation", () => {
 		// the evidence-backed invariant is that the main map remains reference-identical and untouched.
 		expect(harness.session.providerSessionState).toBe(providerStateBefore);
 		expect(harness.session.providerSessionState.size).toBe(0);
+	});
+
+	it("uses the main provider cache identity for credentials and account metadata", async () => {
+		const harness = createHarness({
+			providerSessionId: "logical-provider-session",
+			providerCacheSessionId: "main-cache-affinity",
+		});
+
+		await harness.session.runEphemeralTurn({ purpose: "btw", promptText: "affinity check" });
+
+		expect(harness.getApiKey.mock.calls[0]?.[1]).toBe("main-cache-affinity");
+		expect(harness.model.calls[0]?.options?.metadata?.user_id).toContain("main-cache-affinity");
+		expect(harness.model.calls[0]?.options?.sessionId).toStartWith("main-cache-affinity:btw:");
 	});
 
 	it("reaches a unique side provider event while the main provider request remains active and unchanged", async () => {
@@ -410,11 +429,10 @@ describe("AgentSession /btw isolation", () => {
 		const controller = new AbortController();
 		const turn = harness.session.runEphemeralTurn({
 			purpose: "btw",
-			promptText: "cancelled",
+			promptText: "cancel during credentials",
 			signal: controller.signal,
 		});
 		controller.abort(new Error("replaced during credentials"));
-		key.resolve("test-key");
 
 		await expect(turn).rejects.toThrow("replaced during credentials");
 		expect(harness.model.calls).toHaveLength(0);
