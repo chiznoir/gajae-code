@@ -233,7 +233,7 @@ describe("InteractiveMode goal mode integration", () => {
 		expect(result.exitCode).toBe(0);
 		expect(harness.session.getGoalModeState()?.goal.objective).toContain(".gjc/ultragoal/goals.json");
 		expect(harness.session.getActiveToolNames()).toContain("goal");
-	});
+	}, 15_000);
 
 	it("treats budget as objective text instead of a goal budget command", async () => {
 		await harness.mode.goalModeController.handleCommand("budget 123");

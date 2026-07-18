@@ -7,7 +7,7 @@ import {
 	toResultText,
 	turnTimeoutFingerprint,
 } from "../../goals/continuation-timeout-guard";
-import { type GoalModeState, normalizeGoal } from "../../goals/state";
+import { type Goal, type GoalModeState, normalizeGoal } from "../../goals/state";
 import type { AgentSession, AgentSessionEvent } from "../../session/agent-session";
 import type { SessionContext, SessionManager } from "../../session/session-manager";
 import { formatDuration } from "../../slash-commands/helpers/format";
@@ -255,7 +255,7 @@ export class GoalModeController {
 			? await consumePendingGoalModeRequest(this.ctx.sessionManager.getCwd(), this.ctx.sessionManager.getSessionId())
 			: null;
 		if (!pendingGoal) return false;
-		await this.enter({ objective: pendingGoal.objective, silent: true });
+		await this.enter({ objective: pendingGoal.objective, provenance: pendingGoal.provenance, silent: true });
 		this.scheduleContinuation();
 		return true;
 	}
@@ -286,14 +286,22 @@ export class GoalModeController {
 		}
 	}
 
-	async enter(options: { objective?: string; resume?: boolean; silent?: boolean }): Promise<void> {
+	async enter(options: {
+		objective?: string;
+		provenance?: Goal["provenance"];
+		resume?: boolean;
+		silent?: boolean;
+	}): Promise<void> {
 		if (this.#enabled) return;
 		if (!this.ctx.modeGate.enter("goal")) return this.ctx.showWarning("Exit plan mode first.");
 		this.#previousTools = this.ctx.session.getActiveToolNames();
 		this.#paused = false;
 		const state = options.resume
 			? await this.ctx.session.goalRuntime.resumeGoal()
-			: await this.ctx.session.goalRuntime.createGoal({ objective: options.objective ?? "" });
+			: await this.ctx.session.goalRuntime.createGoal({
+					objective: options.objective ?? "",
+					provenance: options.provenance,
+				});
 		await this.ctx.session.setActiveToolsByName([...new Set([...this.#previousTools, "goal"])]);
 		this.ctx.session.setGoalModeState(state);
 		this.#enabled = true;

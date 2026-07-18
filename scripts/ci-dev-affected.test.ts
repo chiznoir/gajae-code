@@ -396,7 +396,6 @@ describe("--matrix-json and --task CLI fan-out", () => {
 		expect(output).toContain("plan_digest=");
 		expect(await Bun.file(path.join(repoRoot, ".ci-dev-affected-plan.json")).exists()).toBe(true);
 	});
-
 	test("Cargo selection includes transitive dependents and never emits vendored shards", async () => {
 		const sdk = await runScript(["--matrix-json"], "crates/gjc-sdk/src/lib.rs");
 		expect(sdk.exitCode).toBe(0);
@@ -516,6 +515,53 @@ describe("--matrix-json and --task CLI fan-out", () => {
 		});
 		expect(receiptMissing.exitCode).toBe(1);
 		expect(receiptMissing.stderr).toContain("shard receipt set does not match canonical plan");
+		await Bun.write(path.join(receiptDir, "0.json"), JSON.stringify({ key: expectedShards[0]!.key, identity: expectedShards[0]!.identity }));
+		await Bun.write(path.join(receiptDir, "stale-extra.json"), JSON.stringify({ key: "stale", identity: "stale" }));
+		const receiptExtra = await runScript(["--validate-shard-receipts"], "packages/stats/src/index.ts", {
+			CI_DEV_AFFECTED_PLAN: planFile,
+			CI_DEV_PLAN_DIGEST: digest as string,
+			CI_DEV_PLAN_SOURCE_SHA: head,
+			CI_DEV_SHARD_RECEIPTS: receiptDir,
+		});
+		expect(receiptExtra.exitCode).toBe(1);
+		expect(receiptExtra.stderr).toContain("shard receipt set does not match canonical plan");
+		await fs.rm(path.join(receiptDir, "stale-extra.json"));
+		await Bun.write(path.join(receiptDir, "duplicate.json"), JSON.stringify({ key: expectedShards[0]!.key, identity: expectedShards[0]!.identity }));
+		const receiptDuplicate = await runScript(["--validate-shard-receipts"], "packages/stats/src/index.ts", {
+			CI_DEV_AFFECTED_PLAN: planFile,
+			CI_DEV_PLAN_DIGEST: digest as string,
+			CI_DEV_PLAN_SOURCE_SHA: head,
+			CI_DEV_SHARD_RECEIPTS: receiptDir,
+		});
+		expect(receiptDuplicate.exitCode).toBe(1);
+		expect(receiptDuplicate.stderr).toContain("shard receipt set does not match canonical plan");
+		await fs.rm(path.join(receiptDir, "duplicate.json"));
+		await Bun.write(path.join(receiptDir, "0.json"), JSON.stringify({ key: expectedShards[0]!.key, identity: "wrong" }));
+		const receiptWrongIdentity = await runScript(["--validate-shard-receipts"], "packages/stats/src/index.ts", {
+			CI_DEV_AFFECTED_PLAN: planFile,
+			CI_DEV_PLAN_DIGEST: digest as string,
+			CI_DEV_PLAN_SOURCE_SHA: head,
+			CI_DEV_SHARD_RECEIPTS: receiptDir,
+		});
+		expect(receiptWrongIdentity.exitCode).toBe(1);
+		expect(receiptWrongIdentity.stderr).toContain("shard receipt set does not match canonical plan");
+		await Bun.write(path.join(receiptDir, "0.json"), "{");
+		const receiptMalformedJson = await runScript(["--validate-shard-receipts"], "packages/stats/src/index.ts", {
+			CI_DEV_AFFECTED_PLAN: planFile,
+			CI_DEV_PLAN_DIGEST: digest as string,
+			CI_DEV_PLAN_SOURCE_SHA: head,
+			CI_DEV_SHARD_RECEIPTS: receiptDir,
+		});
+		expect(receiptMalformedJson.exitCode).toBe(1);
+		await Bun.write(path.join(receiptDir, "0.json"), JSON.stringify({ key: expectedShards[0]!.key, identity: expectedShards[0]!.identity, extra: true }));
+		const receiptMalformedObject = await runScript(["--validate-shard-receipts"], "packages/stats/src/index.ts", {
+			CI_DEV_AFFECTED_PLAN: planFile,
+			CI_DEV_PLAN_DIGEST: digest as string,
+			CI_DEV_PLAN_SOURCE_SHA: head,
+			CI_DEV_SHARD_RECEIPTS: receiptDir,
+		});
+		expect(receiptMalformedObject.exitCode).toBe(1);
+		expect(receiptMalformedObject.stderr).toContain("malformed shard receipt");
 		const wrongSource = await runScript(["--validate-plan"], "packages/stats/src/index.ts", {
 			CI_DEV_AFFECTED_PLAN: planFile,
 			CI_DEV_PLAN_DIGEST: digest as string,

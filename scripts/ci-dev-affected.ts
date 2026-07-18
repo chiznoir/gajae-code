@@ -450,6 +450,7 @@ async function resolveBaseRef(): Promise<string> {
 			const value = mergeBase.stdout.toString().trim();
 			if (value !== "") return value;
 		}
+		if (baseSha && !ZERO_SHA.test(baseSha)) return baseSha;
 		return `origin/${baseRef}`;
 	}
 	if (baseSha && !ZERO_SHA.test(baseSha)) {

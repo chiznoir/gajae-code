@@ -12,6 +12,7 @@ import { modeStatePath, sessionSpecsDir } from "./session-layout";
 import { resolveGjcSessionForWrite, writeSessionActivityMarker } from "./session-resolution";
 import { runNativeStateCommand } from "./state-runtime";
 import { appendJsonl, readExistingStateForMutation, writeArtifact, writeWorkflowEnvelopeAtomic } from "./state-writer";
+import { assertSafePathComponent, CommandError, flagValue, hasFlag } from "./workflow-cli-common";
 
 export * from "./deep-interview-recorder";
 
@@ -30,8 +31,6 @@ export interface DeepInterviewCommandResult {
 	stdout?: string;
 	stderr?: string;
 }
-
-const PATH_COMPONENT_RE = /^[A-Za-z0-9_-][A-Za-z0-9._-]{0,63}$/;
 
 const DEFAULT_AMBIGUITY_THRESHOLD = 0.05;
 
@@ -105,12 +104,9 @@ interface DeepInterviewTraceSummary {
 
 type DeepInterviewResolution = keyof typeof RESOLUTION_THRESHOLDS;
 
-class DeepInterviewCommandError extends Error {
-	constructor(
-		public readonly exitStatus: number,
-		message: string,
-	) {
-		super(message);
+class DeepInterviewCommandError extends CommandError {
+	constructor(exitStatus: number, message: string) {
+		super(exitStatus, message);
 		this.name = "DeepInterviewCommandError";
 	}
 }
@@ -124,22 +120,6 @@ const VALUE_FLAGS = new Set([
 	"--spec",
 	"--handoff",
 ]);
-
-function flagValue(args: readonly string[], flag: string): string | undefined {
-	const index = args.indexOf(flag);
-	if (index < 0) return undefined;
-	return args[index + 1];
-}
-
-function hasFlag(args: readonly string[], flag: string): boolean {
-	return args.includes(flag);
-}
-
-function assertSafePathComponent(value: string, label: string): void {
-	if (!PATH_COMPONENT_RE.test(value) || value.includes("..")) {
-		throw new DeepInterviewCommandError(2, `invalid path component for --${label}: ${value}`);
-	}
-}
 
 function defaultSpecSlug(now: Date = new Date()): string {
 	const yyyy = now.getUTCFullYear().toString().padStart(4, "0");
@@ -867,7 +847,7 @@ export async function runNativeDeepInterviewCommand(
 				].join("\n");
 		return { status: 0, stdout };
 	} catch (error) {
-		if (error instanceof DeepInterviewCommandError) return { status: error.exitStatus, stderr: `${error.message}\n` };
+		if (error instanceof CommandError) return { status: error.exitStatus, stderr: `${error.message}\n` };
 		return { status: 1, stderr: `${error instanceof Error ? error.message : String(error)}\n` };
 	}
 }

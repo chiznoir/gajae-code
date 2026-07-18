@@ -283,7 +283,7 @@ import {
 	readVisibleSkillActiveState,
 	syncSkillActiveState,
 } from "../skill-state/active-state";
-import { assertWorkflowMutationAllowed } from "../skill-state/deep-interview-mutation-guard";
+import { assertWorkflowMutationAllowed } from "../skill-state/workflow-mutation-guard";
 import { invalidateHostMetadata } from "../ssh/connection-manager";
 import { buildVolatileProjectContext } from "../system-prompt";
 import { resolveThinkingLevelForModel, toReasoningEffort } from "../thinking";
@@ -5495,11 +5495,8 @@ export class AgentSession {
 	}
 
 	/**
-	 * Wrap a tool with the deep-interview mutation guard. This guard is intentionally
-	 * outermost so active interviews reject product-code mutation before ACP permission
-	 * prompts or tool execution can run.
-	 */
-	#wrapToolForDeepInterviewMutationGuard<T extends AgentTool>(tool: T): T {
+	/** Wrap a tool with the workflow mutation guard before permissions or execution. */
+	#wrapToolForWorkflowMutationGuard<T extends AgentTool>(tool: T): T {
 		if (!["edit", "write", "ast_edit", "bash"].includes(tool.name)) return tool;
 		return new Proxy(tool, {
 			get: (target, prop) => {
@@ -5530,7 +5527,8 @@ export class AgentSession {
 		const activeSkill = this.#activeSkillState?.skill ?? "";
 		const activeSkillSession = this.#activeSkillState?.sessionId ?? "";
 		return [
-			"deep-interview-mutation-v1",
+			"workflow-mutation-v1",
+
 			"ultragoal-ask-v1",
 			`active=${activeSkill}:${activeSkillSession}`,
 			`acp=${acpEnabled ? "on" : "off"}:sdk=${sdkEnabled ? "on" : "off"}:${this.#acpPermissionWrapperVersion}`,
@@ -5542,7 +5540,7 @@ export class AgentSession {
 		let wrappersByVersion = this.#guardedToolWrapperCache.get(tool);
 		const cached = wrappersByVersion?.get(cacheKey);
 		if (cached) return cached as T;
-		const wrapped = this.#wrapToolForDeepInterviewMutationGuard(
+		const wrapped = this.#wrapToolForWorkflowMutationGuard(
 			this.#wrapToolForAcpPermission(
 				guardToolForUltragoalAsk(
 					tool,
@@ -6476,7 +6474,7 @@ export class AgentSession {
 
 		const previousTools = this.getActiveToolNames();
 		const goalTools = [...new Set([...previousTools, "goal"])];
-		await this.#goalRuntime.createGoal({ objective: pendingGoal.objective });
+		await this.#goalRuntime.createGoal({ objective: pendingGoal.objective, provenance: pendingGoal.provenance });
 		await this.setActiveToolsByName(goalTools);
 		if (this.isStreaming) {
 			await this.sendGoalModeContext({ deliverAs: "steer" });

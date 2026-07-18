@@ -118,6 +118,42 @@ describe("gjc state handoff", () => {
 		});
 	});
 
+	it("serializes a handoff with a concurrent state write to the callee mode-state", async () => {
+		await withTempCwd(async cwd => {
+			const callerPath = modeStatePath(cwd, TEST_SESSION_ID, "deep-interview");
+			const calleePath = modeStatePath(cwd, TEST_SESSION_ID, "ralplan");
+			await writeJson(callerPath, {
+				skill: "deep-interview",
+				version: WORKFLOW_STATE_VERSION,
+				active: true,
+				current_phase: "interviewing",
+				updated_at: "2026-01-01T00:00:00.000Z",
+			});
+			await writeJson(calleePath, {
+				skill: "ralplan",
+				version: WORKFLOW_STATE_VERSION,
+				active: false,
+				current_phase: "planner",
+				updated_at: "2026-01-01T00:00:00.000Z",
+			});
+
+			const [handoff, write] = await Promise.all([
+				runNativeStateCommand(["handoff", "--mode", "deep-interview", "--to", "ralplan", "--json"], cwd),
+				runNativeStateCommand(
+					["write", "--mode", "ralplan", "--input", '{"current_phase":"planner","concurrent":true}', "--json"],
+					cwd,
+				),
+			]);
+
+			expect(handoff.status).toBe(0);
+			expect(write.status).toBe(0);
+			const callee = await readJson(calleePath);
+			expect(callee?.state_revision).toBe(2);
+			expect(callee?.skill).toBe("ralplan");
+			expect(callee?.version).toBe(WORKFLOW_STATE_VERSION);
+		});
+	});
+
 	it("normalizes legacy caller and callee envelopes to v2 during handoff", async () => {
 		await withTempCwd(async cwd => {
 			const callerPath = modeStatePath(cwd, TEST_SESSION_ID, "deep-interview");
