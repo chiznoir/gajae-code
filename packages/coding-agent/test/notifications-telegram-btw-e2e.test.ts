@@ -291,13 +291,17 @@ test("/btw travels through NotificationServer and a real WebSocket with one stri
 				text: "status?",
 			});
 			const turn = inbound[0]!;
+			const connectionId = turn.connectionId;
+			if (typeof connectionId !== "string" || !connectionId)
+				throw new Error("native inbound event did not preserve the authenticated connection ID");
 			for (const mismatch of [
 				{ updateId: 8 },
 				{ messageId: 71 },
 				{ threadId: String(THREAD_ID + 1) },
 				{ sessionId: "other" },
 			]) {
-				server.pushFrame(
+				server.sendTo(
+					connectionId,
 					JSON.stringify({
 						type: "ephemeral_turn_result",
 						sessionId,
@@ -323,9 +327,9 @@ test("/btw travels through NotificationServer and a real WebSocket with one stri
 				status: "ok",
 				text: "ephemeral answer",
 			};
-			server.pushFrame(JSON.stringify(terminal));
+			server.sendTo(connectionId, JSON.stringify(terminal));
 			await waitFor(() => terminalDispatchCount() === before + 1, "Telegram terminal dispatch");
-			server.pushFrame(JSON.stringify(terminal));
+			server.sendTo(connectionId, JSON.stringify(terminal));
 			await sleep(80);
 			expect(terminalDispatchCount()).toBe(before + 1);
 			const reply = bot.calls.at(-1)!;

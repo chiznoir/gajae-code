@@ -3280,26 +3280,6 @@ export function createNotificationsExtension(
 				return;
 			}
 			const json = JSON.stringify(frame);
-			if (connectionId.startsWith("seam:")) {
-				try {
-					pushSessionFrame(runtime!, {
-						type: "control_command_result",
-						sessionId: runtime!.id,
-						requestId: connectionId.slice("seam:".length),
-						status: "ok",
-						message: json,
-					});
-				} catch (error) {
-					logger.warn(`sdk: seam response delivery failed for ${connectionId}: ${String(error)}`);
-					abandonPromptResponse(connectionId, frame);
-					throw error;
-				}
-				return;
-			}
-			if (connectionId.startsWith("notification:") && typeof frame.type === "string") {
-				pushSessionFrame(runtime!, frame as Record<string, unknown> & { type: string });
-				return;
-			}
 			try {
 				server.sendTo(connectionId, json);
 			} catch (error) {
@@ -3500,9 +3480,8 @@ export function createNotificationsExtension(
 				try {
 					const frame = JSON.parse(inbound.json) as unknown;
 					if (!frame || typeof frame !== "object") return;
-					// Native Rust authenticates and strips the token before emitting InboundEvent.
 					const typedFrame = frame as Record<string, unknown>;
-					if (ephemeralTurns.handle(inbound.connectionId, typedFrame)) return;
+					if (typedFrame.type === "ephemeral_turn" || typedFrame.type === "ephemeral_turn_cancel") return;
 					inboundSdkFrame?.(inbound.connectionId, typedFrame);
 				} catch {}
 			});
@@ -3744,29 +3723,29 @@ export function createNotificationsExtension(
 			// thread (forwarded by the daemon over the WS, fail-closed at the daemon).
 			server.onInbound((err, inbound) => {
 				if (err || !inbound) return;
+				const authenticatedInbound = inbound as typeof inbound & {
+					connectionId: string;
+					messageId?: number;
+					reason?: string;
+				};
 				if (inbound.kind === "control_command") {
 					const frame = sdkInboundFrame(inbound.commandJson);
 					if (frame) {
-						inboundSdkFrame?.(`seam:${inbound.requestId ?? "notification"}`, frame);
+						inboundSdkFrame?.(authenticatedInbound.connectionId, frame);
 						return;
 					}
 				}
 				if (inbound.kind === "ephemeral_turn" || inbound.kind === "ephemeral_turn_cancel") {
-					const sideTurn = inbound as typeof inbound & {
-						messageId?: number;
-						reason?: string;
-					};
-					// Older native bridges expose authenticated side turns only through onInbound,
-					// which deliberately omits the transport connection id. Broadcast the strictly
-					// correlated terminal frame so a same-authority reconnect can receive it.
-					ephemeralTurns.handle(`notification:${sideTurn.sessionId}`, {
-						type: sideTurn.kind,
-						sessionId: sideTurn.sessionId,
-						requestId: sideTurn.requestId,
-						updateId: sideTurn.updateId,
-						messageId: sideTurn.messageId,
-						threadId: sideTurn.threadId,
-						...(sideTurn.kind === "ephemeral_turn" ? { question: sideTurn.text } : { reason: sideTurn.reason }),
+					ephemeralTurns.handle(authenticatedInbound.connectionId, {
+						type: authenticatedInbound.kind,
+						sessionId: authenticatedInbound.sessionId,
+						requestId: authenticatedInbound.requestId,
+						updateId: authenticatedInbound.updateId,
+						messageId: authenticatedInbound.messageId,
+						threadId: authenticatedInbound.threadId,
+						...(authenticatedInbound.kind === "ephemeral_turn"
+							? { question: authenticatedInbound.text }
+							: { reason: authenticatedInbound.reason }),
 					});
 					return;
 				}

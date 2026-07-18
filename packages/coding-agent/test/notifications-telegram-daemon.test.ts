@@ -12,6 +12,7 @@ import {
 	TELEGRAM_MESSAGE_LIMIT,
 	TELEGRAM_PARSE_MODE,
 } from "../src/sdk/bus/html-format";
+import { RateLimitPool } from "../src/sdk/bus/rate-limit-pool";
 import { deliverRichWithFallback } from "../src/sdk/bus/rich-render";
 import {
 	acquireDaemonOwnership,
@@ -8361,7 +8362,7 @@ describe("telegram daemon /btw reservation and capability boundaries", () => {
 		expect(sends.every(call => call.options?.noRetry === true)).toBe(true);
 		expect(tokensBefore - pool.availableTokens()).toBe(expectedChunks.length);
 	});
-	test("stops split /btw fallback after a rejected chunk without retrying or reordering", async () => {
+	test("partial accepted /btw fallback tombstones the turn without a replacement notice", async () => {
 		const now = () => 2_000;
 		const { bot, daemon, threadId } = await daemonWithTopic({ rich: false, now });
 		await daemon.handleTelegramUpdate({
@@ -8398,6 +8399,15 @@ describe("telegram daemon /btw reservation and capability boundaries", () => {
 		expect(sends.map(call => call.body.text)).toEqual(expectedChunks.slice(0, 2));
 		expect(sends.every(call => call.options?.noRetry === true)).toBe(true);
 		expect(attempts).toBe(2);
+		await daemon.handleSessionMessage(session, { type: "session_closed", sessionId: "S" });
+		expect(
+			bot.calls.filter(
+				call =>
+					call.method === "sendMessage" &&
+					call.body.text ===
+						"This /btw question stopped because the GJC session closed or changed. Reopen it and try again.",
+			),
+		).toHaveLength(0);
 	});
 
 	test("removes a queued stale /btw fallback before reconnect replay", async () => {
@@ -8959,5 +8969,17 @@ describe("telegram daemon /btw reservation and capability boundaries", () => {
 		const deleteIndex = bot.calls.findIndex(call => call.method === "deleteForumTopic");
 		expect(unavailableIndex).toBeGreaterThanOrEqual(0);
 		expect(deleteIndex).toBeGreaterThan(unavailableIndex);
+	});
+
+	test("retires a granted pool settlement so an item id can be safely reused", async () => {
+		const pool = new RateLimitPool<string>({ capacity: 1, refillPerSec: 0, now: () => 0 });
+		const first = pool.submit({ sessionId: "S", lane: "ask", itemId: "receipt", payload: "first" });
+		expect(pool.drain()).toEqual([{ sessionId: "S", lane: "ask", itemId: "receipt", payload: "first" }]);
+		pool.settle(first.itemId, "accepted");
+		await expect(first.settled).resolves.toBe("accepted");
+
+		const second = pool.submit({ sessionId: "S", lane: "ask", itemId: "receipt", payload: "second" });
+		pool.settle(second.itemId, "removed");
+		await expect(second.settled).resolves.toBe("removed");
 	});
 });

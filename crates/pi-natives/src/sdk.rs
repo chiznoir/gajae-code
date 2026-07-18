@@ -131,34 +131,37 @@ impl From<gjc_sdk::protocol::AskSelectedAckOutcome> for AskSelectedAckOutcomeEve
 pub struct InboundEvent {
 	/// Inbound kind (`user_message`, `ephemeral_turn`,
 	/// `ephemeral_turn_cancel`, `config_command`, or `control_command`).
-	pub kind:         String,
+	pub kind:          String,
+	/// Server-authenticated identity of the WebSocket connection that delivered
+	/// this event.
+	pub connection_id: String,
 	/// The session this inbound belongs to.
-	pub session_id:   String,
+	pub session_id:    String,
 	/// Free-text body (`user_message` or `ephemeral_turn` only).
-	pub text:         Option<String>,
+	pub text:          Option<String>,
 	/// Telegram update id for dedupe (`user_message`, `ephemeral_turn`, or
 	/// `ephemeral_turn_cancel` only).
-	pub update_id:    Option<i64>,
+	pub update_id:     Option<i64>,
 	/// Originating thread/topic id (`user_message`, `ephemeral_turn`, or
 	/// `ephemeral_turn_cancel` only).
-	pub thread_id:    Option<String>,
+	pub thread_id:     Option<String>,
 	/// Originating Telegram message id (`ephemeral_turn` and
 	/// `ephemeral_turn_cancel` only).
-	pub message_id:   Option<i64>,
+	pub message_id:    Option<i64>,
 	/// Requested verbosity `"lean"|"verbose"` (`config_command` only).
-	pub verbosity:    Option<String>,
+	pub verbosity:     Option<String>,
 	/// Requested redaction state (`config_command` only).
-	pub redact:       Option<bool>,
+	pub redact:        Option<bool>,
 	/// Client-generated request id (`ephemeral_turn`, `ephemeral_turn_cancel`,
 	/// or `control_command` only).
-	pub request_id:   Option<String>,
+	pub request_id:    Option<String>,
 	/// Cancellation reason (`ephemeral_turn_cancel` only).
-	pub reason:       Option<String>,
+	pub reason:        Option<String>,
 	/// JSON-encoded command payload (`control_command` only).
-	pub command_json: Option<String>,
+	pub command_json:  Option<String>,
 	/// Inline image attachments forwarded with the message (`user_message`
 	/// only).
-	pub images:       Option<Vec<InboundImageEvent>>,
+	pub images:        Option<Vec<InboundImageEvent>>,
 }
 
 /// One inline image attachment forwarded with an inbound user message.
@@ -340,17 +343,20 @@ impl NotificationServer {
 		let inbound_rx = handle.take_inbound_receiver();
 		if let (Some(tsfn), Some(mut rx)) = (inbound_tsfn, inbound_rx) {
 			let task = napi::tokio::spawn(async move {
-				while let Some(msg) = rx.recv().await {
+				while let Some(gjc_sdk::server::InboundMessage { connection_id, message: msg }) =
+					rx.recv().await
+				{
 					let event = match msg {
 						ClientMessage::UserMessage(u) => InboundEvent {
-							kind:         "user_message".to_owned(),
-							session_id:   u.session_id,
-							text:         Some(u.text),
-							update_id:    u.update_id,
-							thread_id:    u.thread_id,
-							message_id:   None,
-							reason:       None,
-							images:       if u.images.is_empty() {
+							connection_id,
+							kind: "user_message".to_owned(),
+							session_id: u.session_id,
+							text: Some(u.text),
+							update_id: u.update_id,
+							thread_id: u.thread_id,
+							message_id: None,
+							reason: None,
+							images: if u.images.is_empty() {
 								None
 							} else {
 								Some(
@@ -360,45 +366,49 @@ impl NotificationServer {
 										.collect(),
 								)
 							},
-							verbosity:    None,
-							redact:       None,
-							request_id:   None,
+							verbosity: None,
+							redact: None,
+							request_id: None,
 							command_json: None,
 						},
-						ClientMessage::EphemeralTurn(turn) => ephemeral_turn_event(turn),
-						ClientMessage::EphemeralTurnCancel(cancel) => ephemeral_turn_cancel_event(cancel),
+						ClientMessage::EphemeralTurn(turn) => ephemeral_turn_event(connection_id, turn),
+						ClientMessage::EphemeralTurnCancel(cancel) => {
+							ephemeral_turn_cancel_event(connection_id, cancel)
+						},
 						ClientMessage::ConfigCommand(c) => InboundEvent {
-							kind:         "config_command".to_owned(),
-							session_id:   c.session_id,
-							text:         None,
-							update_id:    None,
-							thread_id:    None,
-							message_id:   None,
-							reason:       None,
-							verbosity:    c.verbosity.map(|v| match v {
+							connection_id,
+							kind: "config_command".to_owned(),
+							session_id: c.session_id,
+							text: None,
+							update_id: None,
+							thread_id: None,
+							message_id: None,
+							reason: None,
+							verbosity: c.verbosity.map(|v| match v {
 								Verbosity::Lean => "lean".to_owned(),
 								Verbosity::Verbose => "verbose".to_owned(),
 							}),
-							redact:       c.redact,
-							request_id:   None,
+							redact: c.redact,
+							request_id: None,
 							command_json: None,
-							images:       None,
+							images: None,
 						},
 						ClientMessage::ControlCommand(c) => InboundEvent {
-							kind:         "control_command".to_owned(),
-							session_id:   c.session_id,
-							text:         None,
-							update_id:    c.update_id,
-							thread_id:    c.thread_id,
-							message_id:   None,
-							reason:       None,
-							verbosity:    None,
-							redact:       None,
-							request_id:   Some(c.request_id),
+							connection_id,
+							kind: "control_command".to_owned(),
+							session_id: c.session_id,
+							text: None,
+							update_id: c.update_id,
+							thread_id: c.thread_id,
+							message_id: None,
+							reason: None,
+							verbosity: None,
+							redact: None,
+							request_id: Some(c.request_id),
 							command_json: Some(
 								serde_json::to_string(&c.command).unwrap_or_else(|_| "null".to_owned()),
 							),
-							images:       None,
+							images: None,
 						},
 						_ => continue,
 					};
@@ -1059,37 +1069,45 @@ impl NotificationControlServer {
 	}
 }
 
-fn ephemeral_turn_event(turn: gjc_sdk::protocol::EphemeralTurn) -> InboundEvent {
+fn ephemeral_turn_event(
+	connection_id: String,
+	turn: gjc_sdk::protocol::EphemeralTurn,
+) -> InboundEvent {
 	InboundEvent {
-		kind:         "ephemeral_turn".to_owned(),
-		session_id:   turn.session_id,
-		text:         Some(turn.question),
-		update_id:    Some(turn.update_id),
-		thread_id:    Some(turn.thread_id),
-		message_id:   Some(turn.message_id),
-		verbosity:    None,
-		redact:       None,
-		request_id:   Some(turn.request_id),
-		reason:       None,
+		connection_id,
+		kind: "ephemeral_turn".to_owned(),
+		session_id: turn.session_id,
+		text: Some(turn.question),
+		update_id: Some(turn.update_id),
+		thread_id: Some(turn.thread_id),
+		message_id: Some(turn.message_id),
+		verbosity: None,
+		redact: None,
+		request_id: Some(turn.request_id),
+		reason: None,
 		command_json: None,
-		images:       None,
+		images: None,
 	}
 }
 
-fn ephemeral_turn_cancel_event(cancel: gjc_sdk::protocol::EphemeralTurnCancel) -> InboundEvent {
+fn ephemeral_turn_cancel_event(
+	connection_id: String,
+	cancel: gjc_sdk::protocol::EphemeralTurnCancel,
+) -> InboundEvent {
 	InboundEvent {
-		kind:         "ephemeral_turn_cancel".to_owned(),
-		session_id:   cancel.session_id,
-		text:         None,
-		update_id:    Some(cancel.update_id),
-		thread_id:    Some(cancel.thread_id),
-		message_id:   Some(cancel.message_id),
-		verbosity:    None,
-		redact:       None,
-		request_id:   Some(cancel.request_id),
-		reason:       Some("daemon_shutdown".to_owned()),
+		connection_id,
+		kind: "ephemeral_turn_cancel".to_owned(),
+		session_id: cancel.session_id,
+		text: None,
+		update_id: Some(cancel.update_id),
+		thread_id: Some(cancel.thread_id),
+		message_id: Some(cancel.message_id),
+		verbosity: None,
+		redact: None,
+		request_id: Some(cancel.request_id),
+		reason: Some("daemon_shutdown".to_owned()),
 		command_json: None,
-		images:       None,
+		images: None,
 	}
 }
 fn presentation_lease(identity: Option<ActionIdentity>) -> Result<PresentationLease> {
@@ -1128,15 +1146,17 @@ mod tests {
 
 	#[test]
 	fn ephemeral_turn_mapping_preserves_question_and_tuple_without_token() {
-		let event = super::ephemeral_turn_event(gjc_sdk::protocol::EphemeralTurn {
-			session_id: "session".to_owned(),
-			token:      "secret".to_owned(),
-			request_id: "btw:123e4567-e89b-42d3-a456-426614174000".to_owned(),
-			update_id:  7,
-			message_id: 9,
-			thread_id:  "11".to_owned(),
-			question:   "What changed?".to_owned(),
-		});
+		let event =
+			super::ephemeral_turn_event("connection-1".to_owned(), gjc_sdk::protocol::EphemeralTurn {
+				session_id: "session".to_owned(),
+				token:      "secret".to_owned(),
+				request_id: "btw:123e4567-e89b-42d3-a456-426614174000".to_owned(),
+				update_id:  7,
+				message_id: 9,
+				thread_id:  "11".to_owned(),
+				question:   "What changed?".to_owned(),
+			});
+		assert_eq!(event.connection_id, "connection-1");
 		assert_eq!(event.kind, "ephemeral_turn");
 		assert_eq!(event.session_id, "session");
 		assert_eq!(event.text.as_deref(), Some("What changed?"));
@@ -1150,15 +1170,19 @@ mod tests {
 	}
 	#[test]
 	fn ephemeral_turn_cancel_mapping_preserves_tuple_without_token_or_question() {
-		let event = super::ephemeral_turn_cancel_event(gjc_sdk::protocol::EphemeralTurnCancel {
-			session_id: "session".to_owned(),
-			token:      "secret".to_owned(),
-			request_id: "btw:123e4567-e89b-42d3-a456-426614174000".to_owned(),
-			update_id:  7,
-			message_id: 9,
-			thread_id:  "11".to_owned(),
-			reason:     gjc_sdk::protocol::EphemeralTurnCancelReason::DaemonShutdown,
-		});
+		let event = super::ephemeral_turn_cancel_event(
+			"connection-2".to_owned(),
+			gjc_sdk::protocol::EphemeralTurnCancel {
+				session_id: "session".to_owned(),
+				token:      "secret".to_owned(),
+				request_id: "btw:123e4567-e89b-42d3-a456-426614174000".to_owned(),
+				update_id:  7,
+				message_id: 9,
+				thread_id:  "11".to_owned(),
+				reason:     gjc_sdk::protocol::EphemeralTurnCancelReason::DaemonShutdown,
+			},
+		);
+		assert_eq!(event.connection_id, "connection-2");
 		assert_eq!(event.kind, "ephemeral_turn_cancel");
 		assert_eq!(event.session_id, "session");
 		assert_eq!(event.request_id.as_deref(), Some("btw:123e4567-e89b-42d3-a456-426614174000"));

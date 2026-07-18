@@ -148,7 +148,15 @@ export class RateLimitPool<T = unknown> {
 
 	/** Settle a stable item after its external transport effect has a known outcome. */
 	settle(itemId: string, disposition: Exclude<RateLimitDisposition, "queued" | "sending">): void {
-		this.settlements.get(itemId)?.resolve(disposition);
+		const deferred = this.settlements.get(itemId);
+		if (!deferred) return;
+		this.settlements.delete(itemId);
+		deferred.resolve(disposition);
+	}
+
+	/** Mark a granted item as owned by an external transport effect. */
+	markSending(itemId: string): void {
+		if (!this.settlements.has(itemId)) throw new Error(`unknown rate-limit item: ${itemId}`);
 	}
 
 	private handle(itemId: string): RateLimitHandle {
@@ -238,6 +246,7 @@ export class RateLimitPool<T = unknown> {
 			if (queue.length === 0) continue;
 			const picked = this.pickFairIndex(lane, queue);
 			const [removed] = queue.splice(picked, 1);
+			if (removed) this.markSending(removed.item.itemId!);
 			return removed?.item;
 		}
 		return undefined;

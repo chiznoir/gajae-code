@@ -1111,6 +1111,11 @@ export interface InboundEvent {
    * `ephemeral_turn_cancel`, `config_command`, or `control_command`).
    */
   kind: string
+  /**
+   * Server-authenticated identity of the WebSocket connection that delivered
+   * this event.
+   */
+  connectionId: string
   /** The session this inbound belongs to. */
   sessionId: string
   /** Free-text body (`user_message` or `ephemeral_turn` only). */

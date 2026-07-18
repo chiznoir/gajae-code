@@ -300,16 +300,21 @@ export class TopicRegistry {
 		record.nameReconcilePending = false;
 	}
 
-	/** Fence new work before the remote delete starts. */
+	/** Fence new work before the remote delete starts, including an absent in-flight create. */
 	beginDelete(sessionId: string): TopicRecord | undefined {
 		const record = this.topics.get(sessionId);
-		if (!record) return undefined;
-		const epoch = Math.max(this.epochs.get(sessionId) ?? 0, record.authorityEpoch ?? 0) + 1;
+		const epoch = Math.max(this.epochs.get(sessionId) ?? 0, record?.authorityEpoch ?? 0) + 1;
 		this.epochs.set(sessionId, epoch);
+		if (!record) return undefined;
 		record.authorityEpoch = epoch;
 		record.authorityState = "delete_pending";
 		if (this.byTopic.get(record.topicId) === sessionId) this.byTopic.delete(record.topicId);
 		return record;
+	}
+
+	/** Wait for a revoked create to settle before admitting a later lifecycle epoch. */
+	async awaitInflight(sessionId: string): Promise<void> {
+		await this.inflight.get(sessionId)?.catch(() => undefined);
 	}
 
 	/** Remove only after a definite remote deletion; ambiguity deliberately retains its fence. */

@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { spawn as childProcessSpawn } from "node:child_process";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
@@ -1388,7 +1389,7 @@ type SelectedAckOutcome =
 	| { status: "delivered"; messageId: number }
 	| { status: "failed"; reason: "route_missing" | "expired" | "cancelled" | "telegram_rejected" }
 	| { status: "unknown"; reason: "transport_ambiguous" | "shutdown" };
-type BtwQueuedDeliveryOutcome = "accepted" | "not_delivered" | "uncertain" | "stale";
+type BtwQueuedDeliveryOutcome = "accepted" | "not_delivered" | "uncertain" | "stale" | "partial_accepted";
 
 interface BtwQueuedDelivery {
 	pending: PendingBtwTurn;
@@ -1443,8 +1444,8 @@ interface PendingBtwDelivery {
 
 class TelegramEffectSupervisor {
 	#stopping = false;
-	#allowTerminal = 0;
 	readonly #abort = new AbortController();
+	readonly #terminalContext = new AsyncLocalStorage<boolean>();
 	readonly #pending = new Set<Promise<unknown>>();
 
 	call(
@@ -1453,16 +1454,18 @@ class TelegramEffectSupervisor {
 		body: unknown,
 		opts?: { signal?: AbortSignal; noRetry?: boolean },
 	): Promise<unknown> {
-		if (this.#stopping && this.#allowTerminal === 0)
+		const terminal = this.#terminalContext.getStore() === true;
+		if (this.#stopping && !terminal)
 			return Promise.reject(Object.assign(new Error("Daemon is stopping"), { name: "AbortError" }));
-		const signal =
-			this.#allowTerminal > 0
-				? opts?.signal
-				: opts?.signal
-					? AbortSignal.any([this.#abort.signal, opts.signal])
-					: this.#abort.signal;
+		const signal = terminal
+			? opts?.signal
+			: opts?.signal
+				? AbortSignal.any([this.#abort.signal, opts.signal])
+				: this.#abort.signal;
+		return this.track(api.call(method, body, { ...opts, signal }));
+	}
 
-		const effect = api.call(method, body, { ...opts, signal });
+	track<T>(effect: Promise<T>): Promise<T> {
 		this.#pending.add(effect);
 		void effect.then(
 			() => this.#pending.delete(effect),
@@ -1480,20 +1483,21 @@ class TelegramEffectSupervisor {
 		this.#abort.abort("daemon_shutdown");
 	}
 
-	async allowTerminal<T>(effect: () => Promise<T>): Promise<T> {
-		this.#allowTerminal++;
-		try {
-			return await effect();
-		} finally {
-			this.#allowTerminal--;
-		}
+	allowTerminal<T>(effect: () => Promise<T>): Promise<T> {
+		return this.#terminalContext.run(true, () => this.track(effect()));
 	}
 
 	async join(deadlineMs: number): Promise<boolean> {
-		if (this.#pending.size === 0) return true;
-		const deadline = new Promise<void>(resolve => setTimeout(resolve, deadlineMs));
-		await Promise.race([Promise.allSettled([...this.#pending]), deadline]);
-		return this.#pending.size === 0;
+		const expiresAt = Date.now() + deadlineMs;
+		while (this.#pending.size > 0) {
+			const remaining = expiresAt - Date.now();
+			if (remaining <= 0) return false;
+			await Promise.race([
+				Promise.allSettled([...this.#pending]),
+				new Promise<void>(resolve => setTimeout(resolve, remaining)),
+			]);
+		}
+		return true;
 	}
 }
 
@@ -2660,22 +2664,19 @@ export class TelegramNotificationDaemon {
 		};
 		input.signal.addEventListener("abort", abort, { once: true });
 		try {
-			this.submitPool({
+			const handle = this.pool.submit({
 				sessionId: input.pending.transportSessionId,
 				lane: "finalized",
 				itemId,
 				payload: {
-					send: {
-						method: "sendMessage",
-						lane: "finalized",
-						text: String(input.body.text ?? ""),
-					},
+					send: { method: "sendMessage", lane: "finalized", text: String(input.body.text ?? "") },
 					topicId: input.pending.threadId,
 					btwDelivery: delivery,
 				},
 			});
 			if (input.signal.aborted) abort();
 			else await this.flushPool();
+			await handle.settled;
 			return await result.promise;
 		} catch {
 			const removed = this.pool.removeById(itemId);
@@ -3016,25 +3017,20 @@ export class TelegramNotificationDaemon {
 	/** Best-effort delete of a session topic once its local notification endpoint shuts down. */
 	private async deleteTopic(sessionId: string): Promise<void> {
 		const record = this.topics.beginDelete(sessionId);
-		if (!record) return;
-		// Persist the deletion epoch before the remote effect: a restart or a late
-		// create cannot regain authority while Telegram's outcome is unknown.
+		// Persist even an absent-record fence: it revokes a create that was admitted
+		// before close but has not yet committed its topic record.
 		await this.persistTopics();
+		if (!record) {
+			await this.topics.awaitInflight(sessionId);
+			return;
+		}
 		const removed = this.pool.removeWhere(item => item.sessionId === sessionId);
 		for (const item of removed) {
 			if (item.payload.selectedAck)
 				this.finishSelectedAck(item.payload.selectedAck, { status: "failed", reason: "cancelled" });
+			item.payload.btwDelivery?.finish("stale");
 		}
-
 		try {
-			// Drop queued sends for this session before deleting the topic; otherwise
-			// rate-limited frames can flush later into a deleted topic or across resume.
-			const removed = this.pool.removeWhere(item => item.sessionId === sessionId);
-			for (const item of removed) {
-				if (item.payload.selectedAck)
-					this.finishSelectedAck(item.payload.selectedAck, { status: "failed", reason: "cancelled" });
-				item.payload.btwDelivery?.finish("stale");
-			}
 			await this.flushPool();
 			const res = (await this.botApi.call("deleteForumTopic", {
 				chat_id: this.opts.chatId,
@@ -3042,9 +3038,7 @@ export class TelegramNotificationDaemon {
 			})) as { ok?: boolean };
 			if (!topicDeleteSettled(res)) return;
 			this.topics.settleDelete(sessionId, record.topicId);
-			for (const k of [...this.liveMessages.keys()]) {
-				if (k.startsWith(`${sessionId}:`)) this.liveMessages.delete(k);
-			}
+			for (const k of [...this.liveMessages.keys()]) if (k.startsWith(`${sessionId}:`)) this.liveMessages.delete(k);
 			this.topicOwnerByIdentity.forEach((ownerSessionId, identityKey) => {
 				if (ownerSessionId === sessionId) this.topicOwnerByIdentity.delete(identityKey);
 			});
@@ -3232,10 +3226,12 @@ export class TelegramNotificationDaemon {
 			if (btwDelivery) {
 				if (!btwDelivery.isAuthoritative()) {
 					btwDelivery.finish("stale");
+					this.pool.settle(item.itemId!, "removed");
 					continue;
 				}
 				if (btwDelivery.signal.aborted) {
 					btwDelivery.finish("uncertain");
+					this.pool.settle(item.itemId!, "ambiguous");
 					continue;
 				}
 				try {
@@ -3243,15 +3239,13 @@ export class TelegramNotificationDaemon {
 						noRetry: true,
 						signal: btwDelivery.signal,
 					});
-					btwDelivery.finish(
-						response && typeof response === "object" && (response as { ok?: unknown }).ok === true
-							? "accepted"
-							: response && typeof response === "object" && (response as { ok?: unknown }).ok === false
-								? "not_delivered"
-								: "uncertain",
-					);
+					const accepted = response && typeof response === "object" && (response as { ok?: unknown }).ok === true;
+					const rejected = response && typeof response === "object" && (response as { ok?: unknown }).ok === false;
+					btwDelivery.finish(accepted ? "accepted" : rejected ? "not_delivered" : "uncertain");
+					this.pool.settle(item.itemId!, accepted ? "accepted" : rejected ? "rejected" : "ambiguous");
 				} catch {
 					btwDelivery.finish("uncertain");
+					this.pool.settle(item.itemId!, "ambiguous");
 				}
 				continue;
 			}
@@ -3262,13 +3256,18 @@ export class TelegramNotificationDaemon {
 				const controller = new AbortController();
 				selectedAck.controller = controller;
 				const routeAvailable = !topicId || (await this.pairedChatIsPrivate());
-				if (this.selectedAckPending.get(selectedAck.pendingKey) !== selectedAck) continue;
+				if (this.selectedAckPending.get(selectedAck.pendingKey) !== selectedAck) {
+					this.pool.settle(item.itemId!, "removed");
+					continue;
+				}
 				if (!routeAvailable) {
 					this.finishSelectedAck(selectedAck, { status: "failed", reason: "route_missing" });
+					this.pool.settle(item.itemId!, "rejected");
 					continue;
 				}
 				if (item.deadlineAt !== undefined && item.deadlineAt <= this.runtime.now()) {
 					this.finishSelectedAck(selectedAck, { status: "failed", reason: "expired" });
+					this.pool.settle(item.itemId!, "expired");
 					continue;
 				}
 				selectedAck.state = "sending";
@@ -3287,26 +3286,35 @@ export class TelegramNotificationDaemon {
 						},
 						{ signal: controller.signal, noRetry: true },
 					)) as { ok?: unknown; result?: { message_id?: unknown } };
+					const messageId = response.result?.message_id;
+					const delivered = response.ok === true && typeof messageId === "number";
 					this.finishSelectedAck(
 						selectedAck,
-						response.ok === true && typeof response.result?.message_id === "number"
-							? { status: "delivered", messageId: response.result.message_id }
-							: { status: "failed", reason: "telegram_rejected" },
+						delivered ? { status: "delivered", messageId } : { status: "failed", reason: "telegram_rejected" },
 					);
+					this.pool.settle(item.itemId!, delivered ? "accepted" : "rejected");
 				} catch {
 					this.finishSelectedAck(selectedAck, { status: "unknown", reason: "transport_ambiguous" });
+					this.pool.settle(item.itemId!, "ambiguous");
 				} finally {
 					(this.opts.clearTimeoutImpl ?? clearTimeout)(timer);
 				}
 				continue;
 			}
 			const { send, topicId } = item.payload;
-			if (topicId && !(await this.pairedChatIsPrivate())) continue;
+			if (topicId && !(await this.pairedChatIsPrivate())) {
+				this.pool.settle(item.itemId!, "rejected");
+				continue;
+			}
 			// Threaded topic when available; otherwise deliver flat to the paired chat.
 			const threadField = topicId ? { message_thread_id: Number(topicId) } : {};
 			const ckey = send.editable ? item.coalesceKey : undefined;
 			const editKey = ckey !== undefined ? `${item.sessionId}:${ckey}` : undefined;
-			if (item.lane === "live" && editKey && finalizedKeys.has(editKey)) continue;
+			if (item.lane === "live" && editKey && finalizedKeys.has(editKey)) {
+				this.pool.settle(item.itemId!, "removed");
+				continue;
+			}
+			let disposition: "accepted" | "ambiguous" = "accepted";
 			try {
 				// Draft streaming (opt-in, off by default): stream a live turn frame as a
 				// best-effort rich-draft preview, debounced to >=1.5s per session through
@@ -3497,7 +3505,9 @@ export class TelegramNotificationDaemon {
 				}
 			} catch {
 				// Best-effort: a failed send/edit must never stop the daemon.
+				disposition = "ambiguous";
 			} finally {
+				this.pool.settle(item.itemId!, disposition);
 				// A terminal tool frame owns the end of this coalescing key even when both
 				// edit and fallback delivery fail. Retaining the old message id would leak
 				// one entry per failure and let a later reused key edit stale Telegram state.
@@ -3886,7 +3896,7 @@ export class TelegramNotificationDaemon {
 				finish: finished.resolve,
 			};
 			this.#btwTerminalDeliveries.set(requestId, terminalDelivery);
-			let deliveryOutcome: "accepted" | "not_delivered" | "uncertain" = "not_delivered";
+			let deliveryOutcome: "accepted" | "not_delivered" | "uncertain" | "partial_accepted" = "not_delivered";
 			try {
 				if (msg.status !== "ok") {
 					const text =
@@ -3953,6 +3963,7 @@ export class TelegramNotificationDaemon {
 				};
 				const html = markdownToTelegramHtml(markdown);
 				const fallback = async (): Promise<typeof deliveryOutcome> => {
+					let acceptedChunks = 0;
 					for (const [index, text] of splitTelegramHtml(html).entries()) {
 						const outcome = await this.#queueBtwFallbackChunk({
 							requestId,
@@ -3968,9 +3979,11 @@ export class TelegramNotificationDaemon {
 								parse_mode: TELEGRAM_PARSE_MODE,
 							},
 						});
-						// One terminal reply owns one chunk ledger: only every definite
-						// acceptance succeeds; an ambiguity stops the remaining sequence.
-						if (outcome === "accepted") continue;
+						if (outcome === "accepted") {
+							acceptedChunks++;
+							continue;
+						}
+						if (outcome === "partial_accepted" || acceptedChunks > 0) return "partial_accepted";
 						return outcome === "uncertain" ? "uncertain" : "not_delivered";
 					}
 					return "accepted";
@@ -4003,6 +4016,9 @@ export class TelegramNotificationDaemon {
 						if (terminalDelivery.terminalizeOnInvalidation)
 							await this.#terminalizeBtwTurn(requestId, pending, this.#stoppingBtw);
 					} else {
+						// Any accepted chunk is already a user-visible terminal sequence. Tombstone
+						// it even when a later chunk fails so invalidation cannot append a second
+						// session-unavailable reply.
 						this.#takeBtwTurn(requestId, pending);
 					}
 				} finally {
@@ -4844,23 +4860,29 @@ export class TelegramNotificationDaemon {
 			}
 		} finally {
 			this.effects.beginShutdown();
-			await this.effects.allowTerminal(() => this.#drainBtwTurns());
-			this.runtime.stop();
-			this.stopOwnershipHeartbeatTimer();
-			this.stopFlushTimer();
-			this.stopScanTimer();
-			this.stopTypingTimer();
-			this.stopLifecycleControl();
-			await this.cleanupAllAttachmentDirs();
-			// Persist durable state before releasing ownership so a fresh daemon
-			// (e.g. after reload) reloads aliases/topics seamlessly.
-			await this.persistAliases().catch(() => undefined);
-			await this.persistTopics().catch(() => undefined);
-			await this.persistSeenUpdateIds().catch(() => undefined);
-			await this.opts.control?.clear?.(this.opts.ownerId).catch(() => undefined);
+			let persisted = false;
+			await this.effects
+				.allowTerminal(async () => {
+					await this.#drainBtwTurns();
+					this.runtime.stop();
+					this.stopOwnershipHeartbeatTimer();
+					this.stopFlushTimer();
+					this.stopScanTimer();
+					this.stopTypingTimer();
+					this.stopLifecycleControl();
+					await this.cleanupAllAttachmentDirs();
+					await this.persistAliases();
+					await this.persistTopics();
+					await this.persistSeenUpdateIds();
+					await this.opts.control?.clear?.(this.opts.ownerId);
+					persisted = true;
+				})
+				.catch(error =>
+					logger.warn(`notifications: shutdown persistence failed: ${sanitizeDiagnostic(String(error))}`),
+				);
 			const quiesced = await this.effects.join(BTW_SHUTDOWN_JOIN_MS);
-			if (!quiesced) {
-				logger.warn("notifications: shutdown effects remain unquiesced; retaining daemon ownership");
+			if (!quiesced || !persisted) {
+				logger.warn("notifications: shutdown was not durably quiesced; retaining daemon ownership");
 			} else {
 				await releaseDaemonOwnership({
 					settings: this.opts.settings,

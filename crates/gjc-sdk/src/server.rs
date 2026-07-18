@@ -411,9 +411,9 @@ struct ServerState {
 	resolver_available:  AtomicBool,
 	/// Present in forward mode: accepted replies are sent here for the host.
 	reply_tx:            Option<mpsc::UnboundedSender<crate::actions::ClaimedReply>>,
-	/// Always present: inbound free-text injections / in-thread config commands
-	/// forwarded to the host (token-authorized).
-	inbound_tx:          mpsc::UnboundedSender<ClientMessage>,
+	/// Always present: authenticated inbound messages paired with the
+	/// server-assigned connection identity that delivered them.
+	inbound_tx:          mpsc::UnboundedSender<InboundMessage>,
 	/// v3 frames, kept raw so the SDK host owns their protocol semantics.
 	frame_tx:            mpsc::UnboundedSender<(String, String)>,
 	/// Negotiated capability snapshots for host-side per-connection policy.
@@ -429,6 +429,15 @@ struct ServerState {
 	connection_sequence: AtomicU64,
 }
 
+/// An authenticated inbound message paired with its server-assigned connection
+/// id.
+#[derive(Debug)]
+pub struct InboundMessage {
+	pub connection_id: String,
+	pub message:       ClientMessage,
+}
+
+pub type InboundReceiver = mpsc::UnboundedReceiver<InboundMessage>;
 type FrameReceiver = mpsc::UnboundedReceiver<(String, String)>;
 type CapabilityReceiver = mpsc::UnboundedReceiver<CapabilityUpdate>;
 
@@ -444,7 +453,7 @@ pub struct ServerHandle {
 	session_id:    String,
 	state_root:    Option<PathBuf>,
 	reply_rx: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<crate::actions::ClaimedReply>>>>,
-	inbound_rx:    Arc<Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<ClientMessage>>>>,
+	inbound_rx:    Arc<Mutex<Option<InboundReceiver>>>,
 	frame_rx:      Arc<Mutex<Option<FrameReceiver>>>,
 	capability_rx: Arc<Mutex<Option<CapabilityReceiver>>>,
 	close_rx:      Arc<Mutex<Option<mpsc::UnboundedReceiver<String>>>>,
@@ -651,13 +660,11 @@ impl ServerHandle {
 		self.reply_rx.lock().take()
 	}
 
-	/// Take the receiver of forwarded inbound messages (free-text injections and
-	/// in-thread config commands). Returns the receiver exactly once; subsequent
-	/// calls return `None`.
+	/// Take authenticated inbound messages paired with their server-assigned
+	/// connection identity. Returns the receiver exactly once; subsequent calls
+	/// return `None`.
 	#[must_use]
-	pub fn take_inbound_receiver(
-		&self,
-	) -> Option<tokio::sync::mpsc::UnboundedReceiver<ClientMessage>> {
+	pub fn take_inbound_receiver(&self) -> Option<InboundReceiver> {
 		self.inbound_rx.lock().take()
 	}
 
@@ -1136,7 +1143,7 @@ pub async fn start(config: ServerConfig) -> std::io::Result<ServerHandle> {
 	} else {
 		(None, None)
 	};
-	let (inbound_tx, inbound_rx) = mpsc::unbounded_channel::<ClientMessage>();
+	let (inbound_tx, inbound_rx) = mpsc::unbounded_channel::<InboundMessage>();
 	let (frame_tx, frame_rx) = mpsc::unbounded_channel();
 	let (cap_tx, cap_rx) = mpsc::unbounded_channel();
 	let (close_tx, close_rx) = mpsc::unbounded_channel();
@@ -1570,14 +1577,20 @@ where
 		// action replies.
 		ClientMessage::UserMessage(u) => {
 			if tokens_match(&u.token, &state.token) {
-				let _ = state.inbound_tx.send(ClientMessage::UserMessage(u));
+				let _ = state.inbound_tx.send(InboundMessage {
+					connection_id: connection_id.to_owned(),
+					message:       ClientMessage::UserMessage(u),
+				});
 			}
 			return true;
 		},
 		ClientMessage::EphemeralTurn(turn) => {
 			if tokens_match(&turn.token, &state.token) {
 				let canonical = ClientMessage::EphemeralTurn(turn);
-				let _ = state.inbound_tx.send(canonical.clone());
+				let _ = state.inbound_tx.send(InboundMessage {
+					connection_id: connection_id.to_owned(),
+					message:       canonical.clone(),
+				});
 				if let Ok(frame) = serde_json::to_string(&canonical) {
 					let _ = state.frame_tx.send((connection_id.to_owned(), frame));
 				}
@@ -1587,7 +1600,10 @@ where
 		ClientMessage::EphemeralTurnCancel(cancel) => {
 			if tokens_match(&cancel.token, &state.token) {
 				let canonical = ClientMessage::EphemeralTurnCancel(cancel);
-				let _ = state.inbound_tx.send(canonical.clone());
+				let _ = state.inbound_tx.send(InboundMessage {
+					connection_id: connection_id.to_owned(),
+					message:       canonical.clone(),
+				});
 				if let Ok(frame) = serde_json::to_string(&canonical) {
 					let _ = state.frame_tx.send((connection_id.to_owned(), frame));
 				}
@@ -1596,13 +1612,19 @@ where
 		},
 		ClientMessage::ConfigCommand(c) => {
 			if tokens_match(&c.token, &state.token) {
-				let _ = state.inbound_tx.send(ClientMessage::ConfigCommand(c));
+				let _ = state.inbound_tx.send(InboundMessage {
+					connection_id: connection_id.to_owned(),
+					message:       ClientMessage::ConfigCommand(c),
+				});
 			}
 			return true;
 		},
 		ClientMessage::ControlCommand(c) => {
 			if tokens_match(&c.token, &state.token) {
-				let _ = state.inbound_tx.send(ClientMessage::ControlCommand(c));
+				let _ = state.inbound_tx.send(InboundMessage {
+					connection_id: connection_id.to_owned(),
+					message:       ClientMessage::ControlCommand(c),
+				});
 			}
 			return true;
 		},
@@ -3034,7 +3056,10 @@ mod tests {
 		let handle = start(ServerConfig::new("s", "secret")).await.unwrap();
 		let mut inbound = handle.take_inbound_receiver().expect("inbound rx");
 		let mut ws = connect(&handle, "secret").await;
-		next_server_hello(&mut ws).await;
+		let connection_id = next_server_hello(&mut ws)
+			.await
+			.connection_id
+			.expect("connection id");
 		wait_for_clients(&handle, 1).await;
 		ws.send(Message::Text(
 			serde_json::to_string(&ClientMessage::UserMessage(crate::protocol::UserMessage {
@@ -3054,7 +3079,8 @@ mod tests {
 			.await
 			.expect("inbound timed out")
 			.expect("inbound channel closed");
-		match got {
+		assert_eq!(got.connection_id, connection_id);
+		match got.message {
 			ClientMessage::UserMessage(u) => {
 				assert_eq!(u.text, "keep going");
 				assert_eq!(u.update_id, Some(7));
@@ -3097,7 +3123,8 @@ mod tests {
 			.await
 			.expect("inbound timed out")
 			.expect("inbound channel closed");
-		match inbound_turn {
+		assert_eq!(inbound_turn.connection_id, connection_id);
+		match inbound_turn.message {
 			ClientMessage::EphemeralTurn(turn) => {
 				assert_eq!(turn.session_id, "s");
 				assert_eq!(turn.token, "secret");
@@ -3242,7 +3269,10 @@ mod tests {
 		let handle = start(ServerConfig::new("s", "secret")).await.unwrap();
 		let mut inbound = handle.take_inbound_receiver().expect("inbound rx");
 		let mut ws = connect(&handle, "secret").await;
-		next_server_hello(&mut ws).await;
+		let connection_id = next_server_hello(&mut ws)
+			.await
+			.connection_id
+			.expect("connection id");
 		wait_for_clients(&handle, 1).await;
 		ws.send(Message::Text(
 			serde_json::to_string(&ClientMessage::ControlCommand(crate::protocol::ControlCommand {
@@ -3262,7 +3292,8 @@ mod tests {
 			.await
 			.expect("inbound timed out")
 			.expect("inbound channel closed");
-		match got {
+		assert_eq!(got.connection_id, connection_id);
+		match got.message {
 			ClientMessage::ControlCommand(c) => {
 				assert_eq!(c.request_id, "r1");
 				assert_eq!(c.update_id, Some(8));
