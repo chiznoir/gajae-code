@@ -198,6 +198,9 @@ const BTW_MAX_PENDING = 256;
 const BTW_SHUTDOWN_JOIN_MS = 1_000;
 const BTW_USAGE_TEXT = "Usage: /btw <question>";
 const BTW_CAPACITY_TEXT = "Too many /btw questions are pending. Wait for one to finish and try again.";
+export const BTW_QUESTION_MAX_UNICODE_SCALARS = 4_096;
+export const BTW_QUESTION_MAX_UTF8_BYTES = 16_384;
+const BTW_QUESTION_LIMIT_TEXT = "Question must be at most 4096 Unicode scalar values and 16384 UTF-8 bytes.";
 type ParsedBtwCommand = { kind: "question"; question: string } | { kind: "ignored" };
 class ThreadedModeCapabilityRefusal extends Error {}
 
@@ -225,7 +228,15 @@ function parseBtwCommand(text: string, botUsername?: string): ParsedBtwCommand |
 	if (!botUsername || match[1] !== botUsername.toLowerCase()) return { kind: "ignored" };
 	return { kind: "question", question: trimmed.slice(rawCommand.length).trim() };
 }
-
+function isValidBtwQuestion(question: string): boolean {
+	if (Buffer.byteLength(question, "utf8") > BTW_QUESTION_MAX_UTF8_BYTES) return false;
+	let scalarCount = 0;
+	for (const _scalar of question) {
+		scalarCount++;
+		if (scalarCount > BTW_QUESTION_MAX_UNICODE_SCALARS) return false;
+	}
+	return true;
+}
 const MODEL_BUTTON_LABEL_MAX_BYTES = 48;
 const SENSITIVE_MODEL_LABEL =
 	/(?:\b(?:https?|wss?):\/\/|\b[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}\b|\b(?:api[-_ ]?key|access[-_ ]?token|bearer|secret|password|account(?:\s*id)?|email|exception|stack trace)\b|\b(?:sk|pk|rk)-[A-Za-z0-9_-]{12,}\b)/i;
@@ -4644,6 +4655,19 @@ export class TelegramNotificationDaemon {
 								messageId: inbound.messageId,
 								text: BTW_USAGE_TEXT,
 							});
+							return;
+						}
+						if (!isValidBtwQuestion(btwQuestion)) {
+							try {
+								await this.#sendBtwMessage({
+									threadId: inbound.threadId,
+									messageId: inbound.messageId,
+									text: BTW_QUESTION_LIMIT_TEXT,
+								});
+							} catch {
+								logger.warn("notifications: /btw question-limit delivery failed");
+							}
+							await this.reserveSeenUpdateId(inbound.updateId);
 							return;
 						}
 						if (this.opts.btw?.enabled === false) {
