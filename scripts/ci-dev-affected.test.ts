@@ -2,7 +2,7 @@ import { afterAll, describe, expect, setDefaultTimeout, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { describeTasks, expandWithDependents, isDarwinArm64TabWorkerSmokePath, loadBuildInventory, needsDarwinArm64TabWorkerSmoke, normalizeChangedPaths, packageScriptCommand, planTargetedTasks, planTasks, requiresCargoWorkspaceEmergency, resolvePackageCwd, runCommand, validateAffectedAggregate, type AffectedAggregateResults, type CargoInventoryUnit, type WorkspacePackage } from "./ci-dev-affected";
+import { describeTasks, expandWithDependents, isDarwinArm64TabWorkerSmokePath, loadBuildInventory, needsDarwinArm64TabWorkerSmoke, normalizeChangedPaths, packageScriptCommand, planFullTasks, planTargetedTasks, planTasks, requiresCargoWorkspaceEmergency, resolvePackageCwd, runCommand, validateAffectedAggregate, type AffectedAggregateResults, type CargoInventoryUnit, type WorkspacePackage } from "./ci-dev-affected";
 
 // Matrix planning validates live workspace and Cargo manifests in subprocesses.
 // Hosted runners can need more than Bun's 5s default during their first cold scan.
@@ -1260,5 +1260,115 @@ describe("Cargo workspace ambiguity", () => {
 		expect(requiresCargoWorkspaceEmergency([first], supported)).toBe(true);
 		expect(requiresCargoWorkspaceEmergency([first, second], supported)).toBe(true);
 		expect(requiresCargoWorkspaceEmergency([unique], supported)).toBe(false);
+	});
+});
+
+describe("planFullTasks — Main CI full mode (issue: shard main CI)", () => {
+	const fullModePackages: WorkspacePackage[] = [
+		{
+			name: "@gajae-code/coding-agent",
+			dir: "packages/coding-agent",
+			manifest: { name: "@gajae-code/coding-agent", scripts: { test: "true" } },
+		},
+		{
+			name: "@gajae-code/example",
+			dir: "packages/example",
+			manifest: { name: "@gajae-code/example", scripts: { check: "true", test: "true" } },
+		},
+	];
+
+	function withEnv<T>(env: Record<string, string | undefined>, run: () => T): T {
+		const previous = new Map<string, string | undefined>();
+		for (const [key, value] of Object.entries(env)) {
+			previous.set(key, process.env[key]);
+			if (value === undefined) delete process.env[key];
+			else process.env[key] = value;
+		}
+		try {
+			return run();
+		} finally {
+			for (const [key, value] of previous) {
+				if (value === undefined) delete process.env[key];
+				else process.env[key] = value;
+			}
+		}
+	}
+
+	test("default env emits the complete task union and omits root-check", () => {
+		const keys = withEnv(
+			{ CI_CODING_AGENT_TEST_SHARDS: undefined, CI_RUST_TEST_PARTITIONS: undefined },
+			() => planFullTasks(fullModePackages).map(task => task.key),
+		);
+		// root-check is covered by the dedicated native-free `check` job.
+		expect(keys).not.toContain("root-check");
+		expect(keys).toContain("native-linux-x64");
+		expect(keys).toContain("root-test:release");
+		expect(keys).toContain("rust-check");
+		expect(keys).toContain("cli-smoke");
+		expect(keys).toContain("runtime-check");
+		expect(keys).toContain("test:@gajae-code/example");
+		// Default coding-agent shard count stays 8 (dev parity).
+		expect(keys.filter(key => key.startsWith("test:@gajae-code/coding-agent:shard-")).length).toBe(8);
+		expect(keys).toContain("test:@gajae-code/coding-agent:shard-1-of-8");
+		// Default rust-test stays a single unpartitioned task.
+		expect(keys).toContain("rust-test");
+		expect(keys.some(key => key.startsWith("rust-test:partition-"))).toBe(false);
+	});
+
+	test("no full-mode task uses the false-green standalone `bun --cwd` form (issue #622)", () => {
+		const tasks = withEnv({ CI_CODING_AGENT_TEST_SHARDS: "16", CI_RUST_TEST_PARTITIONS: "4" }, () =>
+			planFullTasks(fullModePackages),
+		);
+		for (const task of tasks) {
+			expect(task.command.some(arg => arg.startsWith("--cwd"))).toBe(false);
+		}
+		const runtimeCheck = tasks.find(task => task.key === "runtime-check");
+		expect(runtimeCheck?.command).toEqual(["bun", "run", "check:runtime"]);
+		expect(runtimeCheck?.cwd).toBe(resolvePackageCwd("packages/coding-agent"));
+	});
+
+	test("CI_CODING_AGENT_TEST_SHARDS overrides the coding-agent shard count", () => {
+		const keys = withEnv({ CI_CODING_AGENT_TEST_SHARDS: "16" }, () =>
+			planFullTasks(fullModePackages).map(task => task.key),
+		);
+		const shards = keys.filter(key => key.startsWith("test:@gajae-code/coding-agent:shard-"));
+		expect(shards.length).toBe(16);
+		expect(shards).toContain("test:@gajae-code/coding-agent:shard-1-of-16");
+		expect(shards).toContain("test:@gajae-code/coding-agent:shard-16-of-16");
+	});
+
+	test("CI_RUST_TEST_PARTITIONS splits rust-test into nextest partitions", () => {
+		const tasks = withEnv({ CI_RUST_TEST_PARTITIONS: "4" }, () => planFullTasks(fullModePackages));
+		const partitions = tasks.filter(task => task.key.startsWith("rust-test:partition-"));
+		expect(partitions.length).toBe(4);
+		expect(tasks.some(task => task.key === "rust-test")).toBe(false);
+		expect(partitions[0]?.command).toEqual(["bun", "scripts/run-rs-task.ts", "test:rs", "count:1/4"]);
+		expect(partitions[3]?.command).toEqual(["bun", "scripts/run-rs-task.ts", "test:rs", "count:4/4"]);
+		const described = describeTasks(partitions);
+		for (const entry of described) {
+			expect(entry.rust).toBe(true);
+			expect(entry.nextest).toBe(true);
+			expect(entry.native).toBe(false);
+		}
+	});
+
+	test("invalid env values fall back to safe defaults", () => {
+		const keys = withEnv(
+			{ CI_CODING_AGENT_TEST_SHARDS: "0", CI_RUST_TEST_PARTITIONS: "abc" },
+			() => planFullTasks(fullModePackages).map(task => task.key),
+		);
+		expect(keys.filter(key => key.startsWith("test:@gajae-code/coding-agent:shard-")).length).toBe(8);
+		expect(keys).toContain("rust-test");
+		expect(keys.some(key => key.startsWith("rust-test:partition-"))).toBe(false);
+	});
+
+	test("the native build task is the only nativeBuild entry and runtime consumers download it", () => {
+		const entries = withEnv({ CI_CODING_AGENT_TEST_SHARDS: "16", CI_RUST_TEST_PARTITIONS: "4" }, () =>
+			describeTasks(planFullTasks(fullModePackages)),
+		);
+		expect(entries.filter(entry => entry.nativeBuild).map(entry => entry.key)).toEqual(["native-linux-x64"]);
+		expect(entries.find(entry => entry.key === "cli-smoke")?.native).toBe(true);
+		expect(entries.find(entry => entry.key === "runtime-check")?.native).toBe(true);
+		expect(entries.find(entry => entry.key === "test:@gajae-code/coding-agent:shard-1-of-16")?.native).toBe(true);
 	});
 });

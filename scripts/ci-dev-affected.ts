@@ -7,10 +7,37 @@ import * as fs from "node:fs/promises";
 const repoRoot = path.join(import.meta.dir, "..");
 const ZERO_SHA = /^0+$/;
 const PACKAGE_SCOPES = ["dependencies", "devDependencies", "peerDependencies", "optionalDependencies"] as const;
-// The coding-agent package has hundreds of test files; keep dev affected
-// validation below the shard timeout by splitting package-wide/full-workspace
-// TypeScript suites across the matrix instead of one root-test runner.
-const CODING_AGENT_TEST_SHARDS = 8;
+// The coding-agent package has hundreds of test files; keep affected validation
+// below the shard timeout by splitting package-wide/full-workspace TypeScript
+// suites across the matrix. Dev keeps the default; Main CI full mode overrides
+// via CI_CODING_AGENT_TEST_SHARDS to bound the long tail.
+const DEFAULT_CODING_AGENT_TEST_SHARDS = 8;
+
+function codingAgentTestShards(): number {
+	return positiveIntFromEnv("CI_CODING_AGENT_TEST_SHARDS", DEFAULT_CODING_AGENT_TEST_SHARDS);
+}
+
+// Number of nextest partitions the rust-test suite is split into. Dev runs one
+// unpartitioned rust-test task; Main CI full mode raises this to bound the
+// rust-test long tail.
+const DEFAULT_RUST_TEST_PARTITIONS = 1;
+
+function rustTestPartitions(): number {
+	return positiveIntFromEnv("CI_RUST_TEST_PARTITIONS", DEFAULT_RUST_TEST_PARTITIONS);
+}
+
+function positiveIntFromEnv(name: string, fallback: number): number {
+	const raw = Bun.env[name]?.trim();
+	if (!raw) return fallback;
+	const parsed = Number.parseInt(raw, 10);
+	return Number.isInteger(parsed) && parsed >= 1 ? parsed : fallback;
+}
+
+// True when Main CI requests the deterministic full plan via `CI_FORCE_FULL`.
+function isForceFullMode(): boolean {
+	const raw = Bun.env.CI_FORCE_FULL?.trim();
+	return raw === "1" || raw === "true";
+}
 // SDK host lifecycle and coordinator prompt-control changes need the stable first
 // package shard in addition to targeted coverage. Keep this list limited to the
 // stateful surfaces whose regressions depend on broader package ordering.
@@ -199,7 +226,44 @@ export function resolvePlanMode(): PlanMode {
 // Resolve the plan for the current changed paths and CI mode. PR mode builds the
 // targeted plan from a filesystem index of test files (for source→test mapping);
 // push mode reuses the broad affected planner unchanged.
+// Main CI full mode: emit the complete task union regardless of changed paths so
+// every check runs on `main`, and short-circuit the changed-path / canonical-plan
+// machinery entirely. It is deterministic, so the planner and every shard resolve
+// the identical plan without a shared plan artifact.
+export function planFullTasks(packages: readonly WorkspacePackage[]): Task[] {
+	const tasks = new Map<string, Task>();
+	addNativeBuild(tasks);
+	addWorkspaceTestTasks(tasks, packages);
+	add(tasks, "rust-check", "Rust check", ["bun", "run", "check:rs"]);
+	addRustTestTasks(tasks);
+	add(tasks, "cli-smoke", "GJC CLI smoke test", ["bun", "run", "ci:test:smoke"]);
+	add(tasks, "runtime-check", "Runtime checks (needs native addon)", ["bun", "run", "check:runtime"], resolvePackageCwd("packages/coding-agent"));
+	// root-check (ci:check:full) is intentionally omitted: Main CI runs it in the
+	// dedicated native-free `check` job, so emitting it here would double-run it.
+	return Array.from(tasks.values());
+}
+
+// Emit the rust-test task, split into nextest partitions when configured. Each
+// partition shards the test set (not a repeated full run) via `cargo nextest run
+// --partition count:i/N`, wired through run-rs-task.ts.
+function addRustTestTasks(tasks: Map<string, Task>): void {
+	const partitions = rustTestPartitions();
+	if (partitions <= 1) {
+		add(tasks, "rust-test", "Rust tests", ["bun", "run", "test:rs"]);
+		return;
+	}
+	for (let index = 1; index <= partitions; index++) {
+		add(
+			tasks,
+			`rust-test:partition-${index}-of-${partitions}`,
+			`Rust tests partition ${index}/${partitions}`,
+			["bun", "scripts/run-rs-task.ts", "test:rs", `count:${index}/${partitions}`],
+		);
+	}
+}
+
 async function resolvePlannedTasks(paths: readonly string[]): Promise<Task[]> {
+	if (isForceFullMode()) return planFullTasks(await getWorkspacePackages());
 	const fromArtifact = await loadCanonicalPlan();
 	if (fromArtifact) return fromArtifact;
 	const normalizedPaths = normalizeChangedPaths(paths);
@@ -269,6 +333,7 @@ function taskNeedsNative(key: string): boolean {
 		key === "root-check" ||
 		key === "check:@gajae-code/coding-agent" ||
 		key === "cli-smoke" ||
+		key === "runtime-check" ||
 		key === "wrapper-version" ||
 		key === "deep-interview-definitions" ||
 		key === "deep-interview-runtime" ||
@@ -277,9 +342,15 @@ function taskNeedsNative(key: string): boolean {
 	);
 }
 
+// rust-test may be split into nextest partitions (`rust-test:partition-i-of-N`)
+// in Main CI full mode; treat every partition like the single rust-test task.
+function isRustTestKey(key: string): boolean {
+	return key === "rust-test" || key.startsWith("rust-test:partition-");
+}
+
 // Tasks that need the Rust toolchain (and nextest) provisioned on their shard.
 function taskNeedsRust(key: string): boolean {
-	return key === "rust-check" || key === "rust-test" || key === "ci-selftest" || key === "ci-dry-run" || key === "affected-selftest" || key === "affected-dry-run";
+	return key === "rust-check" || isRustTestKey(key) || key === "ci-selftest" || key === "ci-dry-run" || key === "affected-selftest" || key === "affected-dry-run";
 }
 
 // Build the machine-readable descriptor list for the current changed-path plan.
@@ -293,7 +364,7 @@ export function describeTasks(tasks: readonly Task[]): TaskMatrixEntry[] {
 		cwd: task.cwd ? path.relative(repoRoot, task.cwd) || "." : undefined,
 		native: task.capabilities?.nativeConsumer ?? taskNeedsNative(task.key),
 		rust: task.capabilities?.rust ?? taskNeedsRust(task.key),
-		nextest: task.capabilities?.nextest ?? task.key === "rust-test",
+		nextest: task.capabilities?.nextest ?? isRustTestKey(task.key),
 		nativeBuild: task.capabilities?.nativeProducer ?? isNativeBuildKey(task.key),
 	}));
 }
@@ -329,7 +400,33 @@ export function needsDarwinArm64TabWorkerSmoke(paths: readonly string[]): boolea
 	return paths.some(isDarwinArm64TabWorkerSmokePath);
 }
 
+// Main CI full mode: emit a lean matrix from the deterministic full plan. It
+// deliberately skips the dev source-sha/checkout asserts, the canonical plan
+// artifact, plan digest, and the Darwin smoke flag — Main CI re-derives the same
+// full plan on every shard and gates on a simple aggregate job, not evidence
+// receipts.
+async function emitFullMatrix(): Promise<void> {
+	const tasks = planFullTasks(await getWorkspacePackages());
+	const entries = describeTasks(tasks);
+	console.log(JSON.stringify(entries));
+
+	const githubOutput = process.env.GITHUB_OUTPUT;
+	if (!githubOutput) return;
+	const shards = entries
+		.filter(entry => !entry.nativeBuild)
+		.map(entry => ({ key: entry.key, identity: entry.identity, description: entry.description, native: entry.native, rust: entry.rust, nextest: entry.nextest }));
+	const hasNative = entries.some(entry => entry.nativeBuild);
+	const lines = [
+		`matrix=${JSON.stringify({ include: shards })}`,
+		`has_tasks=${shards.length > 0}`,
+		`has_native=${hasNative}`,
+		"",
+	];
+	await fs.appendFile(githubOutput, lines.join("\n"));
+}
+
 async function emitMatrix(): Promise<void> {
+	if (isForceFullMode()) return emitFullMatrix();
 	const sourceSha = await resolveSourceSha();
 	await requireCommitObject(sourceSha, "source head");
 	await assertCheckedOutSourceHead(sourceSha);
@@ -425,6 +522,7 @@ function printPlan(paths: readonly string[], plannedTasks: readonly Task[]): voi
 }
 
 async function getChangedPaths(): Promise<string[]> {
+	if (isForceFullMode()) return [];
 	const explicitPaths = Bun.env.CI_DEV_CHANGED_PATHS?.trim();
 	if (explicitPaths) {
 		return explicitPaths
@@ -783,17 +881,18 @@ function addPackageTestTasks(tasks: Map<string, Task>, workspacePackage: Workspa
 		return;
 	}
 
-	for (let shard = 1; shard <= CODING_AGENT_TEST_SHARDS; shard++) {
-		addCodingAgentTestShard(tasks, shard);
+	const total = codingAgentTestShards();
+	for (let shard = 1; shard <= total; shard++) {
+		addCodingAgentTestShard(tasks, shard, total);
 	}
 }
 
-function addCodingAgentTestShard(tasks: Map<string, Task>, shard: number): void {
+function addCodingAgentTestShard(tasks: Map<string, Task>, shard: number, total: number = codingAgentTestShards()): void {
 	add(
 		tasks,
-		`test:@gajae-code/coding-agent:shard-${shard}-of-${CODING_AGENT_TEST_SHARDS}`,
-		`Test @gajae-code/coding-agent shard ${shard}/${CODING_AGENT_TEST_SHARDS}`,
-		["bun", "test", `--shard=${shard}/${CODING_AGENT_TEST_SHARDS}`],
+		`test:@gajae-code/coding-agent:shard-${shard}-of-${total}`,
+		`Test @gajae-code/coding-agent shard ${shard}/${total}`,
+		["bun", "test", `--shard=${shard}/${total}`],
 		resolvePackageCwd("packages/coding-agent"),
 	);
 }
@@ -1297,7 +1396,7 @@ function serializeTasks(tasks: readonly Task[]): Task[] {
 			cwd,
 			capabilities: task.capabilities ?? {
 				rust: taskNeedsRust(task.key),
-				nextest: task.key === "rust-test",
+				nextest: isRustTestKey(task.key),
 				nativeConsumer: taskNeedsNative(task.key),
 				nativeProducer: isNativeBuildKey(task.key),
 			},
