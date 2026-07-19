@@ -1424,6 +1424,7 @@ interface ToolActivityOwner {
 	toolName: string;
 	endpointDigest: string;
 	phase: "started" | "terminal";
+	policyEpoch?: number;
 }
 
 interface PendingThreadedFrame {
@@ -1559,6 +1560,11 @@ export class TelegramNotificationDaemon {
 	private readonly toolActivityOwners = new Map<string, ToolActivityOwner>();
 	private readonly revokedToolEndpoints = new Set<string>();
 	private toolTerminalizationChain: Promise<void> = Promise.resolve();
+	private toolActivityPolicyEpoch = 0;
+	private toolActivityStopping = false;
+	private readonly replayToolActivityEpochs = new WeakMap<Record<string, unknown>, number>();
+	private toolShutdownBarrier: Promise<void> = Promise.resolve();
+	private toolActivityAmbiguous = false;
 	readonly sessions = new Map<string, SessionSocket>();
 	/** Ephemeral aliases for model choices; deliberately never serialized across daemon restarts. */
 	#modelChoiceAliases = new Map<string, ModelChoiceRoute>();
@@ -1668,8 +1674,13 @@ export class TelegramNotificationDaemon {
 	 * ~25s getUpdates timeout. Safe to call from a signal handler.
 	 */
 	requestStop(_reason?: "reload" | "stop" | "signal"): void {
-		this.scheduleVisibleToolTerminalization().catch(() => undefined);
-		this.effects.beginShutdown();
+		const toolShutdown = this.beginToolActivityShutdown();
+		void toolShutdown
+			.finally(() => {
+				this.effects.beginShutdown();
+				this.#deliveryAbort.abort();
+			})
+			.catch(() => undefined);
 		for (const item of new Set(this.selectedAckPending.values())) {
 			if (item.state === "queued") this.pool.removeById(item.itemId);
 			else item.controller?.abort();
@@ -1680,7 +1691,6 @@ export class TelegramNotificationDaemon {
 			delivery.invalidated = true;
 			delivery.controller.abort("daemon_shutdown");
 		}
-		this.#deliveryAbort.abort();
 		this.runtime.requestStop();
 		this.running = false;
 	}
@@ -2490,17 +2500,13 @@ export class TelegramNotificationDaemon {
 	private enqueueToolTerminalization(
 		claimed: Array<{ messageId: number; owner: ToolActivityOwner }>,
 		awaitDispatch: boolean,
+		strict = false,
 	): Promise<void> {
 		const terminalize = (): Promise<void> =>
 			this.effects.allowTerminal(async () => {
-				if (awaitDispatch)
-					try {
-						await this.flushChain;
-					} catch {
-						// Shutdown may abort an in-flight delivery; claimed visible messages
-						// still require best-effort terminalization.
-					}
-				for (const { messageId, owner } of claimed) {
+				if (awaitDispatch) await this.flushChain;
+				for (const item of claimed) {
+					const { messageId, owner } = item;
 					const send = renderThreadedFrame({
 						type: "tool_activity",
 						sessionId: owner.sessionId,
@@ -2509,15 +2515,31 @@ export class TelegramNotificationDaemon {
 						phase: "unknown",
 					});
 					if (!send?.text) continue;
-					try {
-						await this.botApi.call("editMessageText", {
-							chat_id: this.opts.chatId,
-							message_id: messageId,
-							text: send.text,
-							parse_mode: TELEGRAM_PARSE_MODE,
-						});
-					} catch {
-						// Best-effort cleanup: ownership is already fenced from replacements.
+					let failure: unknown;
+					let delivered = false;
+					for (let attempt = 0; attempt < (strict ? 5 : 1); attempt++) {
+						try {
+							const response = (await this.botApi.call("editMessageText", {
+								chat_id: this.opts.chatId,
+								message_id: messageId,
+								text: send.text,
+								parse_mode: TELEGRAM_PARSE_MODE,
+							})) as { ok?: boolean; description?: string } | undefined;
+							delivered = response?.ok !== false || /not modified/i.test(String(response?.description ?? ""));
+							if (delivered) break;
+							failure = new Error(String(response?.description ?? "Telegram rejected tool terminalization."));
+						} catch (error) {
+							failure = error;
+						}
+						if (strict && attempt < 4) await this.runtime.sleep(50 * 2 ** attempt);
+					}
+					if (!delivered && strict) {
+						const key = `${owner.sessionId}:tool:${owner.toolCallId}`;
+						if (!this.toolActivityOwners.has(key)) {
+							this.toolActivityOwners.set(key, owner);
+							this.liveMessages.set(key, messageId);
+						}
+						throw failure instanceof Error ? failure : new Error("Tool terminalization failed.");
 					}
 				}
 			});
@@ -2526,7 +2548,7 @@ export class TelegramNotificationDaemon {
 		return next;
 	}
 
-	private scheduleVisibleToolTerminalization(endpointDigest?: string): Promise<void> {
+	private scheduleVisibleToolTerminalization(endpointDigest?: string, strict = false): Promise<void> {
 		if (endpointDigest !== undefined) this.revokedToolEndpoints.add(endpointDigest);
 		const claimed: Array<{ messageId: number; owner: ToolActivityOwner }> = [];
 		for (const [key, owner] of this.toolActivityOwners) {
@@ -2541,9 +2563,22 @@ export class TelegramNotificationDaemon {
 				item.payload.toolActivity !== undefined &&
 				(endpointDigest === undefined || item.payload.toolActivity.endpointDigest === endpointDigest),
 		);
-		const next = this.enqueueToolTerminalization(claimed, false);
+		const next = this.enqueueToolTerminalization(claimed, false, strict);
 		if (endpointDigest !== undefined) void next.finally(() => this.revokedToolEndpoints.delete(endpointDigest));
 		return next;
+	}
+
+	private beginToolActivityShutdown(): Promise<void> {
+		if (this.toolActivityStopping) return this.toolShutdownBarrier;
+		this.toolActivityStopping = true;
+		this.toolActivityPolicyEpoch++;
+		this.toolShutdownBarrier = (async () => {
+			await this.flushChain;
+			if (this.toolActivityAmbiguous)
+				throw new Error("Tool activity delivery became ambiguous during daemon shutdown.");
+			await this.scheduleVisibleToolTerminalization(undefined, true);
+		})();
+		return this.toolShutdownBarrier;
 	}
 
 	private dropSession(session: SessionSocket, reason: string): void {
@@ -3404,6 +3439,20 @@ export class TelegramNotificationDaemon {
 			);
 		}
 		for (const item of batch) {
+			const toolActivity = item.payload.toolActivity;
+			if (
+				toolActivity?.phase === "started" &&
+				(this.toolActivityStopping ||
+					this.opts.toolActivity?.enabled === false ||
+					toolActivity.policyEpoch !== this.toolActivityPolicyEpoch)
+			) {
+				const key = `${toolActivity.sessionId}:tool:${toolActivity.toolCallId}`;
+				const owner = this.toolActivityOwners.get(key);
+				if (!this.liveMessages.has(key) && owner?.endpointDigest === toolActivity.endpointDigest)
+					this.toolActivityOwners.delete(key);
+				this.pool.settle(item.itemId!, "removed");
+				continue;
+			}
 			const btwDelivery = item.payload.btwDelivery;
 			if (btwDelivery) {
 				if (!btwDelivery.isAuthoritative()) {
@@ -3703,6 +3752,7 @@ export class TelegramNotificationDaemon {
 			} catch {
 				// Best-effort: a failed send/edit must never stop the daemon.
 				disposition = "ambiguous";
+				if (item.payload.toolActivity?.phase === "started") this.toolActivityAmbiguous = true;
 			} finally {
 				this.pool.settle(item.itemId!, disposition);
 				// A terminal tool frame owns the end of this coalescing key even when both
@@ -4002,10 +4052,13 @@ export class TelegramNotificationDaemon {
 
 	async handleSessionMessage(session: SessionSocket, msg: any): Promise<void> {
 		if (session.replayPending) {
-			if (msg?.type === "tool_activity" && this.opts.toolActivity?.enabled === false) return;
+			if (msg?.type === "tool_activity" && (this.opts.toolActivity?.enabled === false || this.toolActivityStopping))
+				return;
 			const matchingReplay = msg?.type === "event_replay_result" && msg.id === session.replayId;
 			if (!matchingReplay) {
-				session.replayQueue.push(msg as Record<string, unknown>);
+				const frame = msg as Record<string, unknown>;
+				if (frame.type === "tool_activity") this.replayToolActivityEpochs.set(frame, this.toolActivityPolicyEpoch);
+				session.replayQueue.push(frame);
 				return;
 			}
 			session.replayPending = false;
@@ -4050,6 +4103,11 @@ export class TelegramNotificationDaemon {
 			}
 			const queued = session.replayQueue.splice(0);
 			for (const frame of queued) {
+				if (
+					frame.type === "tool_activity" &&
+					this.replayToolActivityEpochs.get(frame) !== this.toolActivityPolicyEpoch
+				)
+					continue;
 				const fingerprint = JSON.stringify(frame);
 				const remaining = replayCounts.get(fingerprint) ?? 0;
 				if (remaining > 0) {
@@ -4284,12 +4342,29 @@ export class TelegramNotificationDaemon {
 			return;
 		}
 		if (typeof msg?.type === "string" && TelegramNotificationDaemon.THREADED_FRAMES.has(msg.type)) {
-			const toolActivity = this.toolActivityOwner(session, msg as Record<string, unknown>);
+			const threadedFrame = msg as Record<string, unknown>;
+			const toolActivity = this.toolActivityOwner(session, threadedFrame);
+			const toolAdmissionEpoch = toolActivity
+				? (this.replayToolActivityEpochs.get(threadedFrame) ?? this.toolActivityPolicyEpoch)
+				: undefined;
+			if (toolActivity) toolActivity.policyEpoch = toolAdmissionEpoch;
+			const toolStartIsCurrent = (): boolean =>
+				toolActivity?.phase !== "started" ||
+				(!this.toolActivityStopping &&
+					this.opts.toolActivity?.enabled !== false &&
+					toolAdmissionEpoch === this.toolActivityPolicyEpoch);
+			const abandonStaleToolStart = (): void => {
+				if (toolActivity?.phase !== "started") return;
+				const key = `${session.sessionId}:tool:${toolActivity.toolCallId}`;
+				const owner = this.toolActivityOwners.get(key);
+				if (!this.liveMessages.has(key) && owner?.endpointDigest === toolActivity.endpointDigest)
+					this.toolActivityOwners.delete(key);
+			};
 			if (toolActivity) {
 				const liveKey = `${session.sessionId}:tool:${toolActivity.toolCallId}`;
 				const currentOwner = this.toolActivityOwners.get(liveKey);
 				if (toolActivity.phase === "started") {
-					if (this.opts.toolActivity?.enabled === false) return;
+					if (!toolStartIsCurrent()) return;
 					this.toolActivityOwners.set(liveKey, toolActivity);
 				} else {
 					if (currentOwner && currentOwner.endpointDigest !== session.endpointDigest) return;
@@ -4313,8 +4388,16 @@ export class TelegramNotificationDaemon {
 			const send = renderThreadedFrame(msg);
 			if (!send) return;
 			const existingTopic = await this.existingTopicForPrivateChat(session.sessionId);
+			if (!toolStartIsCurrent()) {
+				abandonStaleToolStart();
+				return;
+			}
 			if (this.topics.get(session.sessionId)?.authorityState === "delete_pending") return;
 			if (!send.identity && !existingTopic && !this.flatIdentitySent.has(session.sessionId)) {
+				if (!toolStartIsCurrent()) {
+					abandonStaleToolStart();
+					return;
+				}
 				this.rememberPendingThreadedFrame(session, send, msg as Record<string, unknown>);
 				return;
 			}
@@ -4329,6 +4412,10 @@ export class TelegramNotificationDaemon {
 			const topicId =
 				existingTopic ?? (await this.ensureTopic(session.sessionId, this.topicNameFor(session.sessionId, msg)));
 			const topicLease = await this.topicAuthorityLease(session.sessionId);
+			if (!toolStartIsCurrent()) {
+				abandonStaleToolStart();
+				return;
+			}
 			if (!topicId || !topicLease || topicLease.topicId !== topicId) {
 				if (this.topics.get(session.sessionId)?.authorityState === "delete_pending") return;
 				await this.deliverFlatFallback(session.sessionId, send, toolActivity);
@@ -4377,6 +4464,10 @@ export class TelegramNotificationDaemon {
 				}
 				await this.flushPendingThreadedFrames(session.sessionId, topicLease);
 				await this.persistTopics();
+				return;
+			}
+			if (!toolStartIsCurrent()) {
+				abandonStaleToolStart();
 				return;
 			}
 			await this.submitThreadedFrame(session.sessionId, send, topicLease, toolActivity);
@@ -4764,6 +4855,7 @@ export class TelegramNotificationDaemon {
 				if (isRichCommand) {
 					this.opts.rich = { enabled: desired };
 				} else {
+					this.toolActivityPolicyEpoch++;
 					this.opts.toolActivity = { enabled: desired };
 					if (!desired) {
 						const removedTools = this.pool.removeWhere(
@@ -5211,11 +5303,18 @@ export class TelegramNotificationDaemon {
 				await this.runtime.sleep(10);
 			}
 		} finally {
+			let toolShutdownError: unknown;
+			try {
+				await this.beginToolActivityShutdown();
+			} catch (error) {
+				toolShutdownError = error;
+			}
 			this.effects.beginShutdown();
+			this.#deliveryAbort.abort();
 			let persisted = false;
 			const shutdown = this.effects.allowTerminal(async () => {
+				if (toolShutdownError) throw toolShutdownError;
 				await this.#drainBtwTurns();
-				await this.scheduleVisibleToolTerminalization();
 				await this.toolTerminalizationChain;
 				this.runtime.stop();
 				this.stopOwnershipHeartbeatTimer();
