@@ -42,7 +42,7 @@ export interface ReleaseRunJobObservation {
 	name: string;
 }
 
-export const STABLE_GITHUB_RELEASE_FINALIZATION_JOB_NAME = "Finalize stable GitHub Release";
+export const STABLE_GITHUB_RELEASE_FINALIZATION_JOB_NAME = "publish";
 
 export type StableReleaseFinalizationReceipt =
 	| { outcome: "missing" }
@@ -584,6 +584,14 @@ async function cmdRelease(version: string): Promise<void> {
 	// freshly bumped package version (otherwise `check:plugins` reports drift).
 	console.log("Regenerating plugin bundle...");
 	await $`bun run generate-plugins`;
+	console.log();
+
+	// 4c. Rebuild the native addon so the on-disk `.node` exports the freshly
+	// bumped version sentinel. Otherwise the local `bun run check` below loads a
+	// stale addon (built against the previous sentinel) and fails. CI rebuilds
+	// per platform; this keeps the maintainer's release run a single shot.
+	console.log("Rebuilding native addon for the new sentinel…");
+	await $`bun --cwd=packages/natives run build`;
 	console.log();
 
 	// 5. Update changelogs

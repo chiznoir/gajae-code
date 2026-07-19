@@ -50,6 +50,75 @@ describe("SessionSdkHost", () => {
 		expect(registered).toEqual([1, 2]);
 	});
 
+	test("retries broker unregister after a fail-once owner release", async () => {
+		let unsubscribeAttempts = 0;
+		let unregisterAttempts = 0;
+		const host = new SessionSdkHost({
+			sessionId: "retry-stop",
+			stateRoot: "/tmp/retry-stop",
+			token: "t",
+			sendFrame: () => {},
+			onFrame: () => () => {
+				unsubscribeAttempts++;
+			},
+		});
+		await host.registerWithBroker({
+			register: () => {},
+			unregister: () => {
+				unregisterAttempts++;
+				if (unregisterAttempts === 1) throw new Error("unregister failed once");
+			},
+		});
+		await host.start();
+
+		await expect(host.stop()).rejects.toThrow("unregister failed once");
+		expect(host.started).toBe(true);
+		expect(unsubscribeAttempts).toBe(1);
+		expect(unregisterAttempts).toBe(1);
+
+		expect(await host.stop()).toBe("stopped");
+		expect(host.started).toBe(false);
+		expect(unsubscribeAttempts).toBe(1);
+		expect(unregisterAttempts).toBe(2);
+		expect(await host.stop()).toBe("already");
+		expect(unregisterAttempts).toBe(2);
+	});
+
+	test("shares one broker unregister across concurrent stop callers", async () => {
+		let unsubscribeAttempts = 0;
+		let unregisterAttempts = 0;
+		const unregister = Promise.withResolvers<void>();
+		const host = new SessionSdkHost({
+			sessionId: "concurrent-stop",
+			stateRoot: "/tmp/concurrent-stop",
+			token: "t",
+			sendFrame: () => {},
+			onFrame: () => () => {
+				unsubscribeAttempts++;
+			},
+		});
+		await host.registerWithBroker({
+			register: () => {},
+			unregister: () => {
+				unregisterAttempts++;
+				return unregister.promise;
+			},
+		});
+		await host.start();
+
+		const first = host.stop();
+		const concurrent = host.stop();
+		await Bun.sleep(0);
+		expect(unsubscribeAttempts).toBe(1);
+		expect(unregisterAttempts).toBe(1);
+
+		unregister.resolve();
+		expect(await Promise.all([first, concurrent])).toEqual(["stopped", "stopped"]);
+		expect(host.started).toBe(false);
+		expect(unsubscribeAttempts).toBe(1);
+		expect(unregisterAttempts).toBe(1);
+	});
+
 	test("hosts root sessions unless explicitly disabled", () => {
 		expect(shouldHostSdk({ notifications: { enabled: false } }, true, {})).toBe(true);
 		expect(shouldHostSdk({}, false, {})).toBe(false);

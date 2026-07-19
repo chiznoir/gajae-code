@@ -429,87 +429,48 @@ describe("native release binary coverage", () => {
 		expect(workflow).toContain("binary_path: packages/coding-agent/binaries/gjc-darwin-x64");
 		expect(workflow).toContain("{ os: macos-14, platform: darwin, arch: arm64 }");
 		expect(workflow).toContain("target_id: darwin-arm64");
-		expect(workflow).toContain("pattern: pi-natives-${{ matrix.platform }}-${{ matrix.arch }}*-h${{ needs.rust-hash.outputs.hash }}");
+		expect(workflow).toContain("pattern: pi-natives-${{ matrix.platform }}-${{ matrix.arch }}*");
 	});
 
-	test("tag publication uses the fail-closed named-job evidence chain", async () => {
+	test("tag publication builds natives + binaries then publishes npm and the GitHub Release", async () => {
 		const workflow = await Bun.file(path.join(repoRoot, ".github/workflows/ci.yml")).text();
-		const releaseBinary = workflowJob(workflow, "release_binary");
-		const draft = workflowJob(workflow, "release_github_draft");
-		const verifyOnly = workflowJob(workflow, "release_verify_only");
-		const expectedEvidence = workflowJob(workflow, "release_npm_expected");
-		const npmPublish = workflowJob(workflow, "release_npm_publish");
-		const finalEvidence = workflowJob(workflow, "release_github_final_evidence");
-		const githubVerify = workflowJob(workflow, "release_github_verify");
-		const finalize = workflowJob(workflow, "release_github_finalize");
+		const native = workflowJob(workflow, "native");
+		const binaries = workflowJob(workflow, "binaries");
+		const publish = workflowJob(workflow, "publish");
 
-		// The SDK closure suite is deliberately NOT a release gate: it runs in
-		// Dev CI / main `check` (relevance-gated). Release tags gate on the
-		// build, test, and evidence chain below (maintainer decision, 0.11.0).
-		expect(workflow).not.toContain("sdk_closure:");
-		expect(releaseBinary).toContain("needs: [check, native_linux, native_release, rust-hash]");
-
-		expect(draft).toContain("release-id: ${{ steps.capture-release-id.outputs.release-id }}");
-		expect(draft).toContain("id: draft");
-		expect(draft).toContain("RELEASE_ID: ${{ steps.draft.outputs.id }}");
-		expect(draft).toContain('gh api --paginate "/repos/${GITHUB_REPOSITORY}/releases?per_page=100"');
-		expect(draft).toContain("select(.tag_name == $tag)");
-		expect(draft).toContain(".[0].draft == true and .[0].prerelease == false");
-		expect(draft).not.toContain("/releases/tags/");
-
-		expect(expectedEvidence).toContain("needs: [release_github_draft, release_context, release_source_verify, rust-hash]");
-		expect(expectedEvidence).toContain("RELEASE_ID: ${{ needs.release_github_draft.outputs.release-id }}");
-		expect(expectedEvidence).toContain('"/repos/${GITHUB_REPOSITORY}/releases/$RELEASE_ID"');
-		expect(expectedEvidence).toContain('"$upload_url?name=$expected_asset"');
-		expect(expectedEvidence).toContain("releases/assets/$expected_asset_id");
-		expect(expectedEvidence).toContain('https://uploads.github.com/repos/${GITHUB_REPOSITORY}/releases/$RELEASE_ID/assets');
-		expect(expectedEvidence).toContain(".tag_name == $tag");
-		expect(expectedEvidence).toContain("needs.release_source_verify.result == 'success'");
-		expect(expectedEvidence).toContain("needs.release_context.outputs.skip-npm != 'true'");
-		expect(npmPublish).toContain("needs: [release_npm_expected, release_context, release_source_verify]");
-		expect(npmPublish).toContain("needs.release_npm_expected.result == 'success'");
-		expect(npmPublish).toContain("needs.release_source_verify.result == 'success'");
-		expect(npmPublish).toContain("needs.release_context.outputs.skip-npm != 'true'");
-		expect(finalEvidence).toContain("needs: [release_npm_publish, release_github_draft, release_context, release_source_verify]");
-		expect(finalEvidence).toContain("RELEASE_ID: ${{ needs.release_github_draft.outputs.release-id }}");
-		expect(finalEvidence).toContain('"$upload_url?name=$final_asset"');
-		expect(finalEvidence).toContain("releases/assets/$final_asset_id");
-		expect(finalEvidence).toContain('https://uploads.github.com/repos/${GITHUB_REPOSITORY}/releases/$RELEASE_ID/assets');
-		expect(finalEvidence).toContain("needs.release_npm_publish.result == 'success'");
-		expect(finalEvidence).toContain("needs.release_source_verify.result == 'success'");
-		expect(githubVerify).toContain("needs: [release_github_final_evidence, release_github_draft, release_context, release_source_verify]");
-		expect(githubVerify).toContain("RELEASE_ID: ${{ needs.release_github_draft.outputs.release-id }}");
-		expect(githubVerify).toContain("releases/assets/$asset_id");
-		expect(githubVerify).toContain("needs.release_github_final_evidence.result == 'success'");
-		expect(githubVerify).toContain("needs.release_source_verify.result == 'success'");
-		expect(finalize).toContain("needs: [release_npm_publish, release_github_final_evidence, release_github_verify, release_github_draft, release_context, release_source_verify]");
-		expect(finalize).toContain("RELEASE_ID: ${{ needs.release_github_draft.outputs.release-id }}");
-		expect(finalize).toContain('gh api --method PATCH \\\n                 "/repos/${GITHUB_REPOSITORY}/releases/$RELEASE_ID"');
-		expect(finalize).toContain("-F draft=false");
-		expect(finalize).toContain("-F prerelease=false");
-		expect(finalize).toContain('echo "release-id=$RELEASE_ID" >> "$GITHUB_OUTPUT"');
-		expect(finalize).toContain("needs.release_npm_publish.result == 'success'");
-		expect(finalize).toContain("needs.release_github_final_evidence.result == 'success'");
-		expect(finalize).toContain("needs.release_github_verify.result == 'success'");
-		expect(finalize).toContain("needs.release_source_verify.result == 'success'");
-		expect(finalize).toContain("needs.release_context.outputs.skip-npm != 'true'");
-
-		expect(verifyOnly).toContain('gh api --paginate "/repos/${GITHUB_REPOSITORY}/releases?per_page=100"');
-		expect(verifyOnly).toContain("select(.tag_name == $tag)");
-		expect(verifyOnly).toContain("releases/assets/$asset_id");
-		expect(finalEvidence).toContain('cmp "$existing_dir/$final_asset" "$evidence_dir/$final_asset"');
-		expect(finalize).toContain('for asset in "$expected_asset" "$final_asset"; do');
-		expect(finalize.indexOf("for asset in")).toBeLessThan(finalize.indexOf("gh api --method PATCH"));
-		expect(finalize.indexOf("--verify-stable-finalization")).toBeLessThan(finalize.indexOf("gh api --method PATCH"));
-
-		for (const job of [draft, verifyOnly, expectedEvidence, finalEvidence, githubVerify, finalize]) {
-			expect(job).not.toContain('gh release view "$RELEASE_TAG"');
-			expect(job).not.toContain('gh release download "$RELEASE_TAG"');
-			expect(job).not.toContain('gh release upload "$RELEASE_TAG"');
-			expect(job).not.toContain('gh release edit "$RELEASE_TAG"');
+		// Tag-only jobs are self-contained: no dependency on a separate main CI run.
+		for (const job of [native, binaries, publish]) {
+			expect(job).toContain("if: ${{ startsWith(github.ref, 'refs/tags/v') }}");
 		}
-		expect(finalEvidence).not.toContain("needs: [release_npm_publish, release_context]");
-		expect(workflow).not.toContain("needs: [release_binary, release_github_verify, rust-hash, sdk_closure]");
+		expect(workflow).not.toContain("release_source_verify");
+		expect(workflow).not.toContain("verify exact source SHA passed a successful main CI run");
+
+		// Binaries wait on natives; publish waits on both.
+		expect(binaries).toContain("needs: [native]");
+		expect(publish).toContain("needs: [native, binaries]");
+
+		// Publish uses the proven evidence-based publish script in one job.
+		expect(publish).toContain("--prepare-evidence --evidence-dir");
+		expect(publish).toContain("--publish-from-evidence");
+		expect(publish).toContain("--release-serialization-key gajae-production-release");
+		expect(publish).toContain("NPM_TOKEN: ${{ secrets.NPM_TOKEN }}");
+
+		// Publish cuts the GitHub Release directly (no separate draft/finalize dance).
+		expect(publish).toContain("softprops/action-gh-release");
+		expect(publish).toContain("draft: false");
+		expect(publish).toContain("files: release-binaries/gjc-*");
+
+		// The paranoid multi-job evidence/verify chain is gone.
+		for (const removed of [
+			"release_github_draft",
+			"release_npm_expected",
+			"release_github_final_evidence",
+			"release_github_verify",
+			"release_github_finalize",
+			"release_verify_only",
+		]) {
+			expect(workflow).not.toContain(`${removed}:`);
+		}
 	});
 
 	test("linux native platform packages declare their glibc requirement", async () => {

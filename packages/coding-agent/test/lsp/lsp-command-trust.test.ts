@@ -252,27 +252,31 @@ describe("LSP repository command trust", () => {
 	it("wraps supported servers with an external lspmux and honors both disable variables", async () => {
 		using tempDir = TempDir.createSync("@gjc-lspmux-external-");
 		const cwd = path.join(tempDir.path(), "repo");
-		const externalBinDir = path.join(tempDir.path(), "bin");
+		const externalBinDir = path.join(os.homedir(), `.gjc-lspmux-external-${process.pid}-${Date.now()}`);
 		await fs.promises.mkdir(cwd, { recursive: true });
 		await fs.promises.mkdir(externalBinDir, { recursive: true });
-		const externalBinary = await writeLspmuxBinary(externalBinDir);
-		vi.spyOn(piUtils, "$which").mockReturnValue(externalBinary);
+		try {
+			const externalBinary = await writeLspmuxBinary(externalBinDir);
+			vi.spyOn(piUtils, "$which").mockReturnValue(externalBinary);
 
-		const state = await detectLspmux(cwd);
-		expect(state.available).toBe(true);
-		expect(state.running).toBe(true);
-		expect(await getLspmuxCommand("rust-analyzer", [], cwd)).toEqual({
-			command: fs.realpathSync(externalBinary),
-			args: [],
-		});
+			const state = await detectLspmux(cwd);
+			expect(state.available).toBe(true);
+			expect(state.running).toBe(true);
+			expect(await getLspmuxCommand("rust-analyzer", [], cwd)).toEqual({
+				command: fs.realpathSync(externalBinary),
+				args: [],
+			});
 
-		Bun.env.GJC_DISABLE_LSPMUX = "1";
-		expect((await detectLspmux(cwd)).available).toBe(false);
-		delete Bun.env.GJC_DISABLE_LSPMUX;
-		resetLspmuxStateForTesting();
-		expect((await detectLspmux(cwd)).available).toBe(true);
-		Bun.env.PI_DISABLE_LSPMUX = "1";
-		expect((await detectLspmux(cwd)).available).toBe(false);
+			Bun.env.GJC_DISABLE_LSPMUX = "1";
+			expect((await detectLspmux(cwd)).available).toBe(false);
+			delete Bun.env.GJC_DISABLE_LSPMUX;
+			resetLspmuxStateForTesting();
+			expect((await detectLspmux(cwd)).available).toBe(true);
+			Bun.env.PI_DISABLE_LSPMUX = "1";
+			expect((await detectLspmux(cwd)).available).toBe(false);
+		} finally {
+			await fs.promises.rm(externalBinDir, { recursive: true, force: true });
+		}
 	});
 
 	it("rejects a repository-owned executable symlink while preserving an external symlink", async () => {

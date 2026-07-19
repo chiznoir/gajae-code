@@ -102,6 +102,7 @@ export class SessionSdkHost {
 	readonly reverse: ReverseLeaseRuntime;
 	readonly #options: SessionSdkHostOptions;
 	#started = false;
+	#stopPromise?: Promise<"stopped">;
 	#unsubscribe?: () => void;
 	#registration?: { writer: BrokerIndexWriter; generation: number };
 
@@ -154,16 +155,27 @@ export class SessionSdkHost {
 	}
 
 	async stop(): Promise<"stopped" | "already"> {
+		if (this.#stopPromise) return this.#stopPromise;
 		if (!this.#started) return "already";
+		const stopPromise = this.#stopStartedHost();
+		this.#stopPromise = stopPromise;
+		try {
+			return await stopPromise;
+		} finally {
+			if (this.#stopPromise === stopPromise) this.#stopPromise = undefined;
+		}
+	}
+
+	async #stopStartedHost(): Promise<"stopped"> {
 		this.#unsubscribe?.();
 		this.#unsubscribe = undefined;
-		this.#started = false;
 		if (this.#registration?.writer.unregister)
 			await this.#registration.writer.unregister({
 				sessionId: this.#options.sessionId,
 				stateRoot: this.#options.stateRoot,
 				endpointGeneration: this.events.generation,
 			});
+		this.#started = false;
 		return "stopped";
 	}
 

@@ -24,7 +24,7 @@ GJC merges LSP config from multiple files, lowest to highest priority:
 | Priority | Location |
 |----------|----------|
 | 5 (lowest) | `~/lsp.json`, `~/.lsp.json`, `~/lsp.yaml`, `~/.lsp.yaml` |
-| 4 | Preloaded trusted user/marketplace plugin LSP config outside the project (internal loader support; no current CLI/startup producer) |
+| 4 | Preloaded trusted external plugin LSP config outside the project (internal loader support; no current CLI/startup producer) |
 | 3 | `~/.gjc/agent/lsp.json`, `~/.gjc/agent/lsp.yaml`, `~/.gemini/lsp.*` |
 | 2 | `<project>/.gjc/lsp.json`, `<project>/.gjc/lsp.yaml`, `<project>/.gemini/lsp.*` |
 | 1 (highest) | `<project>/lsp.json`, `<project>/.lsp.json`, `<project>/lsp.yaml` |
