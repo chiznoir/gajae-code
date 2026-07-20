@@ -90,7 +90,7 @@ import { loadActiveSubskillTools } from "../extensibility/gjc-plugins/tools";
 import { loadSkills, type Skill, type SkillWarning, setActiveSkills } from "../extensibility/skills";
 import type { FileSlashCommand } from "../extensibility/slash-commands";
 import type { HindsightSessionState } from "../hindsight/state";
-import { LocalProtocolHandler, type LocalProtocolOptions } from "../internal-urls";
+import { initializeLocalRoot, LocalProtocolHandler, type LocalProtocolOptions } from "../internal-urls";
 import { resolveMemoryBackend } from "../memory-backend";
 import asyncResultTemplate from "../prompts/tools/async-result.md" with { type: "text" };
 import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
@@ -982,6 +982,7 @@ const MCP_TOOLS_ONLY_MANAGER_SUBSESSION_ERROR = "tools-only MCP managers cannot 
 const MCP_CONFIG_PATH_SUBSESSION_ERROR = "mcpConfigPath cannot be used in sub-sessions";
 const MAX_EXACT_MCP_TOOL_COLLISION_NAMES = 10;
 const MAX_EXACT_MCP_TOOL_NAME_LENGTH = 100;
+const pluginMcpManagerServers = new WeakMap<MCPManager, ReadonlySet<string>>();
 
 class ExactMcpToolNameCollisionError extends Error {
 	constructor(toolNames: Iterable<string>) {
@@ -1170,8 +1171,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		const sessionManager =
 			options.sessionManager ??
 			(await logger.time("sessionManager", async () => {
-				const sessionDir = SessionManager.getDefaultSessionDir(cwd, agentDir);
-				return SessionManager.create(cwd, sessionDir);
+				return SessionManager.create(cwd, SessionManager.managedDestination(cwd, agentDir));
 			}));
 		const logicalSessionId = sessionManager.getSessionId();
 		const providerSessionId = options.providerSessionId ?? options.forkContextSeed?.cacheIdentity ?? logicalSessionId;
@@ -1506,6 +1506,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			trackEvalExecution: (execution, abortController) =>
 				session ? session.trackEvalExecution(execution, abortController) : execution,
 			getSessionId: () => sessionManager.getSessionId?.() ?? null,
+			isManagedSessionDestination: () => sessionManager.isManagedDestination(),
 			getActiveSkillState: () => session?.getActiveSkillState(),
 			getActiveSkillPhase: () => session?.getActiveSkillPhase(),
 			getHindsightSessionState: () => session?.getHindsightSessionState(),
@@ -1595,6 +1596,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			if (asyncJobManager) AsyncJobManager.setInstance(asyncJobManager);
 		}
 		if (options.localProtocolOptions) {
+			await initializeLocalRoot(options.localProtocolOptions);
 			disposeLocalProtocolOverride = LocalProtocolHandler.installOverride(options.localProtocolOptions);
 		}
 		toolSession.getArtifactsDir = getArtifactsDir;
@@ -1616,6 +1618,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		const explicitMcpConfigPath = !isCanonicalSubSession && !options.mcpManager ? options.mcpConfigPath : undefined;
 		const customTools: CustomTool[] = [];
 		const exactMcpToolNames: string[] = [];
+		const pluginMcpToolNames: string[] = [];
 
 		// Add image tools when the active model or configured image providers can generate images.
 		const imageGenTools = await logger.time("getImageGenTools", () => getImageGenTools(modelRegistry, model));
@@ -1727,6 +1730,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							mcpManager = owned;
 							ownsMcpManager = true;
 							customTools.push(...(result.tools as CustomTool[]));
+							pluginMcpManagerServers.set(owned, new Set(result.connectedServers));
+							owned.sealConnectionSet();
+							pluginMcpToolNames.push(...result.tools.map(tool => tool.name));
 						} else {
 							await owned.disconnectAll().catch(() => {});
 						}
@@ -1751,8 +1757,16 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				try {
 					const inheritedTools = inherited.getTools();
 					if (inheritedTools.length > 0) customTools.push(...(inheritedTools as CustomTool[]));
+					const pluginServers = pluginMcpManagerServers.get(inherited);
+					if (pluginServers) {
+						pluginMcpToolNames.push(
+							...inheritedTools
+								.filter(tool => tool.mcpServerName !== undefined && pluginServers.has(tool.mcpServerName))
+								.map(tool => tool.name),
+						);
+					}
 				} catch (error) {
-					logger.warn("Failed to inherit plugin MCP tools in subagent", { error });
+					logger.warn("Failed to inherit MCP tools in subagent", { error });
 				}
 			}
 		}
@@ -2231,11 +2245,21 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				}
 			}
 		}
+		const mandatoryMCPToolNameSet = new Set(pluginMcpToolNames);
+		const selectableExplicitMCPToolNames = explicitlyRequestedMCPToolNames.filter(
+			name => !mandatoryMCPToolNameSet.has(name),
+		);
 		let initialToolNames = [...initialRequestedActiveToolNames];
 		if (mcpDiscoveryEnabled) {
-			const restoredSelectedMCPToolNames = existingSession.selectedMCPToolNames.filter(name =>
-				toolRegistry.has(name),
+			const restoredSelectedMCPToolNames = existingSession.selectedMCPToolNames.filter(
+				name => toolRegistry.has(name) && !mandatoryMCPToolNameSet.has(name),
 			);
+			if (
+				existingSession.hasPersistedMCPToolSelection &&
+				restoredSelectedMCPToolNames.length !== existingSession.selectedMCPToolNames.length
+			) {
+				sessionManager.appendMCPToolSelection(restoredSelectedMCPToolNames);
+			}
 			defaultSelectedMCPToolNames = [
 				...new Set([
 					...discoveryDefaultServerToolNames,
@@ -2243,11 +2267,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				]),
 			];
 			hasExplicitMCPToolSelection =
-				hasExplicitToolNames && (options.toolNames!.length === 0 || explicitlyRequestedMCPToolNames.length > 0);
+				hasExplicitToolNames && (options.toolNames!.length === 0 || selectableExplicitMCPToolNames.length > 0);
 			initialSelectedMCPToolNames = existingSession.hasPersistedMCPToolSelection
 				? restoredSelectedMCPToolNames
 				: hasExplicitMCPToolSelection
-					? explicitlyRequestedMCPToolNames
+					? selectableExplicitMCPToolNames
 					: defaultSelectedMCPToolNames;
 			initialToolNames = [
 				...new Set([
@@ -2257,13 +2281,17 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			];
 		}
 
-		// Custom tools and extension-registered tools are always included regardless of toolNames filter
+		// Custom, extension-registered, and plugin-bundle MCP tools are always
+		// included regardless of the caller's built-in tool filter. Plugin MCPs
+		// remain always-on even when generic MCP discovery is disabled.
 		const alwaysInclude: string[] = [
 			...(options.customTools?.map(t => (isCustomTool(t) ? t.name : t.name)) ?? []),
 			...registeredTools.filter(t => !t.definition.defaultInactive).map(t => t.definition.name),
+			...pluginMcpToolNames,
 		];
+		const pluginMcpToolNameSet = new Set(pluginMcpToolNames);
 		for (const name of alwaysInclude) {
-			if (mcpDiscoveryEnabled && discoverableMCPToolNames.has(name)) {
+			if (mcpDiscoveryEnabled && discoverableMCPToolNames.has(name) && !pluginMcpToolNameSet.has(name)) {
 				continue;
 			}
 			if (toolRegistry.has(name) && !initialToolNames.includes(name)) {
@@ -2614,9 +2642,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			initialSelectedDiscoveredBuiltinToolNames,
 			initialBaselineDiscoveredBuiltinToolNames,
 			defaultSelectedMCPToolNames,
+			mandatoryMCPToolNames: pluginMcpToolNames,
 			persistInitialMCPToolSelection: !hasExistingSession && hasExplicitMCPToolSelection,
 			persistInitialDiscoveredBuiltinToolSelection: !hasExistingSession && hasExplicitDiscoveredBuiltinToolSelection,
-			initialPersistedMCPToolNames: explicitlyRequestedMCPToolNames,
+			initialPersistedMCPToolNames: selectableExplicitMCPToolNames,
 			initialPersistedDiscoveredBuiltinToolNames: explicitlyRequestedDiscoveredBuiltinToolNames,
 			defaultSelectedMCPServerNames: settings.get("mcp.discoveryDefaultServers") ?? [],
 			ttsrManager,

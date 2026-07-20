@@ -245,7 +245,6 @@ import {
 	persistCoordinatorRuntimeStateFromEvent,
 	registerCoordinatorRuntimeStateFinalizer,
 } from "../gjc-runtime/session-state-sidecar";
-import { writeArtifact } from "../gjc-runtime/state-writer";
 import { requestGjcWorkerIntegrationAttempt } from "../gjc-runtime/team-runtime";
 import { GoalRuntime } from "../goals/runtime";
 import type { Goal, GoalModeState } from "../goals/state";
@@ -436,11 +435,6 @@ export type AgentSessionEvent =
 	| { type: "thinking_level_changed"; thinkingLevel: ThinkingLevel | undefined }
 	| { type: "goal_updated"; goal: Goal | null; state?: GoalModeState };
 
-function isUnderProjectGjc(cwd: string, targetPath: string): boolean {
-	const relative = path.relative(path.join(path.resolve(cwd), ".gjc"), path.resolve(targetPath));
-	return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
-}
-
 /** Listener function for agent session events */
 export type AgentSessionEventListener = (event: AgentSessionEvent) => void;
 export type AsyncJobSnapshotItem = Pick<
@@ -556,6 +550,8 @@ export interface AgentSessionConfig {
 	defaultSelectedMCPServerNames?: string[];
 	/** MCP tool names that should seed brand-new sessions created from this AgentSession. */
 	defaultSelectedMCPToolNames?: string[];
+	/** MCP capabilities that are always active and never part of persisted user selection. */
+	mandatoryMCPToolNames?: string[];
 	/** TTSR manager for time-traveling stream rules */
 	ttsrManager?: TtsrManager;
 	/** Secret obfuscator for deobfuscating streaming edit content */
@@ -992,11 +988,6 @@ const noOpUIContext: ExtensionUIContext = {
 
 function createHandoffContext(document: string): string {
 	return `<handoff-context>\n${document}\n</handoff-context>\n\nThe above is a handoff document from a previous session. Use this context to continue the work seamlessly.`;
-}
-
-function createHandoffFileName(date = new Date()): string {
-	const fileTimestamp = date.toISOString().replace(/[:.]/g, "-");
-	return `handoff-${fileTimestamp}.md`;
 }
 
 // ============================================================================
@@ -1687,6 +1678,7 @@ export class AgentSession {
 	#gjcSubskillToolSignature: string | undefined;
 	#defaultSelectedMCPServerNames = new Set<string>();
 	#defaultSelectedMCPToolNames = new Set<string>();
+	#mandatoryMCPToolNames = new Set<string>();
 	/** Constructor authority applies only while this AgentSession instance remains alive. */
 	#constructorMCPToolSelection: string[] | undefined;
 	#constructorDiscoveredBuiltinToolSelection: string[] | undefined;
@@ -2198,6 +2190,11 @@ export class AgentSession {
 		);
 		this.#defaultSelectedMCPServerNames = new Set(config.defaultSelectedMCPServerNames ?? []);
 		this.#defaultSelectedMCPToolNames = new Set(config.defaultSelectedMCPToolNames ?? []);
+		this.#mandatoryMCPToolNames = new Set(
+			(config.mandatoryMCPToolNames ?? [])
+				.map(name => name.toLowerCase())
+				.filter(name => this.#toolRegistry.has(name)),
+		);
 		this.#constructorMCPToolSelection =
 			config.initialMCPToolSelectionIsExplicit === true
 				? this.#filterSelectableMCPToolNames(config.initialPersistedMCPToolNames ?? [])
@@ -3024,17 +3021,16 @@ export class AgentSession {
 		if (thresholdTokens <= 0 || estimateTextTokensHeuristic(fullText) <= thresholdTokens) return;
 
 		try {
-			const artifact = await this.sessionManager.allocateArtifactPath("tool-result");
-			if (!artifact.id || !artifact.path) return;
-			await Bun.write(artifact.path, fullText);
+			const artifactId = await this.sessionManager.saveArtifact(fullText, "tool-result");
+			if (!artifactId) return;
 			const digest = crypto.createHash("sha256").update(fullText).digest("hex");
-			const preview = createPreAdmissionArtifactSpillPreview(fullText, artifact.id, digest);
+			const preview = createPreAdmissionArtifactSpillPreview(fullText, artifactId, digest);
 			const spillMeta = outputMeta()
 				.truncationFromText(preview, {
 					direction: "middle",
 					totalLines: fullText.split("\n").length,
 					totalBytes: Buffer.byteLength(fullText, "utf-8"),
-					artifactId: artifact.id,
+					artifactId,
 				})
 				.get();
 			const existingDetails = message.details;
@@ -4448,6 +4444,7 @@ export class AgentSession {
 	#localProtocolOptions(): LocalProtocolOptions {
 		return {
 			getArtifactsDir: () => this.sessionManager.getArtifactsDir(),
+			isManagedDestination: () => this.sessionManager.isManagedDestination(),
 			getSessionId: () => this.sessionManager.getSessionId(),
 		};
 	}
@@ -5489,9 +5486,13 @@ export class AgentSession {
 
 	getSelectedMCPToolNames(): string[] {
 		if (!this.#mcpDiscoveryEnabled) {
-			return this.getActiveToolNames().filter(name => isMCPToolName(name) && this.#toolRegistry.has(name));
+			return this.getActiveToolNames().filter(
+				name => isMCPToolName(name) && this.#toolRegistry.has(name) && !this.#mandatoryMCPToolNames.has(name),
+			);
 		}
-		return this.#filterSelectableMCPToolNames(this.#selectedMCPToolNames);
+		return this.#filterSelectableMCPToolNames(this.#selectedMCPToolNames).filter(
+			name => !this.#mandatoryMCPToolNames.has(name),
+		);
 	}
 
 	// ── Generic tool discovery (covers built-in + MCP + extension) ────────────
@@ -5771,7 +5772,7 @@ export class AgentSession {
 			nextSelectedDiscoveredBuiltinToolNames?: string[];
 		},
 	): Promise<void> {
-		toolNames = [...new Set(toolNames.map(name => name.toLowerCase()))];
+		toolNames = [...new Set([...toolNames.map(name => name.toLowerCase()), ...this.#mandatoryMCPToolNames])];
 		const previousSelectedMCPToolNames = options?.previousSelectedMCPToolNames ?? this.getSelectedMCPToolNames();
 		const previousSelectedDiscoveredBuiltinToolNames =
 			options?.previousSelectedDiscoveredBuiltinToolNames ?? this.#getSelectedDiscoveredBuiltinToolNames();
@@ -5787,7 +5788,11 @@ export class AgentSession {
 		const nextSelectedMCPToolNames = this.#mcpDiscoveryEnabled
 			? new Set(
 					validToolNames.filter(
-						name => isMCPToolName(name) && this.#discoverableMCPTools.has(name) && this.#toolRegistry.has(name),
+						name =>
+							isMCPToolName(name) &&
+							!this.#mandatoryMCPToolNames.has(name) &&
+							this.#discoverableMCPTools.has(name) &&
+							this.#toolRegistry.has(name),
 					),
 				)
 			: this.#selectedMCPToolNames;
@@ -8988,25 +8993,6 @@ export class AgentSession {
 			return false;
 		}
 
-		// Copy artifacts directory if it exists
-		const oldArtifactDir = forkResult.oldSessionFile.slice(0, -6);
-		const newArtifactDir = forkResult.newSessionFile.slice(0, -6);
-
-		try {
-			const oldDirStat = await fs.promises.stat(oldArtifactDir);
-			if (oldDirStat.isDirectory()) {
-				await fs.promises.cp(oldArtifactDir, newArtifactDir, { recursive: true });
-			}
-		} catch (err) {
-			if (!isEnoent(err)) {
-				logger.warn("Failed to copy artifacts during fork", {
-					oldArtifactDir,
-					newArtifactDir,
-					error: err instanceof Error ? err.message : String(err),
-				});
-			}
-		}
-
 		// Update agent session ID
 		this.#syncAgentSessionId();
 		this.#bindWorkflowGateEmitter(previousWorkflowGateSessionId);
@@ -10349,27 +10335,13 @@ export class AgentSession {
 			await this.sessionManager.ensureOnDisk();
 			let savedPath: string | undefined;
 			if (options?.autoTriggered && this.settings.get("compaction.handoffSaveToDisk")) {
-				const artifactsDir = this.sessionManager.getArtifactsDir();
-				if (artifactsDir) {
-					const handoffFilePath = path.join(artifactsDir, createHandoffFileName());
-					try {
-						if (isUnderProjectGjc(this.sessionManager.getCwd(), handoffFilePath)) {
-							await writeArtifact(handoffFilePath, `${handoffText}\n`, {
-								cwd: this.sessionManager.getCwd(),
-								audit: { category: "artifact", verb: "write", owner: "gjc-runtime" },
-							});
-						} else {
-							await Bun.write(handoffFilePath, `${handoffText}\n`);
-						}
-						savedPath = handoffFilePath;
-					} catch (error) {
-						logger.warn("Failed to save handoff document to disk", {
-							path: handoffFilePath,
-							error: error instanceof Error ? error.message : String(error),
-						});
-					}
-				} else {
-					logger.debug("Skipping handoff document save because session is not persisted");
+				try {
+					const artifactId = await this.sessionManager.saveArtifact(`${handoffText}\n`, "handoff");
+					savedPath = `artifact://${artifactId}`;
+				} catch (error) {
+					logger.warn("Failed to save handoff document", {
+						error: error instanceof Error ? error.message : String(error),
+					});
 				}
 			}
 
@@ -13161,7 +13133,7 @@ export class AgentSession {
 				cwd,
 				timeout: clampTimeout("bash") * 1000,
 				env: buildGjcRuntimeSessionEnv({
-					sessionFile: this.sessionManager.getSessionFile(),
+					sessionFile: null,
 					sessionId: this.sessionId,
 					cwd,
 				}),

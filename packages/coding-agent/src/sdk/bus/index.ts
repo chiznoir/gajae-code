@@ -33,6 +33,7 @@ import { NotificationServer, nativeBuildInfo } from "@gajae-code/natives";
 import { logger, postmortem, prompt, VERSION } from "@gajae-code/utils";
 import { Settings } from "../../config/settings";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "../../extensibility/extensions";
+import { toAgentWireEventPayload } from "../../modes/shared/agent-wire/event-envelope";
 import {
 	NotificationGatePolicyChangedError,
 	type WorkflowGateEmitter,
@@ -40,6 +41,7 @@ import {
 	type WorkflowGateTerminalProof,
 } from "../../modes/shared/agent-wire/workflow-gate-broker";
 import btwUserPrompt from "../../prompts/system/btw-user.md" with { type: "text" };
+import type { AgentSessionEvent } from "../../session/agent-session";
 import { parseThinkingLevel } from "../../thinking";
 import type {
 	AskAnswerRequest,
@@ -918,6 +920,8 @@ interface SessionRuntime {
 					error: { code: string; message: string };
 			  },
 	) => void;
+	/** Publishes one canonical agent-wire event to the client that owns the active prompt. */
+	emitPromptEvent: (event: AgentSessionEvent) => void;
 	/** Inbound Telegram update ids injected but not yet consumed by a turn. */
 	pendingInbound: Set<number>;
 	/** Latest assistant text of the in-flight turn (from message_update). */
@@ -995,6 +999,7 @@ type SessionStartResult = {
 	status: SessionStartStatus;
 	runtime?: SessionRuntime;
 	failure?: SdkStartupFailure;
+	suppressExtensionError?: boolean;
 };
 
 function pushSessionFrame(
@@ -3137,7 +3142,7 @@ export function createNotificationsExtension(
 			error: unknown;
 			terminal: boolean;
 			createdAt: number;
-			bufferedLifecycle: PromptLifecycleFrame[];
+			bufferedFrames: Array<PromptLifecycleFrame | Record<string, unknown>>;
 		};
 		const promptSubmissions = new Map<string, PromptSubmission>();
 		const promptTerminalTombstones = new Map<string, number>();
@@ -3169,7 +3174,7 @@ export function createNotificationsExtension(
 		};
 		const abandonPrompt = (submission: PromptSubmission) => {
 			submission.abandoned = true;
-			submission.bufferedLifecycle.length = 0;
+			submission.bufferedFrames.length = 0;
 		};
 		const emitPromptLifecycle = (
 			correlation: { commandId: string; turnId: string } | undefined,
@@ -3189,7 +3194,7 @@ export function createNotificationsExtension(
 				return;
 			}
 			if (!submission.acknowledged) {
-				submission.bufferedLifecycle.push(frame);
+				submission.bufferedFrames.push(frame);
 				return;
 			}
 			try {
@@ -3200,8 +3205,31 @@ export function createNotificationsExtension(
 			}
 			if (submission.terminal) finalizePrompt(key, correlation);
 		};
+		const emitPromptEvent = (event: AgentSessionEvent) => {
+			if (!runtime?.activePromptCorrelation) return;
+			cleanupPromptRecords();
+			const correlation = runtime.activePromptCorrelation;
+			const submission = promptSubmissions.get(promptSubmissionKey(correlation));
+			if (!submission || submission.abandoned) return;
+			const frame = {
+				type: "event",
+				kind: event.type,
+				payload: toAgentWireEventPayload(event),
+				...correlation,
+			};
+			if (!submission.acknowledged) {
+				submission.bufferedFrames.push(frame);
+				return;
+			}
+			try {
+				runtime.server.sendTo(submission.connectionId, JSON.stringify(frame));
+			} catch (error) {
+				logger.warn(`sdk: correlated agent event delivery failed: ${String(error)}`);
+				abandonPrompt(submission);
+			}
+		};
 		const flushPromptLifecycle = (key: string, submission: PromptSubmission) => {
-			for (const frame of submission.bufferedLifecycle.splice(0)) {
+			for (const frame of submission.bufferedFrames.splice(0)) {
 				try {
 					server.sendTo(submission.connectionId, JSON.stringify(frame));
 				} catch (error) {
@@ -3237,7 +3265,7 @@ export function createNotificationsExtension(
 				error: undefined,
 				terminal: false,
 				createdAt: Date.now(),
-				bufferedLifecycle: [],
+				bufferedFrames: [],
 			});
 		};
 		const recordPromptTerminal = (correlation: { commandId: string; turnId: string } | undefined) => {
@@ -3519,6 +3547,7 @@ export function createNotificationsExtension(
 			activePromptCorrelation: undefined,
 			recordPromptTerminal,
 			emitPromptLifecycle,
+			emitPromptEvent,
 			pendingInbound: new Set<number>(),
 			inFlightTools: new Map<string, { toolName: string; args: unknown }>(),
 			deferredGatePresentations: [],
@@ -4237,6 +4266,7 @@ export function createNotificationsExtension(
 			logger.warn(`notifications: failed to start server: ${String(e)}`);
 			const result = failLifecycleStartup("failed", e);
 			finishStartup(result);
+			let suppressExtensionError = false;
 			let stopped = false;
 			try {
 				stopped = await stopSession(id, "session", runtime);
@@ -4246,9 +4276,10 @@ export function createNotificationsExtension(
 				// than letting it escape startSession and surface a red extension error
 				// through session_start / session_switch / session_branch.
 				logger.error(`notifications: SDK notification runtime cleanup failed: ${String(error)}`);
+				suppressExtensionError = true;
 			}
 			if (!stopped) await cleanupAbandonedStartup();
-			return { ...result, runtime };
+			return { ...result, runtime, suppressExtensionError };
 		}
 	}
 
@@ -4392,7 +4423,12 @@ export function createNotificationsExtension(
 			await controller.reconcileCurrentSession(ctx);
 			return;
 		}
-		if (!lifecycleStartupCapability && result.status === "failed")
+		if (
+			!lifecycleStartupCapability &&
+			result.status === "failed" &&
+			!extensionShuttingDown &&
+			!result.suppressExtensionError
+		)
 			throw new Error(`notifications: SDK startup failed: ${result.failure?.message ?? "Unknown startup failure."}`);
 	};
 
@@ -4849,6 +4885,7 @@ export function createNotificationsExtension(
 	api.on("message_update", (event, ctx) => {
 		const id = sessionId(ctx);
 		const rt = runtimes.get(id);
+		rt?.emitPromptEvent(event);
 		if (!rt?.notificationsActive || !rt.stream || rt.redact || rt.turnClosed) return;
 		if ((event.message as { role?: unknown }).role !== "assistant") return;
 		if (rt.liveRef === undefined && rt.turnSeq !== undefined) {
@@ -4872,6 +4909,7 @@ export function createNotificationsExtension(
 	api.on("message_end", (event, ctx) => {
 		const id = sessionId(ctx);
 		const rt = runtimes.get(id);
+		rt?.emitPromptEvent(event);
 		if (!rt?.notificationsActive || rt.redact) return;
 		// Capture the in-flight ASSISTANT text here (message_end is on the awaited
 		// extension path and ordered before tool_execution_start) so the pre-ask
