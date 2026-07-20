@@ -250,8 +250,8 @@ describe("AgentSession resilient retry", () => {
 			extensionRunner,
 			onResponse: extensionRunner
 				? async (response, model) => {
-					await extensionRunner.emitAfterProviderResponse(response, model);
-				}
+						await extensionRunner.emitAfterProviderResponse(response, model);
+					}
 				: undefined,
 		});
 	}
@@ -875,9 +875,16 @@ describe("AgentSession resilient retry", () => {
 				return stream;
 			},
 			extensionRunner: createExtensionRunner(
-				new Map([["reasoning_summary_start", [async () => {
-					hookCalls++;
-				}]]]),
+				new Map([
+					[
+						"reasoning_summary_start",
+						[
+							async () => {
+								hookCalls++;
+							},
+						],
+					],
+				]),
 			),
 		});
 		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
@@ -901,9 +908,16 @@ describe("AgentSession resilient retry", () => {
 			],
 			requestedModels,
 			extensionRunner: createExtensionRunner(
-				new Map([["agent_start", [async () => {
-					hookCalls++;
-				}]]]),
+				new Map([
+					[
+						"agent_start",
+						[
+							async () => {
+								hookCalls++;
+							},
+						],
+					],
+				]),
 			),
 		});
 		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
@@ -932,9 +946,16 @@ describe("AgentSession resilient retry", () => {
 				requestedModels,
 				emitProviderPayload: eventType === "before_provider_request",
 				extensionRunner: createExtensionRunner(
-					new Map([[eventType, [async () => {
-						hookCalls++;
-					}]]]),
+					new Map([
+						[
+							eventType,
+							[
+								async () => {
+									hookCalls++;
+								},
+							],
+						],
+					]),
 				),
 			});
 			vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
@@ -962,9 +983,16 @@ describe("AgentSession resilient retry", () => {
 			],
 			requestedModels,
 			extensionRunner: createExtensionRunner(
-				new Map([["auto_retry_start", [async () => {
-					hookCalls++;
-				}]]]),
+				new Map([
+					[
+						"auto_retry_start",
+						[
+							async () => {
+								hookCalls++;
+							},
+						],
+					],
+				]),
 			),
 		});
 		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
@@ -1007,11 +1035,21 @@ describe("AgentSession resilient retry", () => {
 				streamFn: () => {
 					const stream = new AssistantMessageEventStream();
 					queueMicrotask(() => {
-						const empty = assistantMessage(model, [], "error", "Example Provider Watchdog stream timed out while waiting for the first event");
+						const empty = assistantMessage(
+							model,
+							[],
+							"error",
+							"Example Provider Watchdog stream timed out while waiting for the first event",
+						);
 						if (!partialOutput) empty.transportFailure = { kind: "transport", status: 503 };
 						stream.push({ type: "start", partial: empty });
 						if (partialOutput) {
-							const visible = assistantMessage(model, [{ type: "text", text: "already visible" }], "error", "Example Provider Watchdog stream timed out while waiting for the first event");
+							const visible = assistantMessage(
+								model,
+								[{ type: "text", text: "already visible" }],
+								"error",
+								"Example Provider Watchdog stream timed out while waiting for the first event",
+							);
 							stream.push({ type: "text_start", contentIndex: 0, partial: empty });
 							stream.push({ type: "text_delta", contentIndex: 0, delta: "already ", partial: visible });
 							stream.push({ type: "text_delta", contentIndex: 0, delta: "visible", partial: visible });
@@ -1073,7 +1111,12 @@ describe("AgentSession resilient retry", () => {
 						stream.push({ type: "done", reason: "toolUse", message: response });
 						return;
 					}
-					const failure = assistantMessage(model, [], "error", "Example Provider Watchdog stream timed out while waiting for the first event");
+					const failure = assistantMessage(
+						model,
+						[],
+						"error",
+						"Example Provider Watchdog stream timed out while waiting for the first event",
+					);
 					stream.push({ type: "start", partial: failure });
 					stream.push({ type: "error", reason: "error", error: failure });
 				});
@@ -1087,7 +1130,9 @@ describe("AgentSession resilient retry", () => {
 		await session.waitForIdle();
 
 		expect(toolRuns).toBe(1);
-		expect(session.agent.state.messages).toContainEqual(expect.objectContaining({ role: "toolResult", toolCallId: toolCall.id, toolName: "counted" }));
+		expect(session.agent.state.messages).toContainEqual(
+			expect.objectContaining({ role: "toolResult", toolCallId: toolCall.id, toolName: "counted" }),
+		);
 		expect(streamCalls).toBe(2);
 		expect(retryStartEvents).toHaveLength(0);
 		expect(lastAssistant(session).stopReason).toBe("error");
@@ -1105,18 +1150,27 @@ describe("AgentSession resilient retry", () => {
 					queueMicrotask(() => {
 						originalStream.push({ type: "start", partial: assistantMessage(model, [], "stop") });
 						originalStarted.resolve();
-						options?.signal?.addEventListener("abort", () => {
-							originalAborted.resolve();
-							const aborted = assistantMessage(model, [], "aborted", "Aborted");
-							originalStream.push({ type: "error", reason: "aborted", error: aborted });
-						}, { once: true });
+						options?.signal?.addEventListener(
+							"abort",
+							() => {
+								originalAborted.resolve();
+								const aborted = assistantMessage(model, [], "aborted", "Aborted");
+								originalStream.push({ type: "error", reason: "aborted", error: aborted });
+							},
+							{ once: true },
+						);
 					});
 					return originalStream;
 				}
 				const stream = new AssistantMessageEventStream();
 				queueMicrotask(() => {
 					if (streamCalls === 2) {
-						const failure = assistantMessage(model, [], "error", "Example Provider Watchdog stream timed out while waiting for the first event");
+						const failure = assistantMessage(
+							model,
+							[],
+							"error",
+							"Example Provider Watchdog stream timed out while waiting for the first event",
+						);
 						stream.push({ type: "start", partial: failure });
 						stream.push({ type: "error", reason: "error", error: failure });
 						return;
@@ -1137,13 +1191,19 @@ describe("AgentSession resilient retry", () => {
 		await originalAborted.promise;
 		await originalPrompt;
 		await session.waitForIdle();
-		originalStream.push({ type: "done", reason: "stop", message: assistantMessage(model, [{ type: "text", text: "late original" }], "stop") });
+		originalStream.push({
+			type: "done",
+			reason: "stop",
+			message: assistantMessage(model, [{ type: "text", text: "late original" }], "stop"),
+		});
 		await Promise.resolve();
 
 		expect(streamCalls).toBe(3);
 		expect(retryStartEvents).toHaveLength(1);
 		expect(retryEndEvents).toEqual([expect.objectContaining({ success: true })]);
-		expect(session.agent.state.messages.some(message => JSON.stringify(message).includes("late original"))).toBe(false);
+		expect(session.agent.state.messages.some(message => JSON.stringify(message).includes("late original"))).toBe(
+			false,
+		);
 		expect(lastAssistant(session).content).toEqual([{ type: "text", text: "replacement recovered" }]);
 	});
 	it("fails closed on non-canonical watchdog prose under bare defaults", async () => {

@@ -775,7 +775,8 @@ type RetryErrorClassification =
 	| "local_unavailable"
 	| "unknown";
 
-const BARE_DEFAULT_WATCHDOG_ERROR = /^(?:[A-Za-z][A-Za-z0-9-]*(?: [A-Za-z][A-Za-z0-9-]*){0,3} )stream (?:timed out while waiting for the first event|stalled while waiting for the next event)$/;
+const BARE_DEFAULT_WATCHDOG_ERROR =
+	/^(?:[A-Za-z][A-Za-z0-9-]*(?: [A-Za-z][A-Za-z0-9-]*){0,3} )stream (?:timed out while waiting for the first event|stalled while waiting for the next event)$/;
 
 function hasBareDefaultRetryDisqualifyingFacts(message: AssistantMessage): boolean {
 	if (message.errorKind !== undefined || message.errorStatus !== undefined) return true;
@@ -3048,7 +3049,11 @@ export class AgentSession {
 	/** Internal handler for agent events - shared by subscribe and reconnect */
 	#handleAgentEvent = async (event: AgentEvent): Promise<void> => {
 		if (this.#extensionRunner?.hasHandlers(event.type)) this.#markRetryReplayUnsafe();
-		if (event.type === "tool_execution_start" || event.type === "tool_execution_update" || event.type === "tool_execution_end") {
+		if (
+			event.type === "tool_execution_start" ||
+			event.type === "tool_execution_update" ||
+			event.type === "tool_execution_end"
+		) {
 			this.#markRetryReplayUnsafe();
 		} else if (event.type === "message_end") {
 			if (
@@ -3063,9 +3068,13 @@ export class AgentSession {
 				update.type === "toolcall_start" ||
 				update.type === "toolcall_delta" ||
 				update.type === "toolcall_end" ||
-				((update.type === "text_delta" || update.type === "thinking_delta" || update.type === "reasoning_summary_delta") &&
+				((update.type === "text_delta" ||
+					update.type === "thinking_delta" ||
+					update.type === "reasoning_summary_delta") &&
 					update.delta.length > 0) ||
-				((update.type === "text_end" || update.type === "thinking_end" || update.type === "reasoning_summary_end") &&
+				((update.type === "text_end" ||
+					update.type === "thinking_end" ||
+					update.type === "reasoning_summary_end") &&
 					update.content.length > 0)
 			) {
 				this.#markRetryReplayUnsafe();
