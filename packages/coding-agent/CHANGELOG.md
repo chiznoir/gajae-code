@@ -1,6 +1,8 @@
 # Changelog
 
 ## [Unreleased]
+
+## [0.11.4] - 2026-07-20
 ### Added
 - Bracketed pastes containing complete lists of saved static-image paths can now attach up to 16 images in source order after explicit confirmation. Paste transactions are cancellation-safe, disabled in command modes, enforce source, encoded-output, dimension, and decoded-memory budgets before commit, reject animated, remote, linked, or path-swapped sources, and restore the literal paste on cancellation or failure.
 - Rich tool-call rendering in the transcript viewer: both the session-observer and main-session transcript viewers now share one formatter so tool calls render identically (args summary + intent, then a result block with ✓ done / ✗ error / ⏳ pending states). Fixes a latent bug where a tool call with no result rendered as a false "✓ done"; expanded results cap at 100 source lines with raw/copy exposing the full text (#2656).

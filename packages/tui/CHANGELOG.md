@@ -1,6 +1,8 @@
 # Changelog
 
 ## [Unreleased]
+
+## [0.11.4] - 2026-07-20
 ### Fixed
 
 - Keybinding configuration arrays are now defensively copied so external mutations cannot diverge snapshots from resolved key matches.
