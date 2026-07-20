@@ -6,7 +6,7 @@ import { type AssistantMessage, getBundledModel } from "@gajae-code/ai";
 import type { Rule } from "@gajae-code/coding-agent/capability/rule";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import type { ExtensionFactory } from "@gajae-code/coding-agent/extensibility/extensions";
-import { LocalProtocolHandler, resolveLocalUrlToPath } from "@gajae-code/coding-agent/internal-urls";
+import { LocalProtocolHandler, resolveLocalRoot, resolveLocalUrlToPath } from "@gajae-code/coding-agent/internal-urls";
 import { AgentRegistry } from "@gajae-code/coding-agent/registry/agent-registry";
 import { createAgentSession } from "@gajae-code/coding-agent/sdk";
 import { createSecretObfuscator } from "@gajae-code/coding-agent/secrets";
@@ -181,7 +181,7 @@ describe("createAgentSession session storage isolation", () => {
 				})
 			).session;
 			expect(resolveLocalUrlToPath("local://note.md", LocalProtocolHandler.resolveOptions()!)).toBe(
-				path.join(os.tmpdir(), "gjc-local", "first-local-session", "note.md"),
+				path.join(firstArtifactsDir, "local", "note.md"),
 			);
 
 			secondSession = (
@@ -194,14 +194,89 @@ describe("createAgentSession session storage isolation", () => {
 				})
 			).session;
 			expect(resolveLocalUrlToPath("local://note.md", LocalProtocolHandler.resolveOptions()!)).toBe(
-				path.join(os.tmpdir(), "gjc-local", "second-local-session", "note.md"),
+				path.join(secondArtifactsDir, "local", "note.md"),
 			);
 
+			// Dispose the first (bottom-of-stack) override while the second remains installed;
+			// only the first session's override may be removed and the second must still resolve.
+			await firstSession.dispose();
+			firstSession = undefined;
+			expect(resolveLocalUrlToPath("local://note.md", LocalProtocolHandler.resolveOptions()!)).toBe(
+				path.join(secondArtifactsDir, "local", "note.md"),
+			);
+
+			// Disposing the remaining second override restores the default/fallback resolution.
+			await secondSession.dispose();
+			secondSession = undefined;
+			expect(LocalProtocolHandler.resolveOptions()).toBeUndefined();
+
+			// Managed-destination sessions retain their owner-only external gjc-local root.
+			expect(
+				resolveLocalRoot({
+					getArtifactsDir: () => firstArtifactsDir,
+					isManagedDestination: () => true,
+					getSessionId: () => "managed-owner-session",
+				}),
+			).toBe(path.join(os.tmpdir(), "gjc-local", "managed-owner-session"));
+		} finally {
+			await secondSession?.dispose();
+			await firstSession?.dispose();
+		}
+	});
+
+	it("restores the previous session's local:// override when the top override is disposed (LIFO)", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-sdk-local-protocol-lifo-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwd = path.join(tempDir, "project");
+		const agentDir = path.join(tempDir, "agent");
+		const firstArtifactsDir = path.join(tempDir, "first-artifacts");
+		const secondArtifactsDir = path.join(tempDir, "second-artifacts");
+		fs.mkdirSync(cwd, { recursive: true });
+		const sessionOptions = {
+			cwd,
+			agentDir,
+			settings: Settings.isolated(),
+			disableExtensionDiscovery: true,
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: false,
+			enableLsp: false,
+		};
+		let firstSession: AgentSession | undefined;
+		let secondSession: AgentSession | undefined;
+		try {
+			firstSession = (
+				await createAgentSession({
+					...sessionOptions,
+					localProtocolOptions: {
+						getArtifactsDir: () => firstArtifactsDir,
+						getSessionId: () => "first-local-session",
+					},
+				})
+			).session;
+			secondSession = (
+				await createAgentSession({
+					...sessionOptions,
+					localProtocolOptions: {
+						getArtifactsDir: () => secondArtifactsDir,
+						getSessionId: () => "second-local-session",
+					},
+				})
+			).session;
+			expect(resolveLocalUrlToPath("local://note.md", LocalProtocolHandler.resolveOptions()!)).toBe(
+				path.join(secondArtifactsDir, "local", "note.md"),
+			);
+
+			// Dispose the top-of-stack (second) override; the previous (first) override must be restored.
 			await secondSession.dispose();
 			secondSession = undefined;
 			expect(resolveLocalUrlToPath("local://note.md", LocalProtocolHandler.resolveOptions()!)).toBe(
-				path.join(os.tmpdir(), "gjc-local", "first-local-session", "note.md"),
+				path.join(firstArtifactsDir, "local", "note.md"),
 			);
+
+			// Disposing the last remaining override restores the default/fallback resolution.
 			await firstSession.dispose();
 			firstSession = undefined;
 			expect(LocalProtocolHandler.resolveOptions()).toBeUndefined();
