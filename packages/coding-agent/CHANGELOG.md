@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 ### Fixed
+- Workspace-wide LSP diagnostics now fail closed instead of launching build or typecheck subprocesses outside execution-tool authorization; concrete-file and glob diagnostics remain available.
 - Added fail-closed managed tmux owner SIGABRT recovery: exact-child supervisor receipts and pre-CLI admission now bind replacement ownership, strict durable Ultragoal/transcript evidence reconciles terminal child yields over stale nonterminal runtime state, recovery hydration remains write-free until an ownership fence, and hostile identity, corruption, concurrency, and path boundaries preserve dirty product files (#2681).
 - Added evidence-preserving recovery for legacy multi-writer SDK session-index corruption: `gjc gc` now diagnoses corrupt prefixes, `--repair-session-index` quarantines the original snapshot/log under the session-index lock before atomically restoring only the checksum-valid monotonic prefix, and append failures point operators to the explicit repair path (#2654).
 - Preserved access to legal SQLite table names beginning with `sqlite` but not reserved `sqlite_`.
