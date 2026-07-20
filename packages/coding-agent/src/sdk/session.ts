@@ -2758,6 +2758,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			});
 		}
 
+		// Constructor-time workflow-gate tool restoration is deferred by one
+		// microtask (the ToolSession closure needs `session` assigned). Await it
+		// so a resumed canonical workflow session returns with `ask` resident.
+		await session.workflowGateToolRestoration;
 		return {
 			session,
 			extensionsResult,

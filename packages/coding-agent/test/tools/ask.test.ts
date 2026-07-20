@@ -2615,6 +2615,52 @@ describe("AskTool deep-interview recorder persistence", () => {
 			}).success,
 		).toBe(false);
 	});
+
+	it("preserves deep-interview intent branch and strict metadata validation", () => {
+		const contract = {
+			items: [{ id: "artifact:report", category: "artifact" as const, statement: "Produce report" }],
+			confirmation_options: ["Confirm"],
+		};
+		const review = {
+			observed_items: [{ id: "artifact:report", category: "artifact" as const, statement: "Produce report" }],
+			supporting_substitutions: [],
+			approval_options: ["Approve"],
+		};
+		const question = (deepInterview: Record<string, unknown>) => ({
+			questions: [
+				{ id: "q", question: "Pick?", options: [{ label: "Confirm" }, { label: "Approve" }], deepInterview },
+			],
+		});
+
+		expect(
+			askSchema.safeParse(
+				question({
+					round: 1,
+					component: "review-topology",
+					dimension: "topology",
+					ambiguity: 0.5,
+					intent_contract: contract,
+				}),
+			).success,
+		).toBe(false);
+		expect(
+			askSchema.safeParse(
+				question({
+					round: 0,
+					component: "review-topology",
+					dimension: "topology",
+					ambiguity: 0.5,
+					intent_contract: contract,
+					intent_review: review,
+				}),
+			).success,
+		).toBe(false);
+		expect(
+			askSchema.safeParse(
+				question({ round: 1, component: "Scope", dimension: "Constraints", ambiguity: 0.5, unexpected: true }),
+			).success,
+		).toBe(false);
+	});
 });
 
 describe("AskTool Round-0 intent recovery", () => {

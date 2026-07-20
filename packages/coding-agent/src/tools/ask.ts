@@ -67,9 +67,16 @@ const OptionItem = z.object({
 	label: z.string().describe("display label"),
 });
 
+const DEEP_INTERVIEW_INTENT_ID_PATTERN = /^(artifact|surface|integration|constraint):[a-z0-9][a-z0-9._/-]{0,127}$/;
+
+const DeepInterviewReferenceId = z.string().superRefine((value, context) => {
+	if (!DEEP_INTERVIEW_INTENT_ID_PATTERN.test(value))
+		context.addIssue({ code: "custom", message: "invalid deep-interview intent ID" });
+});
+
 const DeepInterviewIntentItem = z
 	.object({
-		id: z.string().regex(/^(artifact|surface|integration|constraint):[a-z0-9][a-z0-9._/-]{0,127}$/),
+		id: z.string().regex(DEEP_INTERVIEW_INTENT_ID_PATTERN),
 		category: z.enum(["artifact", "surface", "integration", "constraint"]),
 		statement: z.string().min(1).max(1_000),
 	})
@@ -93,13 +100,8 @@ const DeepInterviewIntentReview = z
 			.array(
 				z
 					.object({
-						removed_id: z
-							.string()
-							.regex(/^(artifact|surface|integration|constraint):[a-z0-9][a-z0-9._/-]{0,127}$/),
-						replacement_ids: z
-							.array(z.string().regex(/^(artifact|surface|integration|constraint):[a-z0-9][a-z0-9._/-]{0,127}$/))
-							.min(1)
-							.max(64),
+						removed_id: DeepInterviewReferenceId,
+						replacement_ids: z.array(DeepInterviewReferenceId).min(1).max(64),
 						rationale: z.string().min(1).max(500),
 					})
 					.strict(),
@@ -111,25 +113,24 @@ const DeepInterviewIntentReview = z
 
 /** Optional structured deep-interview round metadata; when present the round is recorded automatically. */
 const DeepInterviewMetadata = z.object({
-	round_id: z.string().max(128).describe("stable optional round identity").optional(),
-	round: z.number().int().nonnegative().describe("round number"),
-	component: z.string().min(1).max(128).describe("targeted topology component"),
-	dimension: z.string().min(1).max(128).describe("targeted clarity dimension"),
-	ambiguity: z.number().min(0).max(1).describe("ambiguity at ask time (0..1)"),
+	round_id: z.string().max(128).optional(),
+	round: z.number().int().nonnegative(),
+	component: z.string().min(1).max(128),
+	dimension: z.string().min(1).max(128),
+	ambiguity: z.number().min(0).max(1),
 });
 
-/** Provider-visible branches keep ordinary, contract, and review metadata mutually exclusive. */
 const DeepInterviewMeta = z.union([
 	DeepInterviewMetadata.strict(),
 	DeepInterviewMetadata.extend({
-		round: z.literal(0).describe("round number"),
-		component: z.literal("review-topology").describe("targeted topology component"),
-		dimension: z.literal("topology").describe("targeted clarity dimension"),
-		intent_contract: DeepInterviewIntentContract.describe("Round-0 locked intent contract"),
+		round: z.literal(0),
+		component: z.literal("review-topology"),
+		dimension: z.literal("topology"),
+		intent_contract: DeepInterviewIntentContract,
 	}).strict(),
 	DeepInterviewMetadata.extend({
-		round: z.number().int().positive().describe("round number"),
-		intent_review: DeepInterviewIntentReview.describe("Locked-intent reduction review"),
+		round: z.number().int().positive(),
+		intent_review: DeepInterviewIntentReview,
 	}).strict(),
 ]);
 
@@ -164,6 +165,29 @@ const QuestionItem = z
 		const labels = new Set(value.options.map(option => option.label));
 		const contract = intentContract(value.deepInterview);
 		const review = intentReview(value.deepInterview);
+		if (contract && review)
+			context.addIssue({
+				code: "custom",
+				message: "intent contract and review are mutually exclusive",
+				path: ["deepInterview"],
+			});
+		if (
+			contract &&
+			(value.deepInterview?.round !== 0 ||
+				value.deepInterview.component !== "review-topology" ||
+				value.deepInterview.dimension !== "topology")
+		)
+			context.addIssue({
+				code: "custom",
+				message: "intent contract requires round-0 review topology metadata",
+				path: ["deepInterview"],
+			});
+		if (review && (value.deepInterview?.round ?? 0) <= 0)
+			context.addIssue({
+				code: "custom",
+				message: "intent review requires a positive round",
+				path: ["deepInterview", "round"],
+			});
 		if ((contract || review) && value.multi === true)
 			context.addIssue({ code: "custom", message: "intent gates must be single-select", path: ["multi"] });
 		const confirmationOptions = contract?.confirmation_options ?? [];

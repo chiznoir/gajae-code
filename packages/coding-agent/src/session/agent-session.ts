@@ -2237,11 +2237,37 @@ export class AgentSession {
 		// Re-evaluate append-only context mode when the setting changes at runtime.
 		this.#unsubscribeAppendOnly = onAppendOnlyModeChanged(_value => this.#syncAppendOnlyContext(this.model));
 		// SDK ToolSession callbacks capture the just-constructed session. Defer the
-		// initial ask-tool attachment until that capture has been assigned by the
+		// initial ask-tool registration until that capture has been assigned by the
 		// session factory, while retaining the durable emitter created above.
-		queueMicrotask(() => {
-			if (!this.#isDisposed) this.#ensureWorkflowGateAskTool();
+		this.#workflowGateToolRestoration = new Promise<void>((resolve, reject) => {
+			queueMicrotask(() => {
+				if (this.#isDisposed) {
+					resolve();
+					return;
+				}
+				try {
+					this.#registerWorkflowGateAskTool();
+					this.#attachAskToolIfWorkflowActive().then(resolve, reject);
+				} catch (error) {
+					reject(error instanceof Error ? error : new Error(String(error)));
+				}
+			});
 		});
+		// Non-SDK embedders may never observe the getter; a swallowed handler
+		// prevents an unhandled rejection while later awaits still reject.
+		this.#workflowGateToolRestoration.catch(() => {});
+	}
+
+	#workflowGateToolRestoration: Promise<void> = Promise.resolve();
+
+	/**
+	 * Resolves when constructor-time workflow-gate tool restoration (ask
+	 * registration plus durable active-workflow attachment) has settled. The
+	 * SDK factory awaits this so a resumed canonical workflow session is
+	 * returned with `ask` already resident.
+	 */
+	get workflowGateToolRestoration(): Promise<void> {
+		return this.#workflowGateToolRestoration;
 	}
 
 	/** Model registry for API key resolution and model discovery */
@@ -5777,14 +5803,17 @@ export class AgentSession {
 	}
 
 	async #restoreMCPSelectionsForSessionContext(sessionContext: SessionContext): Promise<void> {
-		if (!this.#mcpDiscoveryEnabled && this.#resolveEffectiveDiscoveryMode() !== "all") return;
+		if (!this.#mcpDiscoveryEnabled && this.#resolveEffectiveDiscoveryMode() !== "all") {
+			await this.#attachAskToolIfWorkflowActive();
+			return;
+		}
 		const selectionOnlyDiscoveredBuiltinToolNames = new Set(
 			this.#getSelectedDiscoveredBuiltinToolNames().filter(
 				name => !this.#baselineDiscoveredBuiltinToolNames.has(name),
 			),
 		);
 		const nextActiveNonMCPToolNames = this.#getActiveNonMCPToolNames().filter(
-			name => !selectionOnlyDiscoveredBuiltinToolNames.has(name),
+			name => name !== "ask" && !selectionOnlyDiscoveredBuiltinToolNames.has(name),
 		);
 		const constructorMCPToolNames = this.#resolveConstructorMCPToolSelection();
 		const restoredMCPToolNames = sessionContext.hasPersistedMCPToolSelection
@@ -5799,6 +5828,7 @@ export class AgentSession {
 			[...nextActiveNonMCPToolNames, ...restoredMCPToolNames, ...restoredDiscoveredBuiltinToolNames],
 			{ persistMCPSelection: false },
 		);
+		await this.#attachAskToolIfWorkflowActive();
 	}
 	/** Rebuild the base system prompt using the current active tool set. */
 	async refreshBaseSystemPrompt(): Promise<void> {
@@ -6475,11 +6505,11 @@ export class AgentSession {
 		this.#workflowGateEmitter = emitter;
 		notifyWorkflowGateEmitterChanged(this.sessionId, emitter);
 		if (emitter) {
-			this.#ensureWorkflowGateAskTool();
+			this.#registerWorkflowGateAskTool();
 		}
 	}
 
-	#ensureWorkflowGateAskTool(): void {
+	#registerWorkflowGateAskTool(): void {
 		if (!this.#workflowGateToolSession) return;
 
 		let askTool = this.#toolRegistry.get("ask");
@@ -6491,7 +6521,47 @@ export class AgentSession {
 			this.#toolRegistry.set(askTool.name, askTool);
 		}
 
-		if (this.getActiveToolNames().includes(askTool.name)) return;
+		try {
+			if ((this.#workflowGateEmitter?.listPendingGates?.().length ?? 0) > 0) {
+				this.#attachAskTool();
+			}
+		} catch (error) {
+			logger.warn("Failed to inspect pending workflow gates; activating ask tool conservatively", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+			this.#attachAskTool();
+		}
+	}
+
+	async #attachAskToolIfWorkflowActive(): Promise<void> {
+		const sessionId = this.sessionManager.getSessionId();
+		const inMemoryActiveSkill =
+			this.#activeSkillState && (!this.#activeSkillState.sessionId || this.#activeSkillState.sessionId === sessionId)
+				? this.#activeSkillState.skill
+				: undefined;
+		let activeSkill = inMemoryActiveSkill;
+		if (!activeSkill) {
+			try {
+				const activeState = await readVisibleSkillActiveState(this.sessionManager.getCwd(), sessionId);
+				activeSkill =
+					activeState?.skill ?? activeState?.active_skills?.find(entry => entry.active !== false)?.skill;
+			} catch (error) {
+				logger.warn("Failed to read durable workflow skill state while restoring ask tool", {
+					error: error instanceof Error ? error.message : String(error),
+				});
+				return;
+			}
+			// Identity fence: the durable read is async — the session may have been
+			// disposed or switched to a different identity meanwhile. Never attach
+			// a predecessor session's workflow state to the current identity.
+			if (this.#isDisposed || this.sessionManager.getSessionId() !== sessionId) return;
+		}
+		if (activeSkill && isCanonicalGjcWorkflowSkill(activeSkill.trim())) this.#attachAskTool();
+	}
+
+	#attachAskTool(): void {
+		const askTool = this.#toolRegistry.get("ask");
+		if (!askTool || this.getActiveToolNames().includes(askTool.name)) return;
 		this.#setGuardedAgentTools([...this.agent.state.tools, askTool]);
 		this.#invalidateDiscoveryCaches();
 		void this.refreshBaseSystemPrompt().catch(error => {
@@ -6996,6 +7066,11 @@ export class AgentSession {
 		const name = (details as { name?: unknown }).name;
 		if (typeof name !== "string" || !name.trim()) return;
 		const skill = name.trim();
+		// Functional tool availability must not depend on the best-effort
+		// observational state-sync below (whose failures are swallowed by
+		// #syncSkillPromptActiveStateSafely): attach ask first so canonical
+		// workflow skills can always call it.
+		if (active && isCanonicalGjcWorkflowSkill(skill)) this.#attachAskTool();
 		const sessionId = this.sessionManager.getSessionId();
 		// Canonical GJC workflow skills (deep-interview, ralplan, ultragoal, team)
 		// own their `.gjc/state/skill-active-state.json` row through the
@@ -8568,7 +8643,9 @@ export class AgentSession {
 		);
 		const nextDiscoverySessionToolNames = this.#mcpDiscoveryEnabled
 			? [
-					...this.#getActiveNonMCPToolNames().filter(name => !selectionOnlyDiscoveredBuiltinToolNames.has(name)),
+					...this.#getActiveNonMCPToolNames().filter(
+						name => name !== "ask" && !selectionOnlyDiscoveredBuiltinToolNames.has(name),
+					),
 					...this.#getConfiguredDefaultSelectedMCPToolNames(),
 				]
 			: undefined;
@@ -10719,6 +10796,8 @@ export class AgentSession {
 			});
 			return;
 		}
+
+		this.#attachAskTool();
 
 		const reminder = prompt.render(planModeToolDecisionReminderPrompt, {
 			askToolName: "ask",
