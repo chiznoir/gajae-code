@@ -37,6 +37,11 @@ describe("compileSecretRegex", () => {
 		expect(() => compileSecretRegex("x", "zz")).toThrow();
 	});
 
+	it("rejects sticky regex flags that would defeat global scanning", () => {
+		expect(() => compileSecretRegex("token-[a-z]+", "y")).toThrow('sticky "y" flag');
+		expect(() => compileSecretRegex("/token-[a-z]+/y")).toThrow('sticky "y" flag');
+	});
+
 	it("preserves safe quantified alternation and regex literal flags", () => {
 		const regex = compileSecretRegex("/(?:api|token)-[a-z]+/i", "m");
 		expect(regex.source).toBe("(?:api|token)-[a-z]+");
@@ -59,6 +64,14 @@ describe("SecretObfuscator regex behavior", () => {
 		const obfuscated = obfuscator.obfuscate(text);
 		expect(obfuscated).not.toEqual(text);
 		expect(obfuscator.deobfuscate(obfuscated)).toEqual(text);
+	});
+
+	it("scans globally after a nonmatching prefix", () => {
+		const obfuscator = new SecretObfuscator([{ type: "regex", content: "token-[a-z]+", flags: "i" }]);
+		const original = "prefix token-alpha suffix";
+		const obfuscated = obfuscator.obfuscate(original);
+		expect(obfuscated).not.toContain("token-alpha");
+		expect(obfuscator.deobfuscate(obfuscated)).toBe(original);
 	});
 
 	it("preserves zero-length regex handling", () => {

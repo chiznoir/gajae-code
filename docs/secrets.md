@@ -86,7 +86,7 @@ Regex entries are supported only by agent configuration outside the current work
   content: "/bearer\\s+[a-zA-Z0-9._~+\\/=-]+/i"
 ```
 
-Regex entries always scan globally (the `g` flag is enforced automatically). The regex literal syntax `/pattern/flags` is supported as an alternative to separate `content` + `flags` fields. Escaped slashes within the pattern (`\\/`) are handled correctly.
+Regex entries always scan globally (the `g` flag is enforced automatically). The regex literal syntax `/pattern/flags` is supported as an alternative to separate `content` + `flags` fields. Escaped slashes within the pattern (`\\/`) are handled correctly. The sticky `y` flag is rejected because it would prevent global scanning.
 
 #### Replace mode with regex
 
