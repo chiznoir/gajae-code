@@ -1354,8 +1354,16 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				: (thinkingLevel ?? resolvedThinkingLevel);
 			effectiveThinkingLevelForWarning = effectiveThinkingLevel;
 
+			// Resumed task session files live inside the parent session's managed
+			// artifact directory, not in the top-level managed-session candidate list.
+			// The resume descriptor is registered by this process with the exact child
+			// path, so authorize that known directory explicitly instead of routing it
+			// through the interactive resume-picker candidate gate.
+			const isResumeRun = options.runMode === "resume" || options.runMode === "message";
 			const sessionManager = sessionFile
-				? await awaitAbortable(SessionManager.open(sessionFile))
+				? await awaitAbortable(
+						SessionManager.open(sessionFile, isResumeRun ? path.dirname(sessionFile) : undefined),
+					)
 				: SessionManager.inMemory(worktree ?? cwd);
 			if (options.parentArtifactManager) {
 				sessionManager.adoptArtifactManager(options.parentArtifactManager);
