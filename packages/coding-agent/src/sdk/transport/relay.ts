@@ -23,6 +23,17 @@ export class RelayOpenAbortedError extends Error {
 	}
 }
 
+export type RelayWebSocketEvent = { data?: unknown };
+
+export type RelayWebSocket = {
+	readonly bufferedAmount: number;
+	readonly readyState: number;
+	close(): void;
+	send(data: string): void;
+	addEventListener(type: string, listener: (event: RelayWebSocketEvent) => void, options?: { once?: boolean }): void;
+	removeEventListener(type: string, listener: (event: RelayWebSocketEvent) => void): void;
+};
+
 export type RelayOptions = {
 	url: string;
 	token: string;
@@ -31,7 +42,7 @@ export type RelayOptions = {
 	downstreamSink: Writable;
 	initialDownstreamBytes?: Buffer;
 	onTransportError: (error: TransportError) => void;
-	webSocketFactory?: (url: string) => WebSocket;
+	webSocketFactory?: (url: string) => RelayWebSocket;
 	signal?: AbortSignal;
 };
 
@@ -58,10 +69,13 @@ function waitForDrain(stream: Writable): Promise<void> {
 	});
 }
 
-function waitForWebSocketDrain(ws: WebSocket, isClosed: () => boolean): Promise<void> {
+const WEBSOCKET_CONNECTING = 0;
+const WEBSOCKET_OPEN = 1;
+
+function waitForWebSocketDrain(ws: RelayWebSocket, isClosed: () => boolean): Promise<void> {
 	return new Promise(resolve => {
 		const poll = (): void => {
-			if (isClosed() || ws.readyState !== WebSocket.OPEN || ws.bufferedAmount === 0) {
+			if (isClosed() || ws.readyState !== WEBSOCKET_OPEN || ws.bufferedAmount === 0) {
 				resolve();
 				return;
 			}
@@ -74,7 +88,7 @@ function waitForWebSocketDrain(ws: WebSocket, isClosed: () => boolean): Promise<
 /** Starts a dedicated raw-WebSocket relay for exactly one downstream stream. */
 export async function startRelayPair(options: RelayOptions): Promise<RelayPair> {
 	if (options.signal?.aborted) throw new RelayOpenAbortedError();
-	const ws =
+	const ws: RelayWebSocket =
 		options.webSocketFactory?.(upstreamUrl(options.url, options.token)) ??
 		new WebSocket(upstreamUrl(options.url, options.token));
 	const opened = Promise.withResolvers<void>();
@@ -110,7 +124,7 @@ export async function startRelayPair(options: RelayOptions): Promise<RelayPair> 
 		closed = true;
 		detach();
 		options.downstream.pause();
-		if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) ws.close();
+		if (ws.readyState === WEBSOCKET_OPEN || ws.readyState === WEBSOCKET_CONNECTING) ws.close();
 		settle(error);
 		return await finished.promise.catch(() => undefined);
 	};
@@ -142,7 +156,7 @@ export async function startRelayPair(options: RelayOptions): Promise<RelayPair> 
 		writingWs = true;
 		if (frame.accounted) pendingToWs -= frame.bytes.length;
 		try {
-			if (ws.readyState !== WebSocket.OPEN) throw new Error("upstream_closed");
+			if (ws.readyState !== WEBSOCKET_OPEN) throw new Error("upstream_closed");
 			ws.send(frame.bytes.toString("utf8"));
 			await waitForWebSocketDrain(ws, () => closed);
 		} catch (error) {
@@ -189,7 +203,7 @@ export async function startRelayPair(options: RelayOptions): Promise<RelayPair> 
 	const onData = (chunk: Buffer | string): void => consumeLines(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
 	const onEnd = (): void => void close();
 	const onDownstreamError = (error: Error): void => void close(error);
-	const onMessage = (event: MessageEvent): void => {
+	const onMessage = (event: RelayWebSocketEvent): void => {
 		if (typeof event.data !== "string") {
 			fail({ type: "transport_error", code: "protocol_error", direction: "ws->downstream" });
 			return;

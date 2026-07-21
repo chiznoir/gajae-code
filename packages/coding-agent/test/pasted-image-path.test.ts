@@ -100,6 +100,14 @@ describe("parsePastedImagePaths", () => {
 		expect(parsePastedImagePaths("/tmp/saved.png")).toBeUndefined();
 	});
 
+	it("rejects prose around clipboard paths as an incomplete payload", () => {
+		const clipboard = path.join(os.tmpdir(), "clipboard-2026-07-19-123456-Ab3.png");
+		const paths = Array.from({ length: MAX_PASTED_IMAGE_COUNT }, (_, index) => `/tmp/${index}.png`);
+
+		expect(parsePastedImagePaths(`look at ${clipboard}`)).toBeUndefined();
+		expect(parsePastedImagePaths(`${paths.join(" ")} look at ${clipboard}`)).toBeUndefined();
+	});
+
 	it("stops at the count bound before accepting candidate 17", () => {
 		const paste = Array.from({ length: MAX_PASTED_IMAGE_COUNT + 1 }, (_, index) => `/tmp/${index}.png`).join(" ");
 		expect(parsePastedImagePaths(paste)).toEqual({

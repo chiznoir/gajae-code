@@ -5,10 +5,11 @@ import * as os from "node:os";
 import path from "node:path";
 import { PassThrough, Writable } from "node:stream";
 import { CliParseError, renderCommandHelp } from "@gajae-code/utils/cli";
+import type { ServerWebSocket } from "bun";
 import Sdk, { parseSdkInternalArgv } from "../src/commands/sdk.js";
 import { listSdkSessionEndpoints } from "../src/sdk/client/discovery.js";
 import { classifyEndpoint, selectLiveEndpoint } from "../src/sdk/client/liveness.js";
-import { startRelayPair } from "../src/sdk/transport/relay.js";
+import { type RelayWebSocket, startRelayPair, type TransportError } from "../src/sdk/transport/relay.js";
 import { resolveServePendingCeiling, runSdkServe } from "../src/sdk/transport/serve-cli.js";
 import { startSocketServe } from "../src/sdk/transport/socket.js";
 
@@ -56,10 +57,11 @@ const closeSocket = (socket: net.Socket): Promise<void> =>
 
 function upstream() {
 	const connections: { ws: ServerWebSocket<unknown>; messages: string[] }[] = [];
-	const server = Bun.serve({
+	const server = Bun.serve<unknown>({
 		port: 0,
 		fetch(req, server) {
-			return server.upgrade(req, { data: {} }) ? undefined : new Response("upgrade required", { status: 426 });
+			if (server.upgrade(req, { data: {} })) return;
+			return new Response("upgrade required", { status: 426 });
 		},
 		websocket: {
 			open(ws) {
@@ -83,34 +85,63 @@ const tempDir = async (): Promise<string> => {
 	return dir;
 };
 
-class StalledWebSocket extends EventTarget {
-	static CONNECTING = 0;
-	static OPEN = 1;
-	static CLOSED = 3;
+class StalledWebSocket implements RelayWebSocket {
+	static readonly CLOSED = 3;
 	static latest: StalledWebSocket | undefined;
-	readyState = StalledWebSocket.CONNECTING;
-	bufferedAmount = 0;
+	readonly url: string;
+	readyState = 0;
+	#bufferedAmount = 0;
+	#listeners = new Map<string, Set<(event: { data?: unknown }) => void>>();
 	closeCalls = 0;
 	readonly messages: string[] = [];
-	constructor(_url: string) {
-		super();
+
+	constructor(url: string) {
+		this.url = url;
 		StalledWebSocket.latest = this;
 	}
+
+	get bufferedAmount(): number {
+		return this.#bufferedAmount;
+	}
+
 	open(): void {
-		this.readyState = StalledWebSocket.OPEN;
-		this.dispatchEvent(new Event("open"));
+		this.readyState = 1;
+		this.#emit("open");
 	}
-	send(message: string): void {
-		this.messages.push(message);
-		this.bufferedAmount += Buffer.byteLength(message);
+
+	send(data: string): void {
+		this.messages.push(data);
+		this.#bufferedAmount += Buffer.byteLength(data);
 	}
+
 	drain(): void {
-		this.bufferedAmount = 0;
+		this.#bufferedAmount = 0;
 	}
+
 	close(): void {
 		this.closeCalls++;
-		this.readyState = StalledWebSocket.CLOSED;
-		this.dispatchEvent(new Event("close"));
+		this.readyState = 3;
+		this.#emit("close");
+	}
+
+	addEventListener(type: string, listener: (event: { data?: unknown }) => void, options?: { once?: boolean }): void {
+		const listeners = this.#listeners.get(type) ?? new Set();
+		const registered = options?.once
+			? (event: { data?: unknown }) => {
+					this.removeEventListener(type, registered);
+					listener(event);
+				}
+			: listener;
+		listeners.add(registered);
+		this.#listeners.set(type, listeners);
+	}
+
+	removeEventListener(type: string, listener: (event: { data?: unknown }) => void): void {
+		this.#listeners.get(type)?.delete(listener);
+	}
+
+	#emit(type: string, event: { data?: unknown } = {}): void {
+		for (const listener of this.#listeners.get(type) ?? []) listener(event);
 	}
 }
 
@@ -129,7 +160,7 @@ async function relayFixture(pendingCeilingBytes = 256 * 1024) {
 	const output = new PassThrough();
 	const received: Buffer[] = [];
 	output.on("data", chunk => received.push(Buffer.from(chunk)));
-	const errors: unknown[] = [];
+	const errors: TransportError[] = [];
 	const pair = await startRelayPair({
 		url: fake.url,
 		token,
@@ -177,9 +208,7 @@ describe("SDK serve raw relay", () => {
 		const rejected = await relayFixture();
 		try {
 			rejected.input.write(`${"x".repeat(256 * 1024 + 1)}\n`);
-			expect(
-				await waitFor(() => rejected.errors[0] as { code: string } | undefined, "oversize error"),
-			).toMatchObject({ code: "frame_oversize" });
+			expect(await waitFor(() => rejected.errors[0], "oversize error")).toMatchObject({ code: "frame_oversize" });
 		} finally {
 			await rejected.pair.close();
 			rejected.fake.stop();
@@ -192,7 +221,7 @@ describe("SDK serve raw relay", () => {
 		try {
 			// Replace the consumer with a deliberately backpressured relay to exercise active-frame exemption.
 			const input = new PassThrough();
-			const errors: unknown[] = [];
+			const errors: TransportError[] = [];
 			const pair = await startRelayPair({
 				url: fixture.fake.url,
 				token,
@@ -207,7 +236,7 @@ describe("SDK serve raw relay", () => {
 			expect(errors).toEqual([]);
 			connection.ws.send("b".repeat(256 * 1024));
 			connection.ws.send("c".repeat(256 * 1024));
-			expect(await waitFor(() => errors[0] as { code: string } | undefined, "pending overflow")).toMatchObject({
+			expect(await waitFor(() => errors[0], "pending overflow")).toMatchObject({
 				code: "pending_overflow",
 				direction: "ws->downstream",
 			});
@@ -222,7 +251,7 @@ describe("SDK serve raw relay", () => {
 		await withStalledWebSocket(async () => {
 			const input = new PassThrough();
 			const output = new PassThrough();
-			const errors: unknown[] = [];
+			const errors: TransportError[] = [];
 			const started = startRelayPair({
 				url: "ws://fake",
 				token,
@@ -230,7 +259,7 @@ describe("SDK serve raw relay", () => {
 				downstream: input,
 				downstreamSink: output,
 				onTransportError: error => errors.push(error),
-				webSocketFactory: () => new StalledWebSocket("") as unknown as WebSocket,
+				webSocketFactory: () => new StalledWebSocket(""),
 			});
 			const ws = await waitFor(() => StalledWebSocket.latest, "fake websocket");
 			ws.open();
@@ -239,9 +268,10 @@ describe("SDK serve raw relay", () => {
 				input.write('{"active":true}\n');
 				await waitFor(() => ws.messages[0], "active websocket frame");
 				input.write(`${"q".repeat(256 * 1024)}\n{"overflow":true}\n`);
-				expect(
-					await waitFor(() => errors[0] as { code: string } | undefined, "downstream pending overflow"),
-				).toMatchObject({ code: "pending_overflow", direction: "downstream->ws" });
+				expect(await waitFor(() => errors[0], "downstream pending overflow")).toMatchObject({
+					code: "pending_overflow",
+					direction: "downstream->ws",
+				});
 			} finally {
 				ws.drain();
 				await pair.close();
@@ -260,7 +290,7 @@ describe("SDK serve raw relay", () => {
 				downstream: input,
 				downstreamSink: output,
 				onTransportError: () => {},
-				webSocketFactory: () => new StalledWebSocket("") as unknown as WebSocket,
+				webSocketFactory: () => new StalledWebSocket(""),
 			});
 			const ws = await waitFor(() => StalledWebSocket.latest, "fake websocket");
 			ws.open();
@@ -315,7 +345,7 @@ describe("SDK socket serve", () => {
 				token,
 				pendingCeilingBytes: 256 * 1024,
 				socketPath,
-				webSocketFactory: () => new StalledWebSocket("") as unknown as WebSocket,
+				webSocketFactory: () => new StalledWebSocket(""),
 			});
 			const client = await socketConnect(socketPath);
 			try {
@@ -340,7 +370,7 @@ describe("SDK socket serve", () => {
 				token,
 				pendingCeilingBytes: 256 * 1024,
 				socketPath,
-				webSocketFactory: () => new StalledWebSocket("") as unknown as WebSocket,
+				webSocketFactory: () => new StalledWebSocket(""),
 			});
 			const client = await socketConnect(socketPath);
 			client.write(`gjc-sdk-transport/1 token=${token}\n`);

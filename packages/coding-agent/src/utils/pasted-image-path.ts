@@ -143,6 +143,7 @@ function tokenizePastedPathCandidates(
 	text: string,
 	options: DecodePastedPathOptions,
 	maxCandidates: number,
+	requireCompletePayload = false,
 ): TokenizePastedPathsResult {
 	if (text.length > MAX_PASTED_IMAGE_PASTE_CHARACTERS) return { kind: "invalid" };
 	const platform = options.platform ?? process.platform;
@@ -154,7 +155,9 @@ function tokenizePastedPathCandidates(
 
 	const startCandidate = (): TokenizePastedPathsResult | undefined => {
 		if (candidateStarted) return undefined;
-		if (candidates.length >= maxCandidates) return { kind: "too-many", maxCandidates, candidates: [...candidates] };
+		if (!requireCompletePayload && candidates.length >= maxCandidates) {
+			return { kind: "too-many", maxCandidates, candidates: [...candidates] };
+		}
 		candidateStarted = true;
 		return undefined;
 	};
@@ -167,7 +170,9 @@ function tokenizePastedPathCandidates(
 	const finishCandidate = (): TokenizePastedPathsResult | undefined => {
 		if (!candidateStarted) return undefined;
 		if (!candidate) return { kind: "invalid" };
-		if (candidates.length >= maxCandidates) return { kind: "too-many", maxCandidates, candidates: [...candidates] };
+		if (!requireCompletePayload && candidates.length >= maxCandidates) {
+			return { kind: "too-many", maxCandidates, candidates: [...candidates] };
+		}
 		const decoded = decodeListToken(candidate, options, platform);
 		if (decoded === undefined) return { kind: "invalid" };
 		candidates.push(decoded);
@@ -225,6 +230,7 @@ function tokenizePastedPathCandidates(
 	if (state !== "normal") return { kind: "invalid" };
 	const finalResult = finishCandidate();
 	if (finalResult) return finalResult;
+	if (candidates.length > maxCandidates) return { kind: "too-many", maxCandidates, candidates };
 	return candidates.length === 0 ? { kind: "invalid" } : { kind: "candidates", candidates };
 }
 
@@ -278,10 +284,9 @@ export function parsePastedImagePaths(
 	options: ResolvePastedImagePathOptions = {},
 ): PastedImagePathParseResult | undefined {
 	const platform = options.platform ?? process.platform;
-	const tokenized = tokenizePastedPathCandidates(text, options, MAX_PASTED_IMAGE_COUNT);
+	const tokenized = tokenizePastedPathCandidates(text, options, MAX_PASTED_IMAGE_COUNT, true);
 	if (tokenized.kind === "too-many") {
 		if (
-			tokenized.candidates.length !== MAX_PASTED_IMAGE_COUNT ||
 			tokenized.candidates.some(
 				candidate =>
 					!IMAGE_FILE_EXTENSION_PATTERN.test(candidate) ||
