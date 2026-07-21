@@ -20,6 +20,7 @@ import {
 import { daemonPaths, HEARTBEAT_TTL_MS } from "./daemon-paths";
 import {
 	acquireDaemonTransitionLock,
+	classifyNotificationEndpoint,
 	type DaemonTransitionLock,
 	daemonTransitionLockIsHeld,
 	exactUnlinkNotificationFile,
@@ -1246,6 +1247,16 @@ export async function acquireDaemonOwnership(input: {
 		return { acquired: false, attached: false, provisional: true };
 	};
 	const existing = await readJson<DaemonState>(fsImpl, paths.state);
+	if (
+		existing &&
+		validDaemonPid(existing.pid) &&
+		!ownerIdentityMatches(existing, input.tokenFingerprint, input.chatId) &&
+		(!hasSafeDaemonStateShape(existing) ||
+			!isProcessIncarnation(existing.incarnation) ||
+			!isProcessIncarnation(pidIncarnation(existing.pid))) &&
+		pidAlive(existing.pid)
+	)
+		return { acquired: false, attached: false, blocked: true };
 	const foreignOwner = classifyForeignLiveOwner({
 		state: existing,
 		tokenFingerprint: input.tokenFingerprint,
@@ -1865,8 +1876,8 @@ function defaultPidAlive(pid: number): boolean {
 	try {
 		process.kill(pid, 0);
 		return true;
-	} catch {
-		return false;
+	} catch (error) {
+		return (error as NodeJS.ErrnoException).code !== "ESRCH";
 	}
 }
 
@@ -2051,35 +2062,49 @@ export async function spawnTelegramDaemonOwner(
 }
 
 /**
- * Owner-bound reclamation of a confirmed-dead daemon owner's lock, mirroring the
- * daemon step of `gjc notify recovery`. Removes only the lock of a recorded owner
- * that is still the same, still-dead process — never a live or superseded owner,
- * because it re-checks ownership and liveness while holding the same steal-mutex
- * the daemon's own takeover path uses. Lets a fresh SDK session self-heal a stale
- * owner (e.g. after a crash, or a `stop --force` that left the record behind)
- * instead of requiring manual reconciliation. Returns true when a stale lock was
- * cleared and a spawn retry is worthwhile.
+ * Owner-bound reclamation of a confirmed-dead daemon owner, mirroring the
+ * daemon step of `gjc notify recovery`. It returns a structured, actionable
+ * result and removes only identity-verified dead-owner artifacts while holding
+ * the transition fence; live, successor, unknown, or unreadable evidence is
+ * retained.
  */
-async function reclaimDeadDaemonOwner(input: {
+export type DeadOwnerRecoveryResult =
+	| { recovered: true; reason: "cleared" }
+	| {
+			recovered: false;
+			reason:
+				| "not-confirmed-dead"
+				| "unsafe-lock"
+				| "transition-contended"
+				| "owner-superseded"
+				| "unsafe-endpoint"
+				| "endpoint-changed"
+				| "endpoint-directory-unreadable"
+				| "lock-changed";
+	  };
+
+/** Preflight cleanup for a confirmed-dead owner, with identity-bound removal. */
+export async function reclaimDeadDaemonOwner(input: {
 	settings: Settings;
+	endpointDir?: string;
 	fs?: TelegramDaemonFs;
 	now?: () => number;
 	pidAlive?: (pid: number) => boolean;
 	pidIncarnation?: (pid: number) => string | undefined;
-}): Promise<boolean> {
+}): Promise<DeadOwnerRecoveryResult> {
 	const fsImpl = input.fs ?? nodeFs;
 	const now = input.now ?? Date.now;
 	const pidAlive = input.pidAlive ?? defaultPidAlive;
 	const pidIncarnation = input.pidIncarnation ?? defaultPidIncarnation;
 	const paths = daemonPaths(input.settings.getAgentDir());
 	const state = await readDaemonState(input.settings, fsImpl);
-	if (!state || pidAlive(state.pid)) return false;
+	if (!state || !hasSafeDaemonStateShape(state) || pidAlive(state.pid))
+		return { recovered: false, reason: "not-confirmed-dead" };
 	const lock = await readOwnershipLock(fsImpl, paths.lock);
-	if (lock.kind === "missing") return false;
 	if (
 		!(await ownershipLockIsReclaimable({ fs: fsImpl, path: paths.lock, lock, now: now(), pidAlive, pidIncarnation }))
 	)
-		return false;
+		return { recovered: false, reason: "unsafe-lock" };
 	const transition = await acquireDaemonTransitionLock({
 		fs: fsImpl,
 		path: paths.steal,
@@ -2087,18 +2112,79 @@ async function reclaimDeadDaemonOwner(input: {
 		pidAlive: defaultPidAlive,
 		pidIncarnation: defaultPidIncarnation,
 	});
-	if (!transition) return false;
+	const readEndpointFile = fsImpl.readEndpointFile;
+	if (!transition || !readEndpointFile || !fsImpl.exactUnlink)
+		return { recovered: false, reason: "transition-contended" };
 	try {
 		const current = await readDaemonState(input.settings, fsImpl);
-		if (!current || current.ownerId !== state.ownerId || current.pid !== state.pid) return false;
-		if (pidAlive(current.pid)) return false;
-		if (!(await daemonTransitionLockIsHeld({ fs: fsImpl, path: paths.steal, lock: transition }))) return false;
-		try {
-			await fsImpl.unlink(paths.lock);
-			return true;
-		} catch {
-			return false;
+		if (
+			!current ||
+			!hasSafeDaemonStateShape(current) ||
+			current.ownerId !== state.ownerId ||
+			current.acquisitionId !== state.acquisitionId ||
+			current.pid !== state.pid ||
+			current.incarnation !== state.incarnation ||
+			current.generation !== state.generation ||
+			current.ownershipPhase !== state.ownershipPhase ||
+			current.tokenFingerprint !== state.tokenFingerprint ||
+			current.chatId !== state.chatId ||
+			pidAlive(current.pid)
+		)
+			return { recovered: false, reason: "owner-superseded" };
+		const currentLock = await readOwnershipLock(fsImpl, paths.lock);
+		if (
+			!ownershipLockMatches(lock, currentLock) ||
+			!(await ownershipLockIsReclaimable({
+				fs: fsImpl,
+				path: paths.lock,
+				lock: currentLock,
+				now: now(),
+				pidAlive,
+				pidIncarnation,
+			})) ||
+			!(await transitionLockIsHeldByCaller({ fs: fsImpl, path: paths.steal, lock: transition }))
+		)
+			return { recovered: false, reason: "unsafe-lock" };
+		const endpoints: Array<{ file: string; identity: NotificationEndpointFileIdentity }> = [];
+		if (input.endpointDir) {
+			let names: string[];
+			try {
+				names = await fsImpl.readdir(input.endpointDir);
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code === "ENOENT") names = [];
+				else return { recovered: false, reason: "endpoint-directory-unreadable" };
+			}
+			for (const name of names) {
+				if (!name.endsWith(".json")) continue;
+				const file = path.join(input.endpointDir, name);
+				const endpoint = await classifyNotificationEndpoint(
+					{ readEndpointFile: fsImpl.readEndpointFile! },
+					file,
+					pidAlive,
+				);
+				if (endpoint.kind === "non-endpoint") continue;
+				if (endpoint.kind !== "endpoint" || endpoint.liveness !== "dead")
+					return { recovered: false, reason: "unsafe-endpoint" };
+				endpoints.push({ file, identity: endpoint.identity });
+			}
 		}
+		if (!(await transitionLockIsHeldByCaller({ fs: fsImpl, path: paths.steal, lock: transition })))
+			return { recovered: false, reason: "transition-contended" };
+		for (const endpoint of endpoints)
+			if (!(await fsImpl.exactUnlink(endpoint.file, endpoint.identity)).ok)
+				return { recovered: false, reason: "endpoint-changed" };
+		if (currentLock.kind === "missing") return { recovered: true, reason: "cleared" };
+		const exactLock = await fsImpl.readEndpointFile!(paths.lock).catch(() => undefined);
+		const exactCurrentLock = await readOwnershipLock(fsImpl, paths.lock);
+		if (
+			!exactLock ||
+			!ownershipLockMatches(currentLock, exactCurrentLock) ||
+			!(await transitionLockIsHeldByCaller({ fs: fsImpl, path: paths.steal, lock: transition }))
+		)
+			return { recovered: false, reason: "lock-changed" };
+		return (await fsImpl.exactUnlink(paths.lock, exactLock.identity)).ok
+			? { recovered: true, reason: "cleared" }
+			: { recovered: false, reason: "lock-changed" };
 	} finally {
 		await releaseDaemonTransitionLock({ fs: fsImpl, path: paths.steal, lock: transition });
 	}
@@ -2116,6 +2202,24 @@ export async function ensureTelegramDaemonRunningDetailed(
 	if (!isTelegramConfigured(cfg)) return "disabled";
 	const root = notificationRootForCwd(input.cwd);
 	const fp = tokenFingerprint(cfg.botToken);
+	// Windows can retain dead launcher metadata without an ownership lock; reclaim
+	// its dead discovery records before the replacement can publish a new owner.
+	if ((deps.platform ?? process.platform) === "win32" && !deps.fs) {
+		const preflight = await reclaimDeadDaemonOwner({
+			settings: input.settings,
+			endpointDir: path.join(root, "sdk"),
+			fs: deps.fs,
+			now: deps.now,
+			pidAlive: deps.pidAlive,
+			pidIncarnation: deps.pidIncarnation,
+		});
+		if (!preflight.recovered && preflight.reason !== "not-confirmed-dead") {
+			logger.warn(
+				`notifications: startup recovery unsafe (${preflight.reason}); run \`gjc notify recovery\` for diagnostics`,
+			);
+			return "blocked_identity";
+		}
+	}
 	let spawned = await withTelegramSetupLease(
 		cfg.botToken,
 		async () =>
@@ -2157,31 +2261,31 @@ export async function ensureTelegramDaemonRunningDetailed(
 			);
 		}
 	}
-	if (
-		spawned.result === "blocked" &&
-		!spawned.warnings[0]?.includes("provisional") &&
-		(await reclaimDeadDaemonOwner({
+	let recoveryReason: Extract<DeadOwnerRecoveryResult, { recovered: false }>["reason"] | undefined;
+	if (spawned.result === "blocked" && !spawned.warnings[0]?.includes("provisional")) {
+		const recovery = await reclaimDeadDaemonOwner({
 			settings: input.settings,
+			endpointDir: path.join(root, "sdk"),
 			fs: deps.fs,
 			now: deps.now,
 			pidAlive: deps.pidAlive,
 			pidIncarnation: deps.pidIncarnation,
-		}))
-	) {
-		// A crashed owner (or a `stop --force` that found no live process) can leave a
-		// stale lock behind that blocks re-acquisition. Automate the recovery step so a
-		// fresh session self-heals instead of requiring a manual `gjc notify recovery`.
-		spawned = await withTelegramSetupLease(
-			cfg.botToken,
-			async () =>
-				await spawnTelegramDaemonOwner(
-					{ settings: input.settings, roots: [root], tokenFingerprint: fp, chatId: cfg.chatId },
-					deps,
-				),
-		);
+		});
+		if (recovery.recovered) {
+			spawned = await withTelegramSetupLease(
+				cfg.botToken,
+				async () =>
+					await spawnTelegramDaemonOwner(
+						{ settings: input.settings, roots: [root], tokenFingerprint: fp, chatId: cfg.chatId },
+						deps,
+					),
+			);
+		} else recoveryReason = recovery.reason;
 	}
 	if (spawned.result === "blocked") {
-		logger.warn(`notifications: failed to ensure Telegram daemon: ${spawned.warnings.join("; ")}`);
+		logger.warn(
+			`notifications: failed to ensure Telegram daemon: ${recoveryReason ? `stale recovery ${recoveryReason}; run \`gjc notify recovery\`` : spawned.warnings.join("; ")}`,
+		);
 		return "blocked_identity";
 	}
 	if (spawned.result === "attached" && spawned.reloadRequired) {

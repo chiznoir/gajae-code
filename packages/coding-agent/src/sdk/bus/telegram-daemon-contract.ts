@@ -23,7 +23,8 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * older-generation owner during automatic generation-upgrade reload in
  * generation 12, restored macOS daemon signaling (kill(2) with a start-time
  * incarnation recheck, replacing the darwin no-op) in generation 13, retained
- * legacy stopped-lock reclamation in generation 14, and Windows expected-identity
- * ACL verification and repair in generation 15.
+ * legacy stopped-lock reclamation in generation 14, Windows expected-identity
+ * ACL verification and repair in generation 15, and identity-fenced stale
+ * endpoint startup recovery in generation 16.
  */
-export const DAEMON_GENERATION = 15;
+export const DAEMON_GENERATION = 16;

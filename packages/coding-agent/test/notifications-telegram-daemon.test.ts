@@ -15,6 +15,7 @@ import {
 } from "../src/sdk/bus/html-format";
 import {
 	acquireDaemonTransitionLock,
+	classifyNotificationEndpoint,
 	type NotificationEndpointFileIdentity,
 	releaseDaemonTransitionLock,
 } from "../src/sdk/bus/notification-service";
@@ -64,6 +65,34 @@ test("endpoint authority digest canonicalizes endpoint presentation and binds au
 	expect(endpointAuthorityDigest("ws://localhost/sdk", "token", "native-connection-a")).toBe(
 		endpointAuthorityDigest("ws://localhost/sdk", "token", "native-connection-a"),
 	);
+});
+
+test("endpoint classification excludes lifecycle records and fails closed for PID-less and unreadable records", async () => {
+	const agentDir = tempAgentDir();
+	const identity: NotificationEndpointFileIdentity = { dev: 1n, ino: 1n, size: 1n, mtimeNs: 1n, sha256: "test" };
+	const classify = async (name: string, value: string) =>
+		await classifyNotificationEndpoint(
+			{ readEndpointFile: async () => ({ bytes: Buffer.from(value), identity }) },
+			path.join(agentDir, name),
+			pid => pid === 7,
+		);
+	const dead = await classify("dead.json", JSON.stringify({ url: "ws://dead", token: "x", pid: 8 }));
+	const pidless = await classify("pidless.json", JSON.stringify({ url: "ws://unknown", token: "x" }));
+	expect(dead.kind === "endpoint" && dead.liveness).toBe("dead");
+	expect(pidless.kind === "endpoint" && pidless.liveness).toBe("unknown");
+	expect((await classify("broker.json", JSON.stringify({ url: "ws://broker", token: "x", pid: 8 }))).kind).toBe(
+		"non-endpoint",
+	);
+	expect(
+		(await classify("owner.lifecycle.json", JSON.stringify({ pid: 8, incarnation: "linux:8", effectMarker: "x" })))
+			.kind,
+	).toBe("non-endpoint");
+	const unreadable = await classifyNotificationEndpoint(
+		{ readEndpointFile: async () => Promise.reject(new Error("mid-write")) },
+		path.join(agentDir, "broken.json"),
+		() => false,
+	);
+	expect(unreadable.kind).toBe("unreadable");
 });
 
 function tempAgentDir(): string {
@@ -1293,6 +1322,7 @@ describe("telegram daemon", () => {
 			{ settings: s, roots: [root], tokenFingerprint: fp, chatId: "42" },
 			{
 				pid: 4242,
+				platform: "win32",
 				pidAlive,
 				pidIncarnation,
 				randomId: () => acquisitionId,
@@ -1324,15 +1354,17 @@ describe("telegram daemon", () => {
 					boundAtStateRead = stateReads;
 					published = true;
 					childProvenanceAvailable = true;
-					expect(
-						await renewDaemonHeartbeat({
-							settings: s,
-							ownerId: boundOwnerId,
-							acquisitionId: boundAcquisitionId,
-							pid: 4243,
-							pidIncarnation,
-						}),
-					).toBe(true);
+					const renewed = await renewDaemonHeartbeat({
+						settings: s,
+						ownerId: boundOwnerId,
+						acquisitionId: boundAcquisitionId,
+						pid: 4243,
+						pidIncarnation,
+					});
+					if (!renewed)
+						throw new Error(
+							`child binding rejected: state=${await fs.promises.readFile(paths.state, "utf8")} lock=${await fs.promises.readFile(paths.lock, "utf8")}`,
+						);
 				}
 				return await fs.promises.readFile(file, encoding);
 			},
@@ -1348,6 +1380,7 @@ describe("telegram daemon", () => {
 				{ settings: s, cwd: root, sessionId: "concurrent-rebound" },
 				{
 					pid: 4244,
+					platform: "win32",
 					pidAlive,
 					pidIncarnation,
 					fs: bindingFs,
@@ -2054,9 +2087,9 @@ describe("telegram daemon", () => {
 			}),
 		);
 	}
-	test("keeps the wire protocol at 3 while retained legacy stopped-lock reclamation uses generation 14", () => {
+	test("keeps wire protocol 3 while Windows ACL and stale startup recovery use generation 16", () => {
 		expect(NOTIFICATION_PROTOCOL_VERSION).toBe(3);
-		expect(DAEMON_GENERATION).toBe(14);
+		expect(DAEMON_GENERATION).toBe(16);
 	});
 
 	test("#2028 acquire flags a reload for a live pre-upgrade owner missing the generation field", async () => {
@@ -3032,6 +3065,10 @@ describe("telegram daemon", () => {
 			tokenFingerprint: "stale-token",
 			generation: DAEMON_GENERATION,
 		});
+		const endpoint = path.join(agentDir, ".gjc", "state", "sdk", "reconciled.json");
+		fs.mkdirSync(path.dirname(endpoint), { recursive: true });
+		fs.writeFileSync(endpoint, JSON.stringify({ url: "ws://dead", token: "dead", pid: 111 }));
+
 		let now = 1_000;
 		let staleProbes = 0;
 		const child = readyTelegramSpawnFixture({ settings: s, firstChildPid: 4243, now: () => now });
@@ -3059,6 +3096,152 @@ describe("telegram daemon", () => {
 			ownershipPhase: "ready",
 		});
 		expect(JSON.parse(fs.readFileSync(paths.lock, "utf8"))).toMatchObject({ pid: 4243 });
+		expect(fs.existsSync(endpoint)).toBe(false);
+	});
+	test("Windows production preflight clears a lockless dead owner and dead endpoints before one ready replacement", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const paths = daemonPaths(agentDir);
+		writeLiveOwner(agentDir, {
+			pid: 111,
+			ownerId: "crashed",
+			acquisitionId: "crashed",
+			tokenFingerprint: "stale-token",
+			generation: DAEMON_GENERATION,
+		});
+		fs.unlinkSync(paths.lock);
+		const endpointDir = path.join(agentDir, ".gjc", "state", "sdk");
+		const endpoints = [path.join(endpointDir, "dead-a.json"), path.join(endpointDir, "dead-b.json")];
+		fs.mkdirSync(endpointDir, { recursive: true });
+		for (const endpoint of endpoints)
+			fs.writeFileSync(endpoint, JSON.stringify({ url: "ws://dead", token: "dead", pid: 111 }));
+
+		let now = 1_000;
+		let spawns = 0;
+		const child = readyTelegramSpawnFixture({
+			settings: s,
+			firstChildPid: 4243,
+			now: () => now,
+			onSpawn: () => spawns++,
+		});
+		await expect(
+			ensureTelegramDaemonRunningDetailed(
+				{ settings: s, cwd: agentDir, sessionId: "windows-lockless-recovery" },
+				{
+					platform: "win32",
+					pid: 4242,
+					now: () => now,
+					pidAlive: pid => pid === 4243,
+					pidIncarnation: () => "linux:100",
+					spawn: child.spawn,
+					readinessTimeoutMs: 1,
+					waitStepMs: 1,
+					sleep: async () => {
+						now++;
+						await child.sleep();
+					},
+				},
+			),
+		).resolves.toBe("spawned");
+		expect(spawns).toBe(1);
+		expect(endpoints.every(endpoint => !fs.existsSync(endpoint))).toBe(true);
+		expect(JSON.parse(fs.readFileSync(paths.state, "utf8"))).toMatchObject({
+			pid: 4243,
+			ownershipPhase: "ready",
+		});
+	});
+
+	test("Windows production preflight fails closed on unsafe lockless-owner endpoint evidence", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const paths = daemonPaths(agentDir);
+		writeLiveOwner(agentDir, {
+			pid: 111,
+			ownerId: "crashed",
+			acquisitionId: "crashed",
+			generation: DAEMON_GENERATION,
+		});
+		fs.unlinkSync(paths.lock);
+		const endpoint = path.join(agentDir, ".gjc", "state", "sdk", "unproven.json");
+		fs.mkdirSync(path.dirname(endpoint), { recursive: true });
+		fs.writeFileSync(endpoint, JSON.stringify({ url: "ws://unproven", token: "unproven" }));
+		let spawns = 0;
+		const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => {});
+		try {
+			await expect(
+				ensureTelegramDaemonRunningDetailed(
+					{ settings: s, cwd: agentDir, sessionId: "windows-unsafe-recovery" },
+					{
+						platform: "win32",
+						pid: 4242,
+						pidAlive: () => false,
+						pidIncarnation: () => "linux:100",
+						spawn: () => {
+							spawns++;
+							return { pid: 4243, unref() {} };
+						},
+					},
+				),
+			).resolves.toBe("blocked_identity");
+			expect(spawns).toBe(0);
+			expect(fs.existsSync(endpoint)).toBe(true);
+			expect(warnSpy).toHaveBeenCalledWith(
+				expect.stringContaining("startup recovery unsafe (unsafe-endpoint); run `gjc notify recovery`"),
+			);
+		} finally {
+			warnSpy.mockRestore();
+		}
+	});
+	test("startup recovery retains an endpoint successor installed during exact stale cleanup", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const paths = daemonPaths(agentDir);
+		const endpoint = path.join(agentDir, ".gjc", "state", "sdk", "raced.json");
+		const successor = JSON.stringify({ url: "ws://live", token: "live", pid: 4243 });
+		fs.mkdirSync(path.dirname(endpoint), { recursive: true });
+		fs.writeFileSync(endpoint, JSON.stringify({ url: "ws://dead", token: "dead", pid: 111 }));
+		writeLiveOwner(agentDir, {
+			pid: 111,
+			ownerId: "crashed",
+			acquisitionId: "crashed",
+			tokenFingerprint: "stale-token",
+			generation: DAEMON_GENERATION,
+		});
+		let now = 1_000;
+		let staleProbes = 0;
+
+		const child = readyTelegramSpawnFixture({ settings: s, firstChildPid: 4243, now: () => now });
+		const recoveryFs: TelegramDaemonFs = {
+			...(fs.promises as unknown as TelegramDaemonFs),
+			...exactTransitionFs(file => {
+				if (file === endpoint) {
+					fs.unlinkSync(file);
+					fs.writeFileSync(file, successor);
+				}
+			}),
+		};
+
+		await expect(
+			ensureTelegramDaemonRunningDetailed(
+				{ settings: s, cwd: agentDir, sessionId: "raced" },
+				{
+					fs: recoveryFs,
+					pid: 4242,
+					now: () => now,
+					pidAlive: pid => (pid === 111 ? staleProbes++ === 0 : pid === 4243),
+					pidIncarnation: () => "linux:100",
+					spawn: child.spawn,
+					readinessTimeoutMs: 1,
+					waitStepMs: 1,
+					sleep: async () => {
+						now++;
+						await child.sleep();
+					},
+				},
+			),
+		).resolves.toBe("blocked_identity");
+		expect(fs.readFileSync(endpoint, "utf8")).toBe(successor);
+		expect(JSON.parse(fs.readFileSync(paths.lock, "utf8"))).toMatchObject({ pid: 111, ownerId: "crashed" });
 	});
 	test("#2028 retires an unbound launcher reservation after bounded bind contention so ensure can recover", async () => {
 		const agentDir = tempAgentDir();

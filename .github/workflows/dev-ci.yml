@@ -272,7 +272,7 @@ jobs:
         run: |
           bun test packages/coding-agent/test/daemon-control.test.ts --test-name-pattern 'incarnation|captured-owner|owner-lock|poll overlap|configured chat providers'
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          bun test packages/coding-agent/test/notifications-telegram-daemon.test.ts --test-name-pattern 'concurrent ensureTelegramDaemonRunning|stale dead-pid lock|lock written before|parent-format|transition lock|provisional|readiness|reload failure|pre-upgrade owner|current-generation live owner|rollback preserves legacy unmanaged root|runDaemonInternal rewrites persisted owner pid|heartbeat fails closed'
+          bun test packages/coding-agent/test/notifications-telegram-daemon.test.ts --test-name-pattern 'Windows production preflight|concurrent ensureTelegramDaemonRunning|stale dead-pid lock|lock written before|parent-format|transition lock|provisional|readiness|reload failure|pre-upgrade owner|current-generation live owner|rollback preserves legacy unmanaged root|runDaemonInternal rewrites persisted owner pid|heartbeat fails closed'
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           bun test packages/natives/test/native.test.ts --test-name-pattern 'signals only the pinned root process'
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
