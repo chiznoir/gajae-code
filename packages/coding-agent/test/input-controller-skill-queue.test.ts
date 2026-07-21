@@ -132,7 +132,6 @@ function createStubInputControllerContext(opts: {
 		},
 		showError,
 		updatePendingMessagesDisplay,
-		hasActiveBtw: () => false,
 		// Defaults that InputController touches on submit but don't matter here.
 		isBashMode: false,
 		isPythonMode: false,
@@ -593,7 +592,6 @@ function createStubInteractiveModeContextForUiHelpers(session: AgentSession) {
 			getDisplayString: (_action: string) => "Alt+Up",
 		},
 		updatePendingMessagesDisplay,
-		hasActiveBtw: () => false,
 		locallySubmittedUserSignatures: new Set<string>(),
 		hasActiveBtw: () => false,
 	} as unknown as InteractiveModeContext;
