@@ -865,6 +865,39 @@ function isExplicitlyStoppedDaemonState(state: unknown): state is DaemonState {
 			state.acquisitionId.length > 0,
 	);
 }
+/**
+ * v0.11.4 and earlier generations wrote stopped tombstones before acquisition
+ * and incarnation fields existed. A live, reused PID must not turn that durable
+ * stop marker into a foreign live owner during an upgrade.
+ */
+function isLegacyStoppedDaemonState(state: unknown): boolean {
+	const candidate = state as Partial<DaemonState> | undefined;
+	return Boolean(
+		candidate &&
+			Number.isSafeInteger(candidate.pid) &&
+			(candidate.pid ?? 0) > 0 &&
+			typeof candidate.ownerId === "string" &&
+			candidate.ownerId.length > 0 &&
+			typeof candidate.tokenFingerprint === "string" &&
+			typeof candidate.chatId === "string" &&
+			Number.isSafeInteger(candidate.startedAt) &&
+			Number.isSafeInteger(candidate.heartbeatAt) &&
+			Number.isSafeInteger(candidate.stoppedAt) &&
+			(candidate.launcherPid === undefined ||
+				(Number.isSafeInteger(candidate.launcherPid) && (candidate.launcherPid ?? 0) > 0)) &&
+			Array.isArray(candidate.roots) &&
+			candidate.roots.every(root => typeof root === "string") &&
+			candidate.version === DAEMON_VERSION &&
+			isRecognizedLegacyGeneration(candidate.generation) &&
+			candidate.incarnation === undefined &&
+			candidate.acquisitionId === undefined &&
+			candidate.ownershipPhase === undefined,
+	);
+}
+
+function isStoppedDaemonState(state: unknown): boolean {
+	return isExplicitlyStoppedDaemonState(state) || isLegacyStoppedDaemonState(state);
+}
 
 function ownerIdentityMatches(
 	state: Pick<DaemonState, "tokenFingerprint" | "chatId">,
@@ -1016,7 +1049,7 @@ function classifyForeignLiveOwner(input: {
 	// Validate before probing so malformed PIDs never reach the liveness source.
 	if (!state || !validDaemonPid(state.pid) || !input.pidAlive(state.pid)) return undefined;
 	// A stopped tombstone with a canonical acquisition is not a live owner.
-	if (isExplicitlyStoppedDaemonState(state) || isLegacyParentDaemonState(state)) return undefined;
+	if (isStoppedDaemonState(state) || isLegacyParentDaemonState(state)) return undefined;
 	const currentIncarnation = input.pidIncarnation?.(state.pid) ?? defaultPidIncarnation(state.pid);
 	if (
 		!hasSafeDaemonStateShape(state) ||
@@ -1156,7 +1189,7 @@ export async function acquireDaemonOwnership(input: {
 		if (state && !hasSafeDaemonStateShape(state)) {
 			const malformed = state as Partial<DaemonState>;
 			if (
-				!isExplicitlyStoppedDaemonState(malformed) &&
+				!isStoppedDaemonState(malformed) &&
 				validDaemonPid(malformed.pid) &&
 				typeof malformed.incarnation === "string" &&
 				pidAlive(malformed.pid)
@@ -2036,7 +2069,9 @@ async function reclaimDeadDaemonOwner(input: {
 	if (!state || pidAlive(state.pid)) return false;
 	const lock = await readOwnershipLock(fsImpl, paths.lock);
 	if (lock.kind === "missing") return false;
-	if (!(await ownershipLockIsReclaimable({ fs: fsImpl, path: paths.lock, lock, now: now(), pidAlive, pidIncarnation })))
+	if (
+		!(await ownershipLockIsReclaimable({ fs: fsImpl, path: paths.lock, lock, now: now(), pidAlive, pidIncarnation }))
+	)
 		return false;
 	const transition = await acquireDaemonTransitionLock({
 		fs: fsImpl,

@@ -885,6 +885,79 @@ describe("telegram daemon", () => {
 			}),
 		).resolves.toMatchObject({ acquired: true });
 	});
+	test.each([
+		["an older generation", { generation: DAEMON_GENERATION - 4 }],
+		["the pre-generation schema", {}],
+	] as const)("reclaims a pre-incarnation stopped tombstone from %s when its PID is still live", async (_schema, legacyFields) => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const paths = daemonPaths(agentDir);
+		fs.mkdirSync(paths.dir, { recursive: true });
+		fs.writeFileSync(
+			paths.state,
+			JSON.stringify({
+				pid: 111,
+				ownerId: "legacy-stopped",
+				tokenFingerprint: "fp",
+				chatId: "42",
+				startedAt: 0,
+				heartbeatAt: 1,
+				stoppedAt: 2,
+				roots: [],
+				version: DAEMON_VERSION,
+				...legacyFields,
+				launcherPid: 110,
+			}),
+		);
+
+		await expect(
+			acquireDaemonOwnership({
+				settings: s,
+				tokenFingerprint: "fp",
+				chatId: "42",
+				pid: 222,
+				ownerId: "replacement",
+				now: () => 30_000,
+				pidAlive: pid => pid === 111,
+				pidIncarnation: pid => (pid === 111 ? "linux:103" : "linux:101"),
+			}),
+		).resolves.toMatchObject({ acquired: true, ownerId: "replacement" });
+		expect(JSON.parse(fs.readFileSync(paths.state, "utf8"))).not.toHaveProperty("stoppedAt");
+	});
+	test("keeps a live malformed legacy tombstone blocked when launcherPid is invalid", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const paths = daemonPaths(agentDir);
+		fs.mkdirSync(paths.dir, { recursive: true });
+		fs.writeFileSync(
+			paths.state,
+			JSON.stringify({
+				pid: 111,
+				ownerId: "legacy-stopped",
+				tokenFingerprint: "fp",
+				chatId: "42",
+				startedAt: 0,
+				heartbeatAt: 1,
+				stoppedAt: 2,
+				roots: [],
+				version: DAEMON_VERSION,
+				launcherPid: "corrupt",
+			}),
+		);
+
+		await expect(
+			acquireDaemonOwnership({
+				settings: s,
+				tokenFingerprint: "fp",
+				chatId: "42",
+				pid: 222,
+				ownerId: "replacement",
+				pidAlive: pid => pid === 111,
+				pidIncarnation: pid => (pid === 111 ? "linux:103" : "linux:101"),
+			}),
+		).resolves.toMatchObject({ acquired: false, blocked: true });
+		expect(JSON.parse(fs.readFileSync(paths.state, "utf8"))).toHaveProperty("launcherPid", "corrupt");
+	});
 	test("release removes only the exact old lock before a successor acquires", async () => {
 		const agentDir = tempAgentDir();
 		const s = setPrivateAgentDir(settings(agentDir), agentDir);
@@ -1943,9 +2016,9 @@ describe("telegram daemon", () => {
 			}),
 		);
 	}
-	test("keeps the wire protocol at 3 while retained authority uses generation 9", () => {
+	test("keeps the wire protocol at 3 while legacy tombstone reclamation uses generation 11", () => {
 		expect(NOTIFICATION_PROTOCOL_VERSION).toBe(3);
-		expect(DAEMON_GENERATION).toBe(9);
+		expect(DAEMON_GENERATION).toBe(11);
 	});
 
 	test("#2028 acquire flags a reload for a live pre-upgrade owner missing the generation field", async () => {
