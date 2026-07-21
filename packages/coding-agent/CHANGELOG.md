@@ -1,6 +1,8 @@
 # Changelog
 
 ## [Unreleased]
+
+## [0.11.5] - 2026-07-20
 ### Fixed
 
 - Internal transcript PageUp/PageDown now keeps moving through tool-output and other non-semantic rows instead of intermittently becoming a no-op after scrolling through anchored conversation content.
