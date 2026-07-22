@@ -148,6 +148,49 @@ describe("lifecycle command routing (G009)", () => {
 		cwdSpy.mockRestore();
 		fs.rmSync(agentDir, { recursive: true, force: true });
 	});
+	test("/session_recent retains stable rows and appends one bounded, non-leaking omission warning", async () => {
+		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-lc-route-"));
+		const { calls, api } = spyBot();
+		const daemon = makeDaemon(agentDir, api);
+		(daemon as unknown as { lifecycleControlActive: boolean }).lifecycleControlActive = true;
+		const cwd = path.join(agentDir, "repo-&-safe");
+		fs.mkdirSync(cwd, { recursive: true });
+		const cwdSpy = vi.spyOn(process, "cwd").mockReturnValue(cwd);
+		writeSession(agentDir, cwd, "stable", {}, 2_000);
+		writeSession(agentDir, cwd, "secret-candidate", {}, 1_000);
+		const replaced = path.join(agentDir, "sessions", "replacement.jsonl");
+		fs.writeFileSync(replaced, `${JSON.stringify({ type: "session", id: "replacement", cwd })}\n`, { mode: 0o600 });
+		secureOwnerOnlyFile(replaced);
+		const verify = native.verifyOwnerOnlyFdSecurity;
+		let replacedOnce = false;
+		const verifier = vi.spyOn(native, "verifyOwnerOnlyFdSecurity").mockImplementation((pathname, kind, fd) => {
+			if (!replacedOnce && pathname.endsWith("secret-candidate.jsonl")) {
+				replacedOnce = true;
+				fs.renameSync(replaced, pathname);
+			}
+			return verify(pathname, kind, fd);
+		});
+		try {
+			await daemon.handleTelegramUpdate(msg("42", "/session_recent", 44));
+			const text = calls
+				.filter(call => call.method === "sendMessage")
+				.map(call => String(call.body?.text))
+				.join("");
+			const warning = "Ignored managed session candidate that changed during inspection.";
+			expect(text).toContain("<code>stable</code>");
+			expect(text).toContain(warning);
+			expect(text.slice(text.indexOf(warning))).not.toContain("secret-candidate");
+			expect(text).toContain("repo-&amp;-safe");
+			expect(Array.from(text.matchAll(new RegExp(warning.replaceAll(".", "\\."), "g")))).toHaveLength(1);
+			expect(
+				calls.filter(call => call.method === "sendMessage").every(call => String(call.body?.text).length <= 4096),
+			).toBe(true);
+		} finally {
+			verifier.mockRestore();
+			cwdSpy.mockRestore();
+			fs.rmSync(agentDir, { recursive: true, force: true });
+		}
+	});
 	test("/session_recent hides internal helper sessions by default", async () => {
 		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-lc-route-"));
 		const { calls, api } = spyBot();

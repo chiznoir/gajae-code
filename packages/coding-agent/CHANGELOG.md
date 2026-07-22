@@ -8,6 +8,7 @@
 - `skill_discovery` empty results now carry a `notice` when discovery config caused the emptiness — naming the exact disabled setting (`skills.enabled`, `skills.enablePiProject`, or `skills.enablePiUser`) and the `gjc config set` command to enable it. Previously a disabled config was indistinguishable from "no skills exist", silently hiding freshly written user/project skills.
 
 ### Fixed
+- Telegram `/session_recent` now keeps stable managed sessions available while another transcript is appended, omitting only candidates that cannot be coherently revalidated while preserving fail-closed scope authority.
 - Repeated byte-identical stale SDK broker locks no longer cause startup to loop when a prior tombstone exists.
 - Ralplan no longer re-asks for execution approval when the user already explicitly named `ultragoal` or `team` in the current turn; that naming is the consent.
 

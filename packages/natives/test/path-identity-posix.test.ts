@@ -11,6 +11,7 @@ import {
 	exactRestore,
 	exactUnlink,
 	snapshotDirectoryTree,
+	verifyOwnerOnlyFdSecurity,
 	verifyOwnerOnlyPathSecurity,
 } from "../native/index.js";
 
@@ -106,6 +107,48 @@ describe.skipIf(process.platform === "win32")("POSIX native path identity", () =
 		expect((await fs.stat(directory)).mode & 0o777).toBe(0o700);
 		expect((await fs.stat(file)).mode & 0o777).toBe(0o600);
 		expect(await fs.readFile(file, "utf8")).toBe(contents);
+	});
+	it("verifies the caller descriptor without closing it and rejects a replaced path", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-path-identity-posix-"));
+		temporaryDirectories.push(root);
+		const file = path.join(root, "state.json");
+		const retained = path.join(root, "retained.json");
+		await fs.writeFile(file, '{"preserve":"payload"}', { mode: 0o600 });
+		await fs.chmod(file, 0o600);
+		const handle = await fs.open(file, "r");
+		try {
+			expectOwnerOnlySuccess(verifyOwnerOnlyFdSecurity(file, "file", handle.fd), "file", "verify");
+			await fs.rename(file, retained);
+			await fs.writeFile(file, '{"replacement":true}', { mode: 0o600 });
+			expect(verifyOwnerOnlyFdSecurity(file, "file", handle.fd)).toEqual({
+				ok: false,
+				code: "identity_mismatch",
+			});
+			expect((await handle.stat()).size).toBe(Buffer.byteLength('{"preserve":"payload"}'));
+			expect(await fs.readFile(retained, "utf8")).toBe('{"preserve":"payload"}');
+			expect(await fs.readFile(file, "utf8")).toBe('{"replacement":true}');
+		} finally {
+			await handle.close();
+		}
+	});
+	it("rejects mode drift through the caller descriptor without mutating bytes", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-path-identity-posix-"));
+		temporaryDirectories.push(root);
+		const file = path.join(root, "state.json");
+		const contents = '{"preserve":"payload"}';
+		await fs.writeFile(file, contents, { mode: 0o600 });
+		const handle = await fs.open(file, "r");
+		try {
+			await fs.chmod(file, 0o640);
+			expect(verifyOwnerOnlyFdSecurity(file, "file", handle.fd)).toEqual({
+				ok: false,
+				code: "mode_mismatch",
+			});
+			expect((await handle.stat()).size).toBe(Buffer.byteLength(contents));
+			expect(await fs.readFile(file, "utf8")).toBe(contents);
+		} finally {
+			await handle.close();
+		}
 	});
 
 	it.skipIf(process.platform !== "darwin")("uses native ACL APIs for owner-only access", async () => {
@@ -530,6 +573,29 @@ describe.skipIf(process.platform === "win32")("POSIX native path identity", () =
 		},
 	);
 	it.skipIf(process.platform !== "darwin")(
+		"rejects an unsafe extended ACL through the caller descriptor without closing it or mutating bytes",
+		async () => {
+			const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-path-identity-posix-"));
+			temporaryDirectories.push(root);
+			const file = path.join(root, "state.json");
+			const contents = '{"preserve":true}';
+			await fs.writeFile(file, contents, { mode: 0o600 });
+			const acl = Bun.spawnSync(["chmod", "+a", "everyone allow read", file]);
+			if (acl.exitCode !== 0) throw new Error("failed to install Darwin ACL fixture");
+			const handle = await fs.open(file, "r");
+			try {
+				expect(verifyOwnerOnlyFdSecurity(file, "file", handle.fd)).toEqual({
+					ok: false,
+					code: "acl_verify_failed",
+				});
+				expect((await handle.stat()).size).toBe(Buffer.byteLength(contents));
+				expect(await fs.readFile(file, "utf8")).toBe(contents);
+			} finally {
+				await handle.close();
+			}
+		},
+	);
+	it.skipIf(process.platform !== "darwin")(
 		"detects and repairs an adversarial extended ACL without changing bytes",
 		async () => {
 			const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-path-identity-posix-"));
@@ -538,10 +604,22 @@ describe.skipIf(process.platform === "win32")("POSIX native path identity", () =
 			await fs.writeFile(file, '{"preserve":true}', { mode: 0o600 });
 			const acl = Bun.spawnSync(["chmod", "+a", "everyone deny read", file]);
 			if (acl.exitCode !== 0) throw new Error("failed to install Darwin ACL fixture");
-			expect(verifyOwnerOnlyPathSecurity(file, "file")).toEqual({ ok: false, code: "acl_verify_failed" });
-			expect(applyOwnerOnlyPathSecurity(file, "file")).toEqual({ ok: true });
-			expect(verifyOwnerOnlyPathSecurity(file, "file")).toEqual({ ok: true });
-			expect(await fs.readFile(file, "utf8")).toBe('{"preserve":true}');
+			const handle = await fs.open(file, "r");
+			try {
+				expect(verifyOwnerOnlyPathSecurity(file, "file")).toEqual({
+					ok: false,
+					code: "acl_verify_failed",
+				});
+				expect(verifyOwnerOnlyFdSecurity(file, "file", handle.fd)).toEqual({
+					ok: false,
+					code: "acl_verify_failed",
+				});
+				expect(applyOwnerOnlyPathSecurity(file, "file")).toEqual({ ok: true });
+				expect(verifyOwnerOnlyFdSecurity(file, "file", handle.fd)).toEqual({ ok: true });
+				expect(await fs.readFile(file, "utf8")).toBe('{"preserve":true}');
+			} finally {
+				await handle.close();
+			}
 		},
 	);
 });

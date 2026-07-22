@@ -5,6 +5,7 @@ import * as path from "node:path";
 import * as native from "@gajae-code/natives";
 import {
 	canonicalExistingDirectoryIdentity,
+	type NativeOwnerOnlySecurityResult,
 	verifyOwnerOnlyPathSecurity,
 	verifyOwnerOnlyPathSecurityExpected,
 } from "@gajae-code/natives";
@@ -18,11 +19,15 @@ import {
 import {
 	acquireManagedLock,
 	assertManagedDirectoryRoot,
+	captureManagedDirectoryAuthorityNoFollow,
+	captureManagedFileCoherentNoFollow,
 	captureManagedFileNoFollow,
 	captureManagedFilePrefixNoFollow,
 	copyManagedFileNoReplace,
 	ensureManagedDirectory,
 	fsyncManagedArtifactTree,
+	type ManagedCoherentCaptureMetrics,
+	type ManagedCoherentFileCapture,
 	type ManagedDirectoryRoot,
 	ManagedSessionDescendantStore,
 	type ManagedSessionSecurityPolicy,
@@ -162,6 +167,100 @@ export type ManagedCandidateListing =
 	  }
 	| { kind: "error"; code: "scan_failed" | "unsafe_root" | "invalid_candidate"; message: string };
 
+export type ManagedRecentCandidateInspection =
+	| {
+			kind: "owned";
+			candidate: ManagedCandidate;
+			initialLines: readonly string[];
+			captureMetrics: ManagedCoherentCaptureMetrics;
+	  }
+	| { kind: "candidate_omitted"; reason: "source_changed" | "replacement" | "unsafe_capture" }
+	| { kind: "scope_invalid"; message: string };
+
+export type ReadonlyAuthorityEntry =
+	| { kind: "absent" }
+	| {
+			kind: "directory";
+			dev: bigint;
+			ino: bigint;
+			mode: number;
+			security: NativeOwnerOnlySecurityResult;
+	  }
+	| { kind: "file"; dev: bigint; ino: bigint; sha256: string };
+
+export interface ReadonlyScopeAuthority {
+	workspace: { platform: "posix" | "win32"; canonicalPath: string; dev: bigint; ino: bigint };
+	root: ReadonlyAuthorityEntry;
+	directory: ReadonlyAuthorityEntry;
+	binding: ReadonlyAuthorityEntry;
+}
+
+function readonlyAuthorityEntry(
+	pathname: string,
+	expected: "directory" | "file",
+	requireOwnerOnly = true,
+): ReadonlyAuthorityEntry {
+	try {
+		if (expected === "file") {
+			const capture = captureManagedFileNoFollow(pathname);
+			return {
+				kind: "file",
+				dev: capture.identity.dev,
+				ino: capture.identity.ino,
+				sha256: capture.identity.sha256,
+			};
+		}
+		const capture = captureManagedDirectoryAuthorityNoFollow(pathname, requireOwnerOnly);
+		return { kind: "directory", ...capture.identity, security: capture.security };
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return { kind: "absent" };
+		throw error;
+	}
+}
+
+function captureReadonlyScopeAuthority(scope: ManagedScope): ReadonlyScopeAuthority {
+	const workspace = identityFor(scope.canonicalCwd);
+	if (!workspace.ok || workspace.platform !== scope.platform || workspace.canonicalPath !== scope.canonicalCwd)
+		throw new Error("workspace authority changed");
+	const workspaceAuthority = captureManagedDirectoryAuthorityNoFollow(scope.canonicalCwd, false);
+	return {
+		workspace: {
+			platform: workspace.platform,
+			canonicalPath: workspace.canonicalPath,
+			dev: workspaceAuthority.identity.dev,
+			ino: workspaceAuthority.identity.ino,
+		},
+		// The sessions root governs legacy discovery and was never an owner-only
+		// write boundary. Preserve its verifier envelope as drift evidence without
+		// making legacy visibility depend on v2's stricter directory policy.
+		root: readonlyAuthorityEntry(scope.sessionsRoot, "directory", false),
+		directory: readonlyAuthorityEntry(scope.directoryPath, "directory"),
+		binding: readonlyAuthorityEntry(path.join(scope.directoryPath, MANAGED_SESSION_BINDING_FILE), "file"),
+	};
+}
+
+function sameReadonlyAuthority(left: ReadonlyAuthorityEntry, right: ReadonlyAuthorityEntry): boolean {
+	if (left.kind !== right.kind) return false;
+	if (left.kind === "absent" || right.kind === "absent") return true;
+	if (left.dev !== right.dev || left.ino !== right.ino) return false;
+	if (left.kind === "directory" && right.kind === "directory") {
+		return left.mode === right.mode && JSON.stringify(left.security) === JSON.stringify(right.security);
+	}
+	return left.kind !== "file" || (right.kind === "file" && left.sha256 === right.sha256);
+}
+
+function readonlyAuthorityIsCurrent(scope: ManagedScope, authority: ReadonlyScopeAuthority): boolean {
+	const current = captureReadonlyScopeAuthority(scope);
+	return (
+		authority.workspace.platform === current.workspace.platform &&
+		authority.workspace.canonicalPath === current.workspace.canonicalPath &&
+		authority.workspace.dev === current.workspace.dev &&
+		authority.workspace.ino === current.workspace.ino &&
+		sameReadonlyAuthority(authority.root, current.root) &&
+		sameReadonlyAuthority(authority.directory, current.directory) &&
+		sameReadonlyAuthority(authority.binding, current.binding)
+	);
+}
 export type ManagedOpenFailure =
 	| "migration_busy"
 	| "binding_conflict"
@@ -536,7 +635,12 @@ function fsyncManagedParent(pathname: string): void {
 }
 
 type CandidatePreflight =
-	| { kind: "capture"; identity: { dev: bigint; ino: bigint; size: number; mtimeNs: bigint } }
+	| {
+			kind: "capture";
+			sessionId: string;
+			cwd: string;
+			identity: { dev: bigint; ino: bigint; size: number; mtimeNs: bigint; sha256: string };
+	  }
 	| {
 			kind: "foreign";
 	  }
@@ -562,7 +666,7 @@ function preflightCandidate(filePath: string, scope: ManagedScope): CandidatePre
 			(candidateIdentity.platform !== scope.platform || candidateIdentity.canonicalPath !== scope.canonicalCwd)
 		)
 			return { kind: "foreign" };
-		return { kind: "capture", identity: snapshot.identity };
+		return { kind: "capture", sessionId: header.id, cwd: header.cwd, identity: snapshot.identity };
 	} catch {
 		return { kind: "invalid", code: "unreadable_candidate" };
 	}
@@ -576,6 +680,25 @@ function matchesPreflightIdentity(candidate: ManagedCandidate, preflight: Candid
 		candidate.identity.size === preflight.identity.size &&
 		candidate.identity.mtimeNs === preflight.identity.mtimeNs
 	);
+}
+function candidateFromPreflight(
+	filePath: string,
+	provenance: "v2" | "legacy",
+	preflight: Extract<CandidatePreflight, { kind: "capture" }>,
+): ManagedCandidate {
+	return {
+		sessionId: preflight.sessionId,
+		path: filePath,
+		cwd: preflight.cwd,
+		provenance,
+		migrationState: provenance === "v2" ? "native_v2" : "legacy_unmigrated",
+		identity: {
+			canonicalPath: path.resolve(filePath),
+			sessionId: preflight.sessionId,
+			...preflight.identity,
+			mtimeMs: Number(preflight.identity.mtimeNs) / 1_000_000,
+		},
+	};
 }
 
 function inspectCandidate(filePath: string, provenance: "v2" | "legacy"): ManagedCandidate | { code: string } {
@@ -645,6 +768,7 @@ function listDirectoryCandidates(
 	directory: string,
 	provenance: "v2" | "legacy",
 	scope: ManagedScope,
+	preflightOnly = false,
 ): readonly CandidateInspection[] {
 	let directoryStat: fs.Stats;
 	try {
@@ -662,6 +786,7 @@ function listDirectoryCandidates(
 			const preflight = preflightCandidate(filePath, scope);
 			if (preflight.kind === "invalid") return { code: preflight.code };
 			if (preflight.kind === "foreign") return { foreign: true };
+			if (preflightOnly) return candidateFromPreflight(filePath, provenance, preflight);
 			const candidate = inspectCandidate(filePath, provenance);
 			if ("code" in candidate) return candidate;
 			return matchesPreflightIdentity(candidate, preflight) ? candidate : { code: "source_changed" };
@@ -829,7 +954,10 @@ export function prepareManagedSessionScopeForWriteSync(
 	}
 }
 
-export function listManagedCandidates(scope: ManagedScope): ManagedCandidateListing {
+export function listManagedCandidates(
+	scope: ManagedScope,
+	options: { preflightOnly?: boolean } = {},
+): ManagedCandidateListing {
 	try {
 		let root: fs.Stats;
 		try {
@@ -853,7 +981,12 @@ export function listManagedCandidates(scope: ManagedScope): ManagedCandidateList
 		];
 		const seen = new Set<string>();
 		for (const directory of directories) {
-			for (const candidate of listDirectoryCandidates(directory.path, directory.provenance, scope)) {
+			for (const candidate of listDirectoryCandidates(
+				directory.path,
+				directory.provenance,
+				scope,
+				options.preflightOnly,
+			)) {
 				if ("code" in candidate) {
 					invalid.push({ code: candidate.code });
 					continue;
@@ -880,28 +1013,10 @@ export function listManagedCandidates(scope: ManagedScope): ManagedCandidateList
 				}
 			}
 		}
-		const visible = owned.filter(candidate => !isRetired(scope, candidate));
-		const active = visible.filter(
-			candidate =>
-				candidate.provenance === "v2" ||
-				!visible.some(
-					destination =>
-						destination.provenance === "v2" &&
-						receiptMatches(receiptPathFor(scope, candidate), candidate, destination, scope),
-				),
-		);
 		return {
 			kind: "complete",
 			scope,
-			owned: active.map(candidate => {
-				if (candidate.provenance !== "v2") return candidate;
-				const migrated = visible.some(
-					source =>
-						source.provenance === "legacy" &&
-						receiptMatches(receiptPathFor(scope, source), source, candidate, scope),
-				);
-				return migrated ? { ...candidate, migrationState: "migrated_v2" as const } : candidate;
-			}),
+			owned: projectManagedCandidates(scope, owned),
 			foreignCount,
 			invalid,
 		};
@@ -912,6 +1027,121 @@ export function listManagedCandidates(scope: ManagedScope): ManagedCandidateList
 			message: error instanceof Error ? error.message : "Session scan failed.",
 		};
 	}
+}
+export function projectManagedCandidates(
+	scope: ManagedScope,
+	candidates: readonly ManagedCandidate[],
+): ManagedCandidate[] {
+	const visible = candidates.filter(candidate => !isRetired(scope, candidate));
+	const active = visible.filter(
+		candidate =>
+			candidate.provenance === "v2" ||
+			!visible.some(
+				destination =>
+					destination.provenance === "v2" &&
+					receiptMatches(receiptPathFor(scope, candidate), candidate, destination, scope),
+			),
+	);
+	return active.map(candidate => {
+		if (candidate.provenance !== "v2") return candidate;
+		const migrated = visible.some(
+			source =>
+				source.provenance === "legacy" && receiptMatches(receiptPathFor(scope, source), source, candidate, scope),
+		);
+		return migrated ? { ...candidate, migrationState: "migrated_v2" as const } : candidate;
+	});
+}
+/**
+ * Captures a listed candidate through the canonical readonly policy path.
+ * Callers retry only source_changed and keep scope authority failures fatal.
+ */
+function candidateFromCoherentCapture(
+	scope: ManagedScope,
+	candidate: ManagedCandidate,
+	capture: ManagedCoherentFileCapture,
+): ManagedCandidate | undefined {
+	const lineEnd = capture.bytes.subarray(0, HEADER_MAX_BYTES).indexOf(0x0a);
+	if (lineEnd < 0) return undefined;
+	try {
+		const value: unknown = JSON.parse(capture.bytes.subarray(0, lineEnd).toString("utf8"));
+		if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+		const header = value as Record<string, unknown>;
+		if (header.type !== "session" || typeof header.id !== "string" || typeof header.cwd !== "string")
+			return undefined;
+		const cwdIdentity = identityFor(header.cwd);
+		if (
+			!cwdIdentity.ok ||
+			cwdIdentity.platform !== scope.platform ||
+			cwdIdentity.canonicalPath !== scope.canonicalCwd
+		)
+			return undefined;
+		return {
+			sessionId: header.id,
+			path: candidate.path,
+			cwd: header.cwd,
+			provenance: candidate.provenance,
+			migrationState: candidate.provenance === "v2" ? "native_v2" : "legacy_unmigrated",
+			identity: {
+				canonicalPath: path.resolve(candidate.path),
+				sessionId: header.id,
+				...capture.identity,
+				mtimeMs: Number(capture.identity.mtimeNs) / 1_000_000,
+			},
+		};
+	} catch {
+		return undefined;
+	}
+}
+
+export function inspectManagedCandidateForRecent(
+	scope: ManagedScope,
+	candidate: ManagedCandidate,
+	authority: ReadonlyScopeAuthority = captureReadonlyScopeAuthority(scope),
+	observeCapture?: (metrics: ManagedCoherentCaptureMetrics) => void,
+): ManagedRecentCandidateInspection {
+	const authorityCurrent = (): ManagedRecentCandidateInspection | undefined => {
+		try {
+			return readonlyAuthorityIsCurrent(scope, authority)
+				? undefined
+				: { kind: "scope_invalid", message: "Managed session scope changed during inspection." };
+		} catch {
+			return { kind: "scope_invalid", message: "Managed session scope could not be revalidated." };
+		}
+	};
+	const beforeCapture = authorityCurrent();
+	if (beforeCapture) return beforeCapture;
+	try {
+		const capture = captureManagedFileCoherentNoFollow(candidate.path, candidate.provenance, 8, observeCapture);
+		const afterCapture = authorityCurrent();
+		if (afterCapture) return afterCapture;
+		if (capture.identity.dev !== candidate.identity.dev || capture.identity.ino !== candidate.identity.ino)
+			return { kind: "candidate_omitted", reason: "replacement" };
+		const capturedCandidate = candidateFromCoherentCapture(scope, candidate, capture);
+		if (!capturedCandidate) return { kind: "candidate_omitted", reason: "unsafe_capture" };
+		return {
+			kind: "owned",
+			candidate: capturedCandidate,
+			initialLines: capture.initialLines,
+			captureMetrics: capture.metrics,
+		};
+	} catch (error) {
+		const afterCapture = authorityCurrent();
+		if (afterCapture) return afterCapture;
+		const message = error instanceof Error ? error.message : "";
+		return {
+			kind: "candidate_omitted",
+			reason:
+				message === "source_changed"
+					? "source_changed"
+					: message === "replacement"
+						? "replacement"
+						: "unsafe_capture",
+		};
+	}
+}
+
+export function readonlyAuthorityForManagedScope(scope: ManagedScope): ReadonlyScopeAuthority {
+	return captureReadonlyScopeAuthority(scope);
 }
 
 const MANAGED_INTERNAL_DIRECTORY = ".gjc-managed-session-internal";

@@ -53,6 +53,16 @@ export interface ManagedFileSnapshot {
 	bytes: Buffer;
 	identity: { dev: bigint; ino: bigint; size: number; mtimeNs: bigint; ctimeNs: bigint; sha256: string };
 }
+export interface ManagedCoherentCaptureMetrics {
+	sampledSize: number;
+	bytesRead: number;
+	peakBuffer: number;
+}
+
+export interface ManagedCoherentFileCapture extends ManagedFileSnapshot {
+	initialLines: string[];
+	metrics: ManagedCoherentCaptureMetrics;
+}
 
 const ACL_FAILURE_CODES = new Set(["acl_denied", "acl_io_error", "acl_present", "acl_malformed", "acl_unknown"]);
 const ACL_CLEAR_EVIDENCE = new Set(["cleared", "already_absent", "unsupported", "not_run"]);
@@ -1031,23 +1041,23 @@ export class ManagedSessionDescendantStore {
 	}
 }
 
-function secureFileDescriptor(pathname: string, fd: number, operation: "apply" | "verify"): void {
-	if (process.platform !== "linux") {
-		if (operation === "apply") secure(pathname, "file");
-		else {
-			const verified = validateNativeSecurityResult(verifyOwnerOnlyPathSecurity(pathname, "file"), "verify", "file");
-			if (!verified.ok) throw securityError(pathname, verified);
-		}
-		return;
-	}
+function secureDescriptor(
+	pathname: string,
+	kind: "directory" | "file",
+	fd: number,
+	operation: "apply" | "verify",
+): void {
 	const result = validateNativeSecurityResult(
 		operation === "apply"
-			? applyOwnerOnlyFdSecurity(pathname, "file", fd)
-			: verifyOwnerOnlyFdSecurity(pathname, "file", fd),
+			? applyOwnerOnlyFdSecurity(pathname, kind, fd)
+			: verifyOwnerOnlyFdSecurity(pathname, kind, fd),
 		operation,
-		"file",
+		kind,
 	);
 	if (!result.ok) throw securityError(pathname, result);
+}
+function secureFileDescriptor(pathname: string, fd: number, operation: "apply" | "verify"): void {
+	secureDescriptor(pathname, "file", fd, operation);
 }
 
 function assertSafeDirectory(pathname: string): void {
@@ -1210,6 +1220,109 @@ function captureManagedFileNoFollowLimit(pathname: string, maxBytes?: number): M
 		if (!named.isFile() || named.isSymbolicLink() || !sameIdentity(identity(before), identity(named)))
 			throw new Error("source_changed");
 		return { bytes, identity: identity(before, createHash("sha256").update(bytes).digest("hex")) };
+	} finally {
+		fs.closeSync(fd);
+	}
+}
+/**
+ * Captures bytes, identity, digest, and initial lines from one no-follow
+ * descriptor. V2 provenance is verified against that open descriptor; legacy
+ * intentionally retains its historical no-follow regular-file policy.
+ */
+export function captureManagedFileCoherentNoFollow(
+	pathname: string,
+	provenance: "v2" | "legacy",
+	maxInitialLines = 8,
+	observeMetrics?: (metrics: ManagedCoherentCaptureMetrics) => void,
+): ManagedCoherentFileCapture {
+	if (!Number.isSafeInteger(maxInitialLines) || maxInitialLines < 0) throw new Error("invalid_capture_limit");
+	let sampledSize = 0;
+	let bytesRead = 0;
+	let peakBuffer = 0;
+	let fd = -1;
+	try {
+		fd = fs.openSync(pathname, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+		const before = fs.fstatSync(fd, { bigint: true });
+		if (!before.isFile() || before.nlink > 1) throw new Error("unsafe_capture");
+		if (provenance === "v2") secureFileDescriptor(pathname, fd, "verify");
+		sampledSize = Number(before.size);
+		const bytes = Buffer.alloc(sampledSize);
+		peakBuffer = bytes.byteLength;
+		let offset = 0;
+		while (offset < bytes.byteLength) {
+			const count = fs.readSync(fd, bytes, offset, bytes.byteLength - offset, offset);
+			if (count === 0) throw new Error("source_changed");
+			offset += count;
+			bytesRead += count;
+		}
+		const after = fs.fstatSync(fd, { bigint: true });
+		if (after.dev !== before.dev || after.ino !== before.ino) throw new Error("source_changed");
+		const named = fs.lstatSync(pathname, { bigint: true });
+		if (!named.isFile() || named.isSymbolicLink()) throw new Error("unsafe_capture");
+		if (named.dev !== before.dev || named.ino !== before.ino) throw new Error("replacement");
+		if (!sameIdentity(identity(before), identity(after)) || !sameIdentity(identity(before), identity(named)))
+			throw new Error("source_changed");
+		const initialLines = bytes.toString("utf8").split("\n").slice(0, maxInitialLines);
+		return {
+			bytes,
+			initialLines,
+			metrics: { sampledSize, bytesRead, peakBuffer },
+			identity: identity(before, createHash("sha256").update(bytes).digest("hex")),
+		};
+	} catch (error) {
+		if (
+			(error as Error).message === "source_changed" ||
+			(error as Error).message === "replacement" ||
+			(error as Error).message === "unsafe_capture"
+		)
+			throw error;
+		throw new Error("unsafe_capture", { cause: error });
+	} finally {
+		if (fd >= 0) fs.closeSync(fd);
+		try {
+			observeMetrics?.({ sampledSize, bytesRead, peakBuffer });
+		} catch {
+			// Observability must not alter the fail-closed capture result.
+		}
+	}
+}
+export interface ManagedDirectoryAuthorityCapture {
+	identity: { dev: bigint; ino: bigint; mode: number };
+	security: NativeOwnerOnlySecurityResult;
+}
+
+/**
+ * Captures descriptor-bound identity, mode, and native verifier evidence for a
+ * directory. Callers may retain failed verifier evidence for legacy authorities
+ * without treating it as permission to create or write managed descendants.
+ */
+export function captureManagedDirectoryAuthorityNoFollow(
+	pathname: string,
+	requireOwnerOnly = true,
+): ManagedDirectoryAuthorityCapture {
+	const fd = fs.openSync(pathname, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
+	try {
+		const before = fs.fstatSync(fd, { bigint: true });
+		if (!before.isDirectory()) throw new Error("unsafe_capture");
+		const security = validateNativeSecurityResult(
+			verifyOwnerOnlyFdSecurity(pathname, "directory", fd),
+			"verify",
+			"directory",
+		);
+		if (requireOwnerOnly && !security.ok) throw securityError(pathname, security);
+		const named = fs.lstatSync(pathname, { bigint: true });
+		if (
+			!named.isDirectory() ||
+			named.isSymbolicLink() ||
+			named.dev !== before.dev ||
+			named.ino !== before.ino ||
+			named.mode !== before.mode
+		)
+			throw new Error("replacement");
+		return {
+			identity: { dev: before.dev, ino: before.ino, mode: Number(before.mode) },
+			security,
+		};
 	} finally {
 		fs.closeSync(fd);
 	}

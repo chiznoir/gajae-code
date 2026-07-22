@@ -6,18 +6,22 @@
  * pick a repo to create in or a recent session to resume without typing raw
  * paths. Dependency-light + injectable so it is unit-testable over a temp dir.
  */
-import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { verifyOwnerOnlyPathSecurity } from "@gajae-code/natives";
 import { getAgentDir, getSessionsDir } from "@gajae-code/utils";
-import { FileSessionStorage } from "../../session/session-storage";
 import {
-	type LogicalSessionCandidate,
-	listManagedSessionCandidates,
-	type ManagedSessionScope,
-	resolveManagedSessionScope,
-} from "../session-directory";
+	inspectManagedCandidateForRecent,
+	listManagedCandidates,
+	type ManagedCandidate,
+	type ManagedRecentCandidateInspection,
+	type ManagedScope,
+	projectManagedCandidates,
+	type ReadonlyScopeAuthority,
+	readonlyAuthorityForManagedScope,
+	resolveManagedScope,
+} from "../../session/internal/managed-session-scope";
+import { captureManagedFilePrefixNoFollow } from "../../session/internal/managed-session-storage";
 
 /** One ranked recent-session entry surfaced to the picker. */
 export interface RecentSessionEntry {
@@ -54,30 +58,8 @@ export interface RecentActivityDeps {
 	includeInternal?: boolean;
 	/** Search every validated v2 workspace scope below the session root (default false). */
 	allWorkspaces?: boolean;
-	/** Injection seam for tests. */
+	/** Injection seam retained for callers that provide independently read metadata. */
 	readInitialLines?: (file: string, maxLines: number) => string[];
-}
-
-function readCandidateInitialLines(
-	candidate: LogicalSessionCandidate,
-	readInitialLines: ((file: string, maxLines: number) => string[]) | undefined,
-): string[] {
-	if (readInitialLines) return readInitialLines(candidate.path, 8);
-	if (candidate.provenance !== "legacy") {
-		const security = verifyOwnerOnlyPathSecurity(candidate.path, "file");
-		if (!security.ok) throw new Error(`Managed session metadata path is unsafe: ${security.code}`);
-	}
-	const snapshot = new FileSessionStorage().readSnapshotSync(candidate.path);
-	const digest = createHash("sha256").update(snapshot.bytes).digest("hex");
-	if (
-		snapshot.stat.dev !== candidate.identity.dev ||
-		snapshot.stat.ino !== candidate.identity.ino ||
-		snapshot.stat.size !== candidate.identity.size ||
-		snapshot.stat.mtimeNs !== candidate.identity.mtimeNs ||
-		digest !== candidate.identity.sha256
-	)
-		throw new Error("Managed session changed after ownership was verified.");
-	return Buffer.from(snapshot.bytes).toString("utf8").split("\n").slice(0, 8);
 }
 
 /** Best-effort header metadata extraction from a session file's first line. */
@@ -109,6 +91,21 @@ function isInternalSession(lines: readonly string[]): boolean {
 	return false;
 }
 
+function sameInitialLines(left: readonly string[], right: readonly string[]): boolean {
+	return left.length === right.length && left.every((line, index) => line === right[index]);
+}
+
+function candidatePathIdentityKey(candidate: ManagedCandidate): string {
+	return [
+		path.resolve(candidate.path),
+		candidate.identity.dev.toString(),
+		candidate.identity.ino.toString(),
+		candidate.identity.size.toString(),
+		candidate.identity.mtimeNs.toString(),
+		candidate.identity.sha256,
+	].join("\0");
+}
+
 /** Lists readonly managed candidates, optionally across every validated v2 workspace scope, ranked by history-file mtime. */
 export type ListRecentSessionsResult =
 	| { kind: "complete"; entries: RecentSessionEntry[]; warnings: readonly string[] }
@@ -117,12 +114,12 @@ export type ListRecentSessionsResult =
 async function resolveRecentScopes(
 	deps: RecentActivityDeps,
 ): Promise<
-	| { kind: "complete"; scopes: ManagedSessionScope[]; warnings: string[] }
+	| { kind: "complete"; scopes: ManagedScope[]; warnings: string[] }
 	| { kind: "error"; code: "scope_unavailable"; message: string }
 > {
 	const agentDir = deps.agentDir ?? getAgentDir();
 	const sessionsRoot = deps.sessionsRoot ?? getSessionsDir(agentDir);
-	const current = await resolveManagedSessionScope({
+	const current = resolveManagedScope({
 		cwd: deps.cwd,
 		agentDir,
 		sessionsRoot,
@@ -149,7 +146,7 @@ async function resolveRecentScopes(
 	const seen = new Set(scopes.map(scope => scope.directoryPath));
 
 	const addResolvedScope = async (cwd: string, expectedDirectory?: string): Promise<void> => {
-		const resolved = await resolveManagedSessionScope({
+		const resolved = resolveManagedScope({
 			cwd,
 			agentDir,
 			sessionsRoot,
@@ -194,8 +191,9 @@ async function resolveRecentScopes(
 				for (const file of files) {
 					if (!file.isFile() || file.isSymbolicLink() || !file.name.endsWith(".jsonl")) continue;
 					try {
-						const snapshot = new FileSessionStorage().readSnapshotSync(
+						const snapshot = captureManagedFilePrefixNoFollow(
 							path.join(sessionsRoot, directory.name, file.name),
+							64 * 1024,
 						);
 						const newline = snapshot.bytes.indexOf(0x0a);
 						if (newline < 0) continue;
@@ -222,18 +220,31 @@ async function resolveRecentScopes(
 export async function listRecentSessions(deps: RecentActivityDeps): Promise<ListRecentSessionsResult> {
 	const limit = deps.limit ?? 20;
 	const includeInternal = deps.includeInternal ?? true;
-	const readInitialLines = deps.readInitialLines;
 	const breadcrumbs = new Set((deps.breadcrumbPaths ?? []).map(candidate => path.resolve(candidate)));
 	const resolved = await resolveRecentScopes(deps);
 	if (resolved.kind === "error") return resolved;
 	const warnings = [...resolved.warnings];
-	const candidates: LogicalSessionCandidate[] = [];
+	const candidates: Array<{
+		scope: ManagedScope;
+		candidate: ManagedCandidate;
+		authority: ReadonlyScopeAuthority;
+	}> = [];
 	for (const scope of resolved.scopes) {
-		const listed = await listManagedSessionCandidates({ scope });
+		let authority: ReadonlyScopeAuthority;
+		try {
+			authority = readonlyAuthorityForManagedScope(scope);
+		} catch {
+			return {
+				kind: "error",
+				code: "managed_scan_failed",
+				message: "Managed session scope could not be inspected.",
+			};
+		}
+		const listed = listManagedCandidates(scope, { preflightOnly: true });
 		if (listed.kind !== "complete") {
 			return { kind: "error", code: "managed_scan_failed", message: listed.message };
 		}
-		candidates.push(...listed.owned);
+		candidates.push(...listed.owned.map(candidate => ({ scope, candidate, authority })));
 		warnings.push(
 			...listed.invalid
 				.filter(
@@ -244,29 +255,68 @@ export async function listRecentSessions(deps: RecentActivityDeps): Promise<List
 		);
 	}
 
+	const MAX_SOURCE_CHANGED_CAPTURE_ATTEMPTS = 2;
+	const captured: Array<{
+		scope: ManagedScope;
+		inspection: Extract<ManagedRecentCandidateInspection, { kind: "owned" }>;
+	}> = [];
+	for (const { scope, candidate, authority } of candidates) {
+		let inspected: ManagedRecentCandidateInspection | undefined;
+		for (let attempt = 0; attempt < MAX_SOURCE_CHANGED_CAPTURE_ATTEMPTS; attempt++) {
+			inspected = inspectManagedCandidateForRecent(scope, candidate, authority);
+			if (inspected.kind !== "candidate_omitted" || inspected.reason !== "source_changed") break;
+		}
+		if (!inspected || inspected.kind === "candidate_omitted") {
+			warnings.push("Ignored managed session candidate that changed during inspection.");
+			continue;
+		}
+		if (inspected.kind === "scope_invalid") {
+			return { kind: "error", code: "managed_scan_failed", message: inspected.message };
+		}
+		captured.push({ scope, inspection: inspected });
+	}
+	const activeByScope = new Map<ManagedScope, ManagedCandidate[]>();
+	for (const { scope, inspection } of captured) {
+		const candidatesForScope = activeByScope.get(scope) ?? [];
+		candidatesForScope.push(inspection.candidate);
+		activeByScope.set(scope, candidatesForScope);
+	}
+	const projectedByScope = new Map<ManagedScope, Map<string, ManagedCandidate>>();
+	for (const scope of resolved.scopes) {
+		const accepted = new Map<string, ManagedCandidate>();
+		for (const candidate of projectManagedCandidates(scope, activeByScope.get(scope) ?? []))
+			accepted.set(candidatePathIdentityKey(candidate), candidate);
+		projectedByScope.set(scope, accepted);
+	}
 	const entries: RecentSessionEntry[] = [];
-	for (const candidate of candidates) {
-		let initialLines: string[];
-		try {
-			initialLines = readCandidateInitialLines(candidate, readInitialLines);
-		} catch (error) {
-			return {
-				kind: "error",
-				code: "managed_scan_failed",
-				message: `Could not read managed session metadata: ${error instanceof Error ? error.message : String(error)}`,
-			};
+	for (const { scope, inspection } of captured) {
+		const active = projectedByScope.get(scope)?.get(candidatePathIdentityKey(inspection.candidate));
+		if (!active) continue;
+		let initialLines = inspection.initialLines;
+		if (deps.readInitialLines) {
+			try {
+				const callbackLines = deps.readInitialLines(inspection.candidate.path, 8);
+				if (!sameInitialLines(callbackLines, inspection.initialLines)) {
+					warnings.push("Ignored managed session candidate with mismatched injected metadata.");
+					continue;
+				}
+				initialLines = callbackLines;
+			} catch {
+				warnings.push("Ignored managed session candidate with unreadable injected metadata.");
+				continue;
+			}
 		}
 		const meta = headerMeta(initialLines[0]);
 		const internal = isInternalSession(initialLines);
 		if (internal && !includeInternal) continue;
 		entries.push({
-			sessionId: candidate.sessionId,
-			path: candidate.cwd,
+			sessionId: active.sessionId,
+			path: active.cwd,
 			branch: meta.branch,
 			title: meta.title,
-			sessionStateFile: candidate.path,
-			mtimeMs: candidate.identity.mtimeMs,
-			currentTerminal: breadcrumbs.has(path.resolve(candidate.path)) || undefined,
+			sessionStateFile: active.path,
+			mtimeMs: active.identity.mtimeMs,
+			currentTerminal: breadcrumbs.has(path.resolve(active.path)) || undefined,
 			internal: internal || undefined,
 		});
 	}

@@ -1846,7 +1846,10 @@ pub(crate) mod platform {
 		}
 		#[cfg(target_os = "macos")]
 		match has_extended_acl(&authority.file) {
-			Ok(false) => NativeOwnerOnlySecurityResult::success(),
+			Ok(false) => match revalidate_authority(authority) {
+				Ok(_) => NativeOwnerOnlySecurityResult::success(),
+				Err(result) => result,
+			},
 			Ok(true) => NativeOwnerOnlySecurityResult::failure("acl_verify_failed"),
 			Err(result) => result,
 		}
@@ -2046,7 +2049,7 @@ pub(crate) mod platform {
 		verify_authority(&authority, kind)
 	}
 
-	#[cfg(target_os = "linux")]
+	#[cfg(any(target_os = "linux", target_os = "macos"))]
 	#[allow(clippy::result_large_err, reason = "preserves structured native security evidence")]
 	fn checked_caller_file(
 		path: &Path,
@@ -2102,7 +2105,7 @@ pub(crate) mod platform {
 		NativeOwnerOnlySecurityResult::failure("acl_unavailable")
 	}
 
-	#[cfg(target_os = "linux")]
+	#[cfg(any(target_os = "linux", target_os = "macos"))]
 	pub(super) fn apply_owner_only_fd_security(
 		path: &Path,
 		kind: &str,
@@ -2114,7 +2117,7 @@ pub(crate) mod platform {
 		}
 	}
 
-	#[cfg(not(target_os = "linux"))]
+	#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 	pub(super) fn apply_owner_only_fd_security(
 		_: &Path,
 		_: &str,
@@ -2123,7 +2126,7 @@ pub(crate) mod platform {
 		NativeOwnerOnlySecurityResult::failure("acl_unavailable")
 	}
 
-	#[cfg(target_os = "linux")]
+	#[cfg(any(target_os = "linux", target_os = "macos"))]
 	pub(super) fn verify_owner_only_fd_security(
 		path: &Path,
 		kind: &str,
@@ -2135,7 +2138,7 @@ pub(crate) mod platform {
 		}
 	}
 
-	#[cfg(not(target_os = "linux"))]
+	#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 	pub(super) fn verify_owner_only_fd_security(
 		_: &Path,
 		_: &str,
@@ -3544,8 +3547,8 @@ mod platform {
 	use sha2::{Digest, Sha256};
 	use windows_sys::Win32::{
 		Foundation::{
-			CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, GENERIC_ALL, GetLastError,
-			HANDLE, INVALID_HANDLE_VALUE, LocalFree,
+			CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_FILE_NOT_FOUND,
+			ERROR_PATH_NOT_FOUND, GENERIC_ALL, GetLastError, HANDLE, INVALID_HANDLE_VALUE, LocalFree,
 		},
 		Security::{
 			ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_REVISION, ACL_SIZE_INFORMATION,
@@ -4077,6 +4080,24 @@ mod platform {
 			&& left_information.dwVolumeSerialNumber == right_information.dwVolumeSerialNumber
 			&& left_information.nFileIndexHigh == right_information.nFileIndexHigh
 			&& left_information.nFileIndexLow == right_information.nFileIndexLow
+	}
+	fn revalidate_retained_path_authority(
+		path: &Path,
+		kind: &str,
+		retained: &HeldExact,
+	) -> Result<(), NativeOwnerOnlySecurityResult> {
+		let current = open_exact(path, kind, READ_CONTROL)?;
+		if retained.ancestors.len() != current.ancestors.len()
+			|| !handles_same_object(retained.target, current.target)
+			|| !retained
+				.ancestors
+				.iter()
+				.zip(&current.ancestors)
+				.all(|(left, right)| handles_same_object(*left, *right))
+		{
+			return Err(NativeOwnerOnlySecurityResult::failure("identity_mismatch"));
+		}
+		Ok(())
 	}
 
 	fn rename_handle_no_replace(
@@ -4922,6 +4943,54 @@ mod platform {
 		}
 	}
 
+	struct DuplicatedCallerHandle(HANDLE);
+
+	impl Drop for DuplicatedCallerHandle {
+		fn drop(&mut self) {
+			// SAFETY: this wrapper owns exactly the handle returned by DuplicateHandle.
+			unsafe { CloseHandle(self.0) };
+		}
+	}
+
+	#[link(name = "msvcrt")]
+	// SAFETY: this declaration matches the MSVC CRT ABI.
+	unsafe extern "C" {
+		fn _get_osfhandle(file_descriptor: i32) -> isize;
+	}
+
+	fn duplicate_caller_handle(
+		caller_fd: i32,
+	) -> Result<DuplicatedCallerHandle, NativeOwnerOnlySecurityResult> {
+		// SAFETY: the CRT only inspects the supplied file descriptor. An invalid
+		// descriptor is reported by the documented -1 sentinel and is never closed or
+		// mutated here.
+		let source = unsafe { _get_osfhandle(caller_fd) };
+		if source == -1 {
+			return Err(NativeOwnerOnlySecurityResult::failure("io_error"));
+		}
+		// SAFETY: GetCurrentProcess returns the current-process pseudo-handle.
+		let process = unsafe { GetCurrentProcess() };
+		let mut duplicate = null_mut();
+		// SAFETY: `source` is a CRT-owned OS handle, `process` is valid, and
+		// `duplicate` is a writable out pointer. DUPLICATE_SAME_ACCESS preserves the
+		// caller handle's actual authority without closing or modifying it.
+		if unsafe {
+			DuplicateHandle(
+				process,
+				source as HANDLE,
+				process,
+				&mut duplicate,
+				0,
+				0,
+				DUPLICATE_SAME_ACCESS,
+			)
+		} == 0 || duplicate.is_null()
+		{
+			return Err(NativeOwnerOnlySecurityResult::failure("io_error"));
+		}
+		Ok(DuplicatedCallerHandle(duplicate))
+	}
+
 	pub(super) fn apply_owner_only_fd_security(
 		_: &Path,
 		_: &str,
@@ -4931,11 +5000,32 @@ mod platform {
 	}
 
 	pub(super) fn verify_owner_only_fd_security(
-		_: &Path,
-		_: &str,
-		_: i32,
+		path: &Path,
+		kind: &str,
+		caller_fd: i32,
 	) -> NativeOwnerOnlySecurityResult {
-		NativeOwnerOnlySecurityResult::failure("acl_unavailable")
+		let retained = match open_exact(path, kind, READ_CONTROL) {
+			Ok(handle) => handle,
+			Err(result) => return result,
+		};
+		let caller = match duplicate_caller_handle(caller_fd) {
+			Ok(handle) => handle,
+			Err(result) => return result,
+		};
+		if let Err(result) = revalidate_retained_path_authority(path, kind, &retained) {
+			return result;
+		}
+		if !handles_same_object(retained.target, caller.0) {
+			return NativeOwnerOnlySecurityResult::failure("identity_mismatch");
+		}
+		let verified = verify_owner_only_handle(caller.0, kind);
+		if let Err(result) = revalidate_retained_path_authority(path, kind, &retained) {
+			return result;
+		}
+		if !handles_same_object(retained.target, caller.0) {
+			return NativeOwnerOnlySecurityResult::failure("identity_mismatch");
+		}
+		verified
 	}
 	#[cfg(test)]
 	mod tests {

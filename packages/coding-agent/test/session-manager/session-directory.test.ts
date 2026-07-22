@@ -6,9 +6,12 @@ import * as path from "node:path";
 import * as native from "@gajae-code/natives";
 import {
 	deleteManagedSessionCandidate,
+	inspectManagedCandidateForRecent,
 	listManagedCandidates,
+	MANAGED_SESSION_BINDING_FILE,
 	openManagedCandidateForWrite,
 	prepareManagedSessionScopeForWrite,
+	readonlyAuthorityForManagedScope,
 	resolveManagedScope,
 } from "../../src/session/internal/managed-session-scope";
 import { publishManagedFileNoReplace } from "../../src/session/internal/managed-session-storage";
@@ -1125,5 +1128,213 @@ describe("managed session write protocol", () => {
 		if (restarted.kind !== "resolved") throw new Error(restarted.message);
 		expect((await prepareManagedSessionScopeForWrite(restarted.scope)).kind).toBe("resolved");
 		expect(listManagedCandidates(restarted.scope)).toMatchObject({ kind: "complete", owned: [] });
+	});
+});
+describe("managed readonly inspector authority", () => {
+	it("projects the same v2 and legacy candidates as listing, including legacy 0644", async () => {
+		const { cwd, sessionsRoot, scope } = await fixture();
+		const legacy = legacyDirectory(sessionsRoot, cwd);
+		await fs.mkdir(legacy, { recursive: true });
+		const legacyPath = path.join(legacy, "legacy.jsonl");
+		await fs.writeFile(legacyPath, transcript("legacy", cwd), { mode: 0o644 });
+		await fs.chmod(legacyPath, 0o644);
+		expect((await prepareManagedSessionScopeForWrite(scope)).kind).toBe("resolved");
+		const listing = listManagedCandidates(scope);
+		expect(listing.kind).toBe("complete");
+		if (listing.kind !== "complete") return;
+
+		const authority = readonlyAuthorityForManagedScope(scope);
+		const inspected = listing.owned.map(candidate => inspectManagedCandidateForRecent(scope, candidate, authority));
+		expect(inspected.map(result => result.kind)).toEqual(listing.owned.map(() => "owned"));
+		expect(
+			inspected
+				.filter(result => result.kind === "owned")
+				.map(result => result.candidate.sessionId)
+				.sort(),
+		).toEqual(listing.owned.map(candidate => candidate.sessionId).sort());
+	});
+	it("adopts a coherent same-inode rewrite only with its revalidated header metadata", async () => {
+		const { cwd, scope } = await fixture();
+		expect((await prepareManagedSessionScopeForWrite(scope)).kind).toBe("resolved");
+		const transcriptPath = path.join(scope.directoryPath, "candidate.jsonl");
+		await fs.writeFile(transcriptPath, transcript("before", cwd));
+		expect(native.applyOwnerOnlyPathSecurity(transcriptPath, "file")).toMatchObject({ ok: true });
+		const listing = listManagedCandidates(scope);
+		if (listing.kind !== "complete") throw new Error(listing.message);
+		const candidate = listing.owned.find(item => item.path === transcriptPath);
+		if (!candidate) throw new Error("candidate missing");
+		await fs.writeFile(transcriptPath, transcript("after", cwd));
+		expect(inspectManagedCandidateForRecent(scope, candidate, readonlyAuthorityForManagedScope(scope))).toMatchObject(
+			{
+				kind: "owned",
+				candidate: { sessionId: "after", cwd, provenance: "v2" },
+			},
+		);
+	});
+	it("omits invalid and foreign same-inode rewrites", async () => {
+		const { cwd, scope } = await fixture();
+		expect((await prepareManagedSessionScopeForWrite(scope)).kind).toBe("resolved");
+		const invalidPath = path.join(scope.directoryPath, "invalid.jsonl");
+		const foreignPath = path.join(scope.directoryPath, "foreign.jsonl");
+		const foreignCwd = path.join(path.dirname(cwd), "foreign-workspace");
+		await fs.mkdir(foreignCwd);
+		await Promise.all([
+			fs.writeFile(invalidPath, transcript("invalid-before", cwd)),
+			fs.writeFile(foreignPath, transcript("foreign-before", cwd)),
+		]);
+		for (const pathname of [invalidPath, foreignPath])
+			expect(native.applyOwnerOnlyPathSecurity(pathname, "file")).toMatchObject({ ok: true });
+		const listing = listManagedCandidates(scope);
+		if (listing.kind !== "complete") throw new Error(listing.message);
+		const invalid = listing.owned.find(item => item.path === invalidPath);
+		const foreign = listing.owned.find(item => item.path === foreignPath);
+		if (!invalid || !foreign) throw new Error("candidates missing");
+		await Promise.all([
+			fs.writeFile(invalidPath, "not-json\n"),
+			fs.writeFile(foreignPath, transcript("foreign-after", foreignCwd)),
+		]);
+		const authority = readonlyAuthorityForManagedScope(scope);
+		expect(inspectManagedCandidateForRecent(scope, invalid, authority)).toMatchObject({ kind: "candidate_omitted" });
+		expect(inspectManagedCandidateForRecent(scope, foreign, authority)).toMatchObject({ kind: "candidate_omitted" });
+	});
+
+	it("keeps a never-created v2 directory/binding valid for a legacy-only scope", async () => {
+		const { cwd, sessionsRoot, scope } = await fixture();
+		const legacy = legacyDirectory(sessionsRoot, cwd);
+		await fs.mkdir(legacy, { recursive: true });
+		await fs.chmod(sessionsRoot, 0o755);
+		await fs.writeFile(path.join(legacy, "legacy-only.jsonl"), transcript("legacy-only", cwd));
+		const listing = listManagedCandidates(scope);
+		expect(listing).toMatchObject({ kind: "complete" });
+		if (listing.kind !== "complete") return;
+		const candidate = listing.owned[0];
+		expect(candidate?.provenance).toBe("legacy");
+		expect(
+			inspectManagedCandidateForRecent(scope, candidate!, readonlyAuthorityForManagedScope(scope)),
+		).toMatchObject({
+			kind: "owned",
+			candidate: { sessionId: "legacy-only" },
+		});
+	});
+	it("invalidates readonly authority when the root verifier evidence drifts", async () => {
+		const { cwd, sessionsRoot, scope } = await fixture();
+		const legacy = legacyDirectory(sessionsRoot, cwd);
+		await fs.mkdir(legacy, { recursive: true });
+		await fs.writeFile(path.join(legacy, "legacy-only.jsonl"), transcript("legacy-only", cwd));
+		expect(native.applyOwnerOnlyPathSecurity(sessionsRoot, "directory")).toMatchObject({ ok: true });
+		const listing = listManagedCandidates(scope);
+		if (listing.kind !== "complete") throw new Error(listing.message);
+		const candidate = listing.owned[0];
+		if (!candidate) throw new Error("legacy candidate missing");
+		const authority = readonlyAuthorityForManagedScope(scope);
+		const verify = native.verifyOwnerOnlyFdSecurity;
+		const verifier = vi.spyOn(native, "verifyOwnerOnlyFdSecurity").mockImplementation((pathname, kind, fd) => {
+			return pathname === sessionsRoot ? { ok: false, code: "mode_mismatch" } : verify(pathname, kind, fd);
+		});
+		try {
+			expect(inspectManagedCandidateForRecent(scope, candidate, authority)).toMatchObject({ kind: "scope_invalid" });
+		} finally {
+			verifier.mockRestore();
+		}
+	});
+
+	it("fails closed when binding authority capture interleaves a replacement or rewrite", async () => {
+		const { cwd, scope } = await fixture();
+		expect((await prepareManagedSessionScopeForWrite(scope)).kind).toBe("resolved");
+		const transcriptPath = path.join(scope.directoryPath, "candidate.jsonl");
+		await fs.writeFile(transcriptPath, transcript("candidate", cwd));
+		expect(native.applyOwnerOnlyPathSecurity(transcriptPath, "file")).toMatchObject({ ok: true });
+		const listing = listManagedCandidates(scope);
+		if (listing.kind !== "complete") throw new Error(listing.message);
+		const candidate = listing.owned.find(item => item.path === transcriptPath);
+		if (!candidate) throw new Error("candidate missing");
+		const bindingPath = path.join(scope.directoryPath, MANAGED_SESSION_BINDING_FILE);
+
+		for (const interleave of ["replacement", "rewrite"] as const) {
+			const authority = readonlyAuthorityForManagedScope(scope);
+			const binding = syncFs.readFileSync(bindingPath);
+			const stagedBinding = `${bindingPath}.${interleave}`;
+			if (interleave === "replacement") syncFs.writeFileSync(stagedBinding, binding);
+			const rewritten = Buffer.from(binding);
+			rewritten[rewritten.byteLength - 1] = 0x20;
+			const readSync = syncFs.readSync;
+			let interleaved = false;
+			const captureReads = vi
+				.spyOn(syncFs, "readSync")
+				.mockImplementation(
+					(
+						descriptor: number,
+						buffer: NodeJS.ArrayBufferView,
+						offsetOrOptions?: number | syncFs.ReadOptions,
+						length?: number,
+						position?: syncFs.ReadPosition | null,
+					): number => {
+						if (!interleaved && syncFs.readlinkSync(`/proc/self/fd/${descriptor}`) === bindingPath) {
+							interleaved = true;
+							if (interleave === "replacement") syncFs.renameSync(stagedBinding, bindingPath);
+							else syncFs.writeFileSync(bindingPath, rewritten);
+						}
+						return typeof offsetOrOptions === "number"
+							? readSync(
+									descriptor,
+									buffer,
+									offsetOrOptions,
+									length ?? buffer.byteLength - offsetOrOptions,
+									position ?? null,
+								)
+							: readSync(descriptor, buffer, offsetOrOptions);
+					},
+				);
+			try {
+				expect(inspectManagedCandidateForRecent(scope, candidate, authority)).toMatchObject({
+					kind: "scope_invalid",
+				});
+			} finally {
+				captureReads.mockRestore();
+			}
+			expect(interleaved).toBe(true);
+		}
+	});
+	it("fails closed when captured root, directory, or binding authority changes", async () => {
+		const { cwd, sessionsRoot, scope } = await fixture();
+		expect((await prepareManagedSessionScopeForWrite(scope)).kind).toBe("resolved");
+		const transcriptPath = path.join(scope.directoryPath, "candidate.jsonl");
+		await fs.writeFile(transcriptPath, transcript("candidate", cwd));
+		expect(native.applyOwnerOnlyPathSecurity(transcriptPath, "file")).toMatchObject({ ok: true });
+		expect(native.verifyOwnerOnlyPathSecurity(transcriptPath, "file")).toMatchObject({ ok: true });
+		const listing = listManagedCandidates(scope);
+		if (listing.kind !== "complete") throw new Error(listing.message);
+		const candidate = listing.owned.find(item => item.path === transcriptPath);
+		if (!candidate) throw new Error("candidate missing");
+
+		for (const target of [
+			sessionsRoot,
+			scope.directoryPath,
+			path.join(scope.directoryPath, MANAGED_SESSION_BINDING_FILE),
+		]) {
+			const authority = readonlyAuthorityForManagedScope(scope);
+			const moved = `${target}.moved`;
+			await fs.rename(target, moved);
+			if (target.endsWith(".json")) await fs.writeFile(target, "{}");
+			else await fs.mkdir(target, { recursive: true });
+			expect(inspectManagedCandidateForRecent(scope, candidate, authority)).toMatchObject({ kind: "scope_invalid" });
+			await fs.rm(target, { recursive: true, force: true });
+			await fs.rename(moved, target);
+		}
+	});
+	it("fails closed when the workspace path is replaced during readonly inspection", async () => {
+		const { cwd, scope } = await fixture();
+		expect((await prepareManagedSessionScopeForWrite(scope)).kind).toBe("resolved");
+		const transcriptPath = path.join(scope.directoryPath, "candidate.jsonl");
+		await fs.writeFile(transcriptPath, transcript("candidate", cwd));
+		expect(native.applyOwnerOnlyPathSecurity(transcriptPath, "file")).toMatchObject({ ok: true });
+		const listing = listManagedCandidates(scope);
+		if (listing.kind !== "complete") throw new Error(listing.message);
+		const candidate = listing.owned.find(item => item.path === transcriptPath);
+		if (!candidate) throw new Error("candidate missing");
+		const authority = readonlyAuthorityForManagedScope(scope);
+		await fs.rename(cwd, `${cwd}.replaced`);
+		await fs.mkdir(cwd);
+		expect(inspectManagedCandidateForRecent(scope, candidate, authority)).toMatchObject({ kind: "scope_invalid" });
 	});
 });

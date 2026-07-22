@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Owner-only caller-fd verification now binds macOS descriptors and Windows CRT-backed handles to retained pathname authority across ACL inspection, rejecting replacement and reparse races without closing the caller's descriptor.
+
 ## [0.11.5] - 2026-07-20
 ### Added
 - `Process.signalRoot` exposes stable root-only process signaling, and identity-bound exact unlink reports stale quarantines, live successors, and retained internal exchange-placeholder cleanup paths as distinct recovery evidence.

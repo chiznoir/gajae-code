@@ -6,6 +6,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as native from "@gajae-code/natives";
 import {
+	captureManagedFileCoherentNoFollow,
 	ManagedSessionDescendantStore,
 	managedDirectoryRoot,
 	publishManagedFileNoReplace,
@@ -211,6 +212,136 @@ describe.skipIf(process.platform !== "linux")("managed native security result va
 		expect(() => validateNativeSecurityResult({ ...validApply, unexpected: true }, "apply", "file")).toThrow(
 			"Unexpected Linux security success fields",
 		);
+	});
+});
+describe("coherent managed transcript capture", () => {
+	let root: string;
+
+	beforeEach(() => {
+		root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-coherent-capture-"));
+	});
+
+	afterEach(() => {
+		vi.restoreAllMocks();
+		fs.rmSync(root, { recursive: true, force: true });
+	});
+
+	function transcript(name: string, mode = 0o600): string {
+		const pathname = path.join(root, `${name}.jsonl`);
+		fs.writeFileSync(pathname, `{"type":"session","id":"${name}"}\n{"type":"message"}\n`, { mode });
+		return pathname;
+	}
+
+	it("returns bytes, digest, initial lines, and precise metrics from one legacy descriptor capture", () => {
+		const pathname = transcript("legacy", 0o644);
+		fs.chmodSync(pathname, 0o644);
+		const verifier = vi.spyOn(native, "verifyOwnerOnlyFdSecurity");
+		const observed: Array<{ sampledSize: number; bytesRead: number; peakBuffer: number }> = [];
+		const capture = captureManagedFileCoherentNoFollow(pathname, "legacy", 1, metrics => observed.push(metrics));
+		expect(capture.bytes.toString("utf8")).toContain('"id":"legacy"');
+		expect(capture.initialLines).toEqual(['{"type":"session","id":"legacy"}']);
+		expect(capture.identity.sha256).toBe(createHash("sha256").update(capture.bytes).digest("hex"));
+		expect(capture.metrics).toEqual({
+			sampledSize: capture.bytes.byteLength,
+			bytesRead: capture.bytes.byteLength,
+			peakBuffer: capture.bytes.byteLength,
+		});
+		expect(observed).toEqual([capture.metrics]);
+		expect(verifier).not.toHaveBeenCalled();
+	});
+
+	it("does not return v2 bytes when descriptor-bound owner verification fails", () => {
+		const pathname = transcript("v2");
+		const verifier = vi
+			.spyOn(native, "verifyOwnerOnlyFdSecurity")
+			.mockReturnValue({ ok: false, code: "mode_mismatch" });
+		expect(() => captureManagedFileCoherentNoFollow(pathname, "v2")).toThrow("unsafe_capture");
+		expect(verifier).toHaveBeenCalledWith(pathname, "file", expect.any(Number));
+	});
+
+	it.skipIf(process.platform === "win32")(
+		"rejects hard links and pathname replacement without reading a trusted snapshot",
+		() => {
+			const pathname = transcript("linked");
+			const alias = path.join(root, "alias.jsonl");
+			fs.linkSync(pathname, alias);
+			expect(() => captureManagedFileCoherentNoFollow(pathname, "legacy")).toThrow("unsafe_capture");
+
+			fs.unlinkSync(alias);
+			const replacement = transcript("replacement");
+			const read = fs.readSync;
+			const spy = vi.spyOn(fs, "readSync").mockImplementation(((
+				fd: number,
+				buffer: NodeJS.ArrayBufferView,
+				offset: number,
+				length: number,
+				position: number | null,
+			) => {
+				const count = read(fd, buffer, offset, length, position);
+				fs.renameSync(replacement, pathname);
+				return count;
+			}) as typeof fs.readSync);
+			expect(() => captureManagedFileCoherentNoFollow(pathname, "legacy")).toThrow("replacement");
+			spy.mockRestore();
+		},
+	);
+
+	it("detects same-inode mutation after reading and accounts only captured attempt bytes", () => {
+		const pathname = transcript("mutated");
+		const expectedBytes = fs.statSync(pathname).size;
+		const read = fs.readSync;
+		let bytesRead = 0;
+		const spy = vi.spyOn(fs, "readSync").mockImplementation(((
+			fd: number,
+			buffer: NodeJS.ArrayBufferView,
+			offset: number,
+			length: number,
+			position: number | null,
+		) => {
+			const count = read(fd, buffer, offset, length, position);
+			bytesRead += count;
+			fs.appendFileSync(pathname, '{"type":"message","race":true}\n');
+			return count;
+		}) as typeof fs.readSync);
+		expect(() => captureManagedFileCoherentNoFollow(pathname, "legacy")).toThrow("source_changed");
+		spy.mockRestore();
+		expect(bytesRead).toBe(expectedBytes);
+	});
+
+	it("accounts two bounded capture attempts as S1 plus S2 with peak max size", () => {
+		const pathname = transcript("retry-metrics");
+		const observed: Array<{ sampledSize: number; bytesRead: number; peakBuffer: number }> = [];
+		const read = fs.readSync;
+		let mutate = true;
+		const spy = vi.spyOn(fs, "readSync").mockImplementation(((
+			fd: number,
+			buffer: NodeJS.ArrayBufferView,
+			offset: number,
+			length: number,
+			position: number | null,
+		) => {
+			const count = read(fd, buffer, offset, length, position);
+			if (mutate) {
+				mutate = false;
+				fs.appendFileSync(pathname, '{"type":"message","race":true}\n');
+			}
+			return count;
+		}) as typeof fs.readSync);
+		expect(() =>
+			captureManagedFileCoherentNoFollow(pathname, "legacy", 8, metrics => observed.push(metrics)),
+		).toThrow("source_changed");
+		spy.mockRestore();
+		const accepted = captureManagedFileCoherentNoFollow(pathname, "legacy", 8, metrics => observed.push(metrics));
+
+		expect(observed).toHaveLength(2);
+		expect(observed.every(metrics => metrics.bytesRead === metrics.sampledSize)).toBe(true);
+		expect(observed.reduce((total, metrics) => total + metrics.bytesRead, 0)).toBe(
+			observed[0]!.sampledSize + observed[1]!.sampledSize,
+		);
+		expect(Math.max(...observed.map(metrics => metrics.peakBuffer))).toBe(
+			Math.max(observed[0]!.sampledSize, observed[1]!.sampledSize),
+		);
+		expect(accepted.metrics).toEqual(observed[1]!);
 	});
 });
 
