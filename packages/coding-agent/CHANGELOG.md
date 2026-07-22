@@ -44,6 +44,7 @@
 - Secret obfuscation now uses authenticated process-local placeholders that remain stable within a running process and opaque after restart.
 - Workspace-wide LSP diagnostics now fail closed instead of launching build or typecheck subprocesses outside execution-tool authorization; concrete-file and glob diagnostics remain available.
 - Clean, side-effect-free canonical provider stream first-event and next-event watchdog failures now retry on bare single-model legacy sessions; explicit legacy disable, managed fallback, and fail-closed structured, non-watchdog, or unsafe attempts are unchanged.
+- Remote MCP HTTP and SSE responses now enforce finite content and message budgets before parsing or dispatch.
 - Added fail-closed managed tmux owner SIGABRT recovery: exact-child supervisor receipts and pre-CLI admission now bind replacement ownership, strict durable Ultragoal/transcript evidence reconciles terminal child yields over stale nonterminal runtime state, recovery hydration remains write-free until an ownership fence, and hostile identity, corruption, concurrency, and path boundaries preserve dirty product files (#2681).
 - Restored non-root startup on Synology and other Linux container filesystems that definitively report POSIX ACL storage unsupported for managed session paths; explicit `--session-dir` semantics and all owner, mode, type, symlink, identity, and scope-binding checks remain unchanged and fail closed (#2687).
 - Preserved access to legal SQLite table names beginning with `sqlite` but not reserved `sqlite_`.
