@@ -470,7 +470,7 @@ export declare class Shell {
  * `packages/natives/native/index.js` (which derives the name from
  * `package.json#version`).
  */
-export declare function __piNativesV0_11_6(): void
+export declare function __piNativesV0_11_7(): void
 
 /**
  * Apply conservative pre-execution rewrites to a bash command.
@@ -1960,9 +1960,10 @@ export interface RecoveryFsResult {
 export declare function renameNoReplacePath(sourcePath: string, destinationPath: string): NativeExactUnlinkResult
 
 /**
- * Repair the owner-only ACL for an existing path only when its retained
- * no-follow handle still identifies the expected object. The expected
- * identity is checked before any ACL mutation and again after the repair.
+ * Repair an owner-only ACL on a retained expected path.
+ *
+ * Its no-follow handle must still identify the expected object before repair
+ * and again after final ACL verification.
  */
 export declare function repairOwnerOnlyPathSecurityExpected(path: string, kind: "directory" | "file", expectedDev: bigint, expectedIno: bigint): NativeOwnerOnlySecurityResult
 
@@ -2195,8 +2196,8 @@ export declare function verifyOwnerOnlyFdSecurity(path: string, kind: "directory
 export declare function verifyOwnerOnlyPathSecurity(path: string, kind: "directory" | "file"): NativeOwnerOnlySecurityResult
 
 /**
- * Verify owner-only security for the exact expected target using a no-follow
- * handle. The target identity is checked before and after verification.
+ * Verify owner-only ACL security without mutation only when the retained
+ * no-follow handle identifies the expected object before and after inspection.
  */
 export declare function verifyOwnerOnlyPathSecurityExpected(path: string, kind: "directory" | "file", expectedDev: bigint, expectedIno: bigint): NativeOwnerOnlySecurityResult
 

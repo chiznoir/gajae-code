@@ -29,7 +29,7 @@ export const RecoveryFsRoot = nativeBindings.RecoveryFsRoot;
 export const Shell = nativeBindings.Shell;
 
 // functions
-export const __piNativesV0_11_6 = nativeBindings.__piNativesV0_11_6;
+export const __piNativesV0_11_7 = nativeBindings.__piNativesV0_11_7;
 export const applyBashFixups = nativeBindings.applyBashFixups;
 export const applyOwnerOnlyFdSecurity = nativeBindings.applyOwnerOnlyFdSecurity;
 export const applyOwnerOnlyPathSecurity = nativeBindings.applyOwnerOnlyPathSecurity;
