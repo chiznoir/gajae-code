@@ -240,12 +240,53 @@ describe("LocalProtocolHandler", () => {
 				const resource = await InternalUrlRouter.instance().resolve("local://");
 
 				expect(localRoot).toBe(path.join(os.tmpdir(), "gjc-local", sessionId));
-				expect(resource.sourcePath).toBe(localRoot);
+				expect(resource.sourcePath).toBe(await fs.realpath(localRoot));
 				expect(resource.content).toContain("handoff.json");
 				expect(resource.content).toContain("legacy.json");
 				expect(resource.sourcePath?.startsWith(`${path.resolve(artifactsDir)}${path.sep}`)).toBe(false);
 				await expect(fs.lstat(path.join(artifactsDir, "local"))).rejects.toMatchObject({ code: "ENOENT" });
 				expect((await InternalUrlRouter.instance().resolve("local://legacy.json")).content).toBe('{"legacy":true}');
+			});
+		});
+	});
+
+	it("migrates through a benign ancestor symlink while retaining a canonical migration authority", async () => {
+		if (process.platform === "win32") return;
+		await withTempDir(async tempDir => {
+			const canonicalParent = path.join(tempDir, "canonical");
+			const artifactsDir = path.join(canonicalParent, "artifacts");
+			const aliasedArtifactsDir = path.join(tempDir, "alias", "artifacts");
+			const sessionId = `legacy-ancestor-symlink-${path.basename(tempDir)}`;
+			await fs.mkdir(path.join(artifactsDir, "local"), { recursive: true });
+			await fs.symlink(canonicalParent, path.join(tempDir, "alias"));
+			await Bun.write(path.join(artifactsDir, "local", "legacy.json"), '{"legacy":true}');
+			await withLocalRoot(sessionId, async localRoot => {
+				LocalProtocolHandler.setOverride(localOptions(sessionId, aliasedArtifactsDir));
+				await initializeLocalRoot(LocalProtocolHandler.resolveOptions()!);
+				expect(await fs.readFile(path.join(localRoot, "legacy.json"), "utf8")).toBe('{"legacy":true}');
+				await expect(fs.lstat(path.join(artifactsDir, "local"))).rejects.toMatchObject({ code: "ENOENT" });
+			});
+		});
+	});
+
+	it("fails closed when artifacts/local itself is a symlink during legacy migration", async () => {
+		if (process.platform === "win32") return;
+		await withTempDir(async artifactsDir => {
+			const sessionId = `legacy-root-symlink-${path.basename(artifactsDir)}`;
+			const legacySource = path.join(artifactsDir, "legacy-source");
+			const legacy = path.join(artifactsDir, "local");
+			await fs.mkdir(legacySource, { recursive: true });
+			await Bun.write(path.join(legacySource, "legacy.json"), '{"legacy":true}');
+			await fs.symlink(legacySource, legacy);
+			await withLocalRoot(sessionId, async localRoot => {
+				LocalProtocolHandler.setOverride(localOptions(sessionId, artifactsDir));
+				await expect(InternalUrlRouter.instance().resolve("local://")).rejects.toThrow(
+					"Unsafe legacy local:// migration source",
+				);
+				expect((await fs.lstat(legacy)).isSymbolicLink()).toBe(true);
+				await expect(fs.lstat(path.join(localRoot, ".gjc-local-legacy-migrated-v1"))).rejects.toMatchObject({
+					code: "ENOENT",
+				});
 			});
 		});
 	});

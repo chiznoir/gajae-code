@@ -7793,13 +7793,9 @@ export class TelegramNotificationDaemon {
 	}
 
 	async run(): Promise<void> {
-		// Runtime callers can bypass TypeScript's option type. Do not derive an
-		// ownership identity from absent credentials; lifecycle startup still owns
-		// cleanup of a factory-created server on this fail-closed path.
-		if (!validBotToken(this.opts.botToken)) {
-			await this.startLifecycleControl();
-			return;
-		}
+		// Runtime callers can bypass TypeScript's option type. Without a valid bot
+		// token, there is no authenticated daemon identity or lifecycle authority.
+		if (!validBotToken(this.opts.botToken)) return;
 		this.running = await renewDaemonHeartbeat({
 			settings: this.opts.settings,
 			ownerId: this.opts.ownerId,
@@ -7812,6 +7808,10 @@ export class TelegramNotificationDaemon {
 			pidIncarnation: this.opts.pidIncarnation,
 		});
 		if (!this.running) return;
+		// Owner-only: start lifecycle control immediately after ownership proof,
+		// before timers or pre-poll startup work can invalidate this run.
+		// Best-effort; notification delivery remains available on failure.
+		await this.startLifecycleControl();
 		this.runtime.start();
 		this.startOwnershipHeartbeatTimer();
 		this.startFlushTimer();
@@ -7825,9 +7825,6 @@ export class TelegramNotificationDaemon {
 			await this.loadSeenUpdateIds();
 			await this.replyStore.load();
 			await this.runScan();
-			// Owner-only: start the session-lifecycle control server now that
-			// ownership is confirmed (singleton-safe). Best-effort; degrades.
-			await this.startLifecycleControl();
 			let idleSince = this.runtime.now();
 			while (this.running) {
 				if (await this.controlStopRequested()) break;

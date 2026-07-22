@@ -25,7 +25,7 @@ import * as native from "@gajae-code/natives";
 import { getConfigRootDir, logger } from "@gajae-code/utils";
 import { Settings } from "../src/config/settings";
 import { tokenFingerprint } from "../src/sdk/bus/config";
-import { acquireDaemonOwnership, TelegramNotificationDaemon } from "../src/sdk/bus/telegram-daemon";
+import { acquireDaemonOwnership, daemonPaths, TelegramNotificationDaemon } from "../src/sdk/bus/telegram-daemon";
 import {
 	prepareManagedSessionScopeForWriteSync,
 	resolveManagedScope,
@@ -198,21 +198,28 @@ function immediateTimeout(): typeof setTimeout {
 }
 
 async function startAsOwner(settings: Settings, ownerId: string, botToken: string): Promise<void> {
-	await acquireDaemonOwnership({
+	const acquisition = await acquireDaemonOwnership({
 		settings,
 		tokenFingerprint: tokenFingerprint(botToken),
 		chatId: PAIRED,
 		pid: process.pid,
 		randomId: () => ownerId,
 	});
+	if (!acquisition.acquired) throw new Error(`ownership acquisition failed: ${JSON.stringify(acquisition)}`);
+	const paths = daemonPaths(settings.getAgentDir());
+	const state = JSON.parse(fs.readFileSync(paths.state, "utf8")) as { ownershipPhase: string };
+	state.ownershipPhase = "ready";
+	fs.writeFileSync(paths.state, `${JSON.stringify(state)}\n`, { mode: 0o600 });
+	fs.rmSync(paths.steal, { force: true });
 }
 
 it("passes the daemon-derived audit key through real lifecycle startup without a fallback", async () => {
 	const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-daemon-audit-key-"));
 	const settings = daemonSettings(agentDir);
-	await startAsOwner(settings, "audit-key-owner", "bot-token");
+	await startAsOwner(settings, "audit-key-owner", "123456:secret-token");
 
 	let capturedKey: Uint8Array | undefined;
+	const startupOrder: string[] = [];
 	let registered = 0;
 	const factory: LifecycleControlServerFactory = () =>
 		({
@@ -226,9 +233,14 @@ it("passes the daemon-derived audit key through real lifecycle startup without a
 	const daemon = new TelegramNotificationDaemon({
 		settings,
 		ownerId: "audit-key-owner",
-		botToken: "bot-token",
+		botToken: "123456:secret-token",
 		chatId: PAIRED,
-		botApi: { call: async () => ({ ok: true, result: [] }) } as never,
+		botApi: {
+			call: async (method: string) => {
+				startupOrder.push(`bot:${method}`);
+				return { ok: true, result: [] };
+			},
+		} as never,
 		idleTimeoutMs: 10,
 		now: (() => {
 			let now = 0;
@@ -237,6 +249,7 @@ it("passes the daemon-derived audit key through real lifecycle startup without a
 		setTimeoutImpl: immediateTimeout(),
 		createLifecycleControlServer: factory,
 		createLifecycleOrchestratorDeps: input => {
+			startupOrder.push("lifecycle-deps");
 			capturedKey = input.auditRedactionKey;
 			return { ...stubDeps(), auditRedactionKey: input.auditRedactionKey };
 		},
@@ -245,8 +258,9 @@ it("passes the daemon-derived audit key through real lifecycle startup without a
 	await daemon.run();
 
 	expect(Buffer.from(capturedKey ?? []).toString("hex")).toBe(
-		"03936c8324cc679ecdc4bca97b2a88acaedf993ec45a8e6b3196033a6f9727a6",
+		"ff2063f913d83ae42436a9e33c8bdd86ae77006c5a3fe4980dc7062ba4d95aca",
 	);
+	expect(startupOrder[0]).toBe("lifecycle-deps");
 	expect(registered).toBe(1);
 });
 
@@ -293,7 +307,7 @@ it("does not attach lifecycle audit dependencies or fall back when daemon key de
 
 	await daemon.run();
 
-	expect([dependenciesBuilt, registered, started, stopped]).toEqual([0, 0, 0, 1]);
+	expect([dependenciesBuilt, registered, started, stopped]).toEqual([0, 0, 0, 0]);
 });
 
 describe("lifecycle control runtime", () => {
