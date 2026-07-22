@@ -2956,6 +2956,9 @@ export class TelegramNotificationDaemon {
 	private readonly pollConflictBackoff = new OperatorBackoffPolicy({ initialMs: 500, maxMs: 5_000 });
 	private readonly loopBackoff = new OperatorBackoffPolicy({ initialMs: 250, maxMs: 4_000 });
 	private running = false;
+	/** Once set, a concurrent startup await can never restore a running daemon. */
+	private stopRequested = false;
+
 	private readonly fsImpl: TelegramDaemonFs;
 	private readonly botApi: BotApi;
 	private readonly effects = new TelegramEffectSupervisor();
@@ -3073,6 +3076,8 @@ export class TelegramNotificationDaemon {
 	 * ~25s getUpdates timeout. Safe to call from a signal handler.
 	 */
 	requestStop(_reason?: "reload" | "stop" | "signal"): void {
+		this.stopRequested = true;
+
 		const toolShutdown = this.beginToolActivityShutdown();
 		void toolShutdown
 			.finally(() => {
@@ -7796,34 +7801,32 @@ export class TelegramNotificationDaemon {
 		// Runtime callers can bypass TypeScript's option type. Without a valid bot
 		// token, there is no authenticated daemon identity or lifecycle authority.
 		if (!validBotToken(this.opts.botToken)) return;
-		this.running = await renewDaemonHeartbeat({
-			settings: this.opts.settings,
-			ownerId: this.opts.ownerId,
-			acquisitionId: this.opts.ownerId,
-			tokenFingerprint: tokenFingerprint(this.opts.botToken),
-			chatId: this.opts.chatId,
-			fs: this.fsImpl,
-			now: this.opts.now,
-			pid: this.opts.pid ?? process.pid,
-			pidIncarnation: this.opts.pidIncarnation,
-		});
-		if (!this.running) return;
-		// Owner-only: start lifecycle control immediately after ownership proof,
-		// before timers or pre-poll startup work can invalidate this run.
-		// Best-effort; notification delivery remains available on failure.
-		await this.startLifecycleControl();
-		// A stop may arrive while lifecycle startup awaits its control endpoint.
-		// Do not re-enable runtime work after that stop; close the partial server.
-		if (!this.running) {
-			this.stopLifecycleControl();
-			return;
-		}
-		this.runtime.start();
-		this.startOwnershipHeartbeatTimer();
-		this.startFlushTimer();
-		this.startScanTimer();
-		this.startTypingTimer();
 		try {
+			const renewed = await renewDaemonHeartbeat({
+				settings: this.opts.settings,
+				ownerId: this.opts.ownerId,
+				acquisitionId: this.opts.ownerId,
+				tokenFingerprint: tokenFingerprint(this.opts.botToken),
+				chatId: this.opts.chatId,
+				fs: this.fsImpl,
+				now: this.opts.now,
+				pid: this.opts.pid ?? process.pid,
+				pidIncarnation: this.opts.pidIncarnation,
+			});
+			this.running = !this.stopRequested && renewed;
+			if (!this.running) return;
+			// Owner-only: start lifecycle control immediately after ownership proof,
+			// before timers or pre-poll startup work can invalidate this run.
+			// Best-effort; notification delivery remains available on failure.
+			await this.startLifecycleControl();
+			// A stop may arrive while lifecycle startup awaits its control endpoint.
+			// Do not re-enable runtime work after that stop; close the partial server.
+			if (!this.running) return;
+			this.runtime.start();
+			this.startOwnershipHeartbeatTimer();
+			this.startFlushTimer();
+			this.startScanTimer();
+			this.startTypingTimer();
 			await this.refreshBotIdentity();
 			await this.registerBotCommands();
 			await this.loadAliases();

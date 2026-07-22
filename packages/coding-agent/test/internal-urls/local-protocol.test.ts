@@ -271,12 +271,19 @@ describe("LocalProtocolHandler", () => {
 	});
 
 	it("aborts legacy migration when the canonical root changes at manifest capture", async () => {
-		await withTempDir(async artifactsDir => {
-			const sessionId = `legacy-capture-swap-${path.basename(artifactsDir)}`;
+		if (process.platform === "win32") return;
+		await withTempDir(async tempDir => {
+			const canonicalParent = path.join(tempDir, "canonical");
+			const canonicalArtifactsDir = path.join(canonicalParent, "artifacts");
+			const artifactsDir = path.join(tempDir, "alias", "artifacts");
+			const sessionId = `legacy-capture-swap-${path.basename(tempDir)}`;
 			const legacy = path.join(artifactsDir, "local");
 			const displacedLegacy = path.join(artifactsDir, "displaced-local");
+			await fs.mkdir(canonicalArtifactsDir, { recursive: true });
+			await fs.symlink(canonicalParent, path.join(tempDir, "alias"));
 			await fs.mkdir(legacy, { recursive: true });
 			await Bun.write(path.join(legacy, "legacy.json"), '{"legacy":true}');
+			const legacyRootPaths = new Set([path.resolve(legacy), await fs.realpath(legacy)]);
 			await withLocalRoot(sessionId, async localRoot => {
 				const lstat = fs.lstat.bind(fs);
 				let rootSnapshots = 0;
@@ -284,7 +291,7 @@ describe("LocalProtocolHandler", () => {
 					target: nodeFs.PathLike,
 					options?: nodeFs.StatOptions,
 				) => {
-					if (path.resolve(String(target)) === legacy && ++rootSnapshots === 3) {
+					if (legacyRootPaths.has(path.resolve(String(target))) && ++rootSnapshots === 3) {
 						await fs.rename(legacy, displacedLegacy);
 						await fs.mkdir(legacy);
 						await Bun.write(path.join(legacy, "replacement.json"), '{"replacement":true}');

@@ -25,7 +25,14 @@ import * as native from "@gajae-code/natives";
 import { getConfigRootDir, logger } from "@gajae-code/utils";
 import { Settings } from "../src/config/settings";
 import { tokenFingerprint } from "../src/sdk/bus/config";
-import { acquireDaemonOwnership, daemonPaths, TelegramNotificationDaemon } from "../src/sdk/bus/telegram-daemon";
+import { exactUnlinkNotificationFile, readNotificationEndpointFile } from "../src/sdk/bus/notification-service";
+import {
+	acquireDaemonOwnership,
+	daemonPaths,
+	type TelegramDaemonFs,
+	TelegramNotificationDaemon,
+} from "../src/sdk/bus/telegram-daemon";
+
 import {
 	prepareManagedSessionScopeForWriteSync,
 	resolveManagedScope,
@@ -323,6 +330,8 @@ it("does not resume daemon startup after stop during deferred lifecycle startup"
 	let stopped = 0;
 	let intervalsStarted = 0;
 	let apiCalls = 0;
+	let controlsCleared = 0;
+
 	const factory: LifecycleControlServerFactory = () =>
 		({
 			onLifecycleRequest: () => {
@@ -354,6 +363,12 @@ it("does not resume daemon startup after stop during deferred lifecycle startup"
 		}) as unknown as typeof setInterval,
 		createLifecycleControlServer: factory,
 		createLifecycleOrchestratorDeps: () => stubDeps(),
+		control: {
+			shouldStop: async () => false,
+			clear: async () => {
+				controlsCleared++;
+			},
+		},
 	});
 
 	const run = daemon.run();
@@ -362,7 +377,82 @@ it("does not resume daemon startup after stop during deferred lifecycle startup"
 	releaseLifecycleStart.resolve();
 	await run;
 
-	expect([registered, stopped, intervalsStarted, apiCalls]).toEqual([1, 1, 0, 0]);
+	expect([registered, stopped, intervalsStarted, apiCalls, controlsCleared]).toEqual([1, 1, 0, 0, 1]);
+	const paths = daemonPaths(agentDir);
+	const state = JSON.parse(fs.readFileSync(paths.state, "utf8")) as { stoppedAt?: number };
+	expect(state.stoppedAt).toEqual(expect.any(Number));
+	expect(fs.existsSync(paths.lock)).toBe(false);
+});
+
+it("does not restore running state after stop during deferred initial heartbeat renewal", async () => {
+	const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-daemon-renewal-stop-"));
+	const settings = daemonSettings(agentDir);
+	await startAsOwner(settings, "renewal-stop-owner", "123456:secret-token");
+	const renewalStarted = Promise.withResolvers<void>();
+	const releaseRenewal = Promise.withResolvers<void>();
+	let delayStateRead = true;
+	let lifecycleFactories = 0;
+	let intervalsStarted = 0;
+	let apiCalls = 0;
+	const paths = daemonPaths(agentDir);
+
+	const daemonFs: TelegramDaemonFs = {
+		mkdir: async (directory, opts) => {
+			await fs.promises.mkdir(directory, opts);
+		},
+		readFile: async (file, encoding) => {
+			if (delayStateRead && file === paths.state) {
+				delayStateRead = false;
+				renewalStarted.resolve();
+				await releaseRenewal.promise;
+			}
+			return await fs.promises.readFile(file, encoding);
+		},
+		writeFile: fs.promises.writeFile.bind(fs.promises),
+		rename: fs.promises.rename.bind(fs.promises),
+		unlink: fs.promises.unlink.bind(fs.promises),
+		open: fs.promises.open.bind(fs.promises),
+		readdir: async file => await fs.promises.readdir(file),
+		chmod: fs.promises.chmod.bind(fs.promises),
+		stat: fs.promises.stat.bind(fs.promises),
+		readEndpointFile: readNotificationEndpointFile,
+		exactUnlink: async (file, identity) =>
+			await exactUnlinkNotificationFile(file, identity, ".gjc-test-daemon-transition.json"),
+	};
+	const daemon = new TelegramNotificationDaemon({
+		settings,
+		ownerId: "renewal-stop-owner",
+		botToken: "123456:secret-token",
+		chatId: PAIRED,
+		fs: daemonFs,
+		botApi: {
+			call: async () => {
+				apiCalls++;
+				return { ok: true, result: [] };
+			},
+		} as never,
+		setIntervalImpl: ((..._args: unknown[]) => {
+			intervalsStarted++;
+			return 0;
+		}) as unknown as typeof setInterval,
+		createLifecycleControlServer: () => {
+			lifecycleFactories++;
+			return {
+				onLifecycleRequest: () => {},
+				respond: () => {},
+				start: async () => {},
+				stop: () => {},
+			} as LifecycleControlServer;
+		},
+		createLifecycleOrchestratorDeps: () => stubDeps(),
+	});
+	const run = daemon.run();
+	await renewalStarted.promise;
+	daemon.requestStop();
+	releaseRenewal.resolve();
+	await run;
+
+	expect([lifecycleFactories, intervalsStarted, apiCalls]).toEqual([0, 0, 0]);
 });
 
 describe("lifecycle control runtime", () => {
