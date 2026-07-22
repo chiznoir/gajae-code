@@ -78,34 +78,36 @@ function isRetiredBundledModel(model: Pick<Model, "provider" | "id">): boolean {
  * chat model. These entries are image-only and should be excluded from the
  * chat model browser UI.
  */
-function injectImageGenerationModels(models: Model[]): void {
+export function injectImageGenerationModels(models: Model[]): void {
 	const imageModelBase = {
 		id: "gpt-image-2",
 		name: "GPT Image 2",
 		reasoning: false,
-		input: ["text"] as const,
-		output: ["text", "image"] as const,
+		input: ["text"],
+		output: ["text", "image"],
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		contextWindow: 128_000,
 		maxTokens: 16_384,
-	};
+	} satisfies Omit<Model, "api" | "provider" | "baseUrl">;
 	const hasOpenAI = models.some(m => m.provider === "openai" && m.id === "gpt-image-2");
 	if (!hasOpenAI) {
-		models.push({
+		const openAIImageModel: Model<"openai-responses"> = {
 			...imageModelBase,
 			api: "openai-responses",
 			provider: "openai",
 			baseUrl: "",
-		} as Model);
+		};
+		models.push(openAIImageModel);
 	}
 	const hasCodex = models.some(m => m.provider === "openai-codex" && m.id === "gpt-image-2");
 	if (!hasCodex) {
-		models.push({
+		const codexImageModel: Model<"openai-codex-responses"> = {
 			...imageModelBase,
 			api: "openai-codex-responses",
 			provider: "openai-codex",
 			baseUrl: "",
-		} as Model);
+		};
+		models.push(codexImageModel);
 	}
 }
 
@@ -505,5 +507,6 @@ Model Statistics:`);
 	}
 }
 
-// Run the generator
-generateModels().catch(console.error);
+if (import.meta.main) {
+	generateModels().catch(console.error);
+}

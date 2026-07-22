@@ -646,6 +646,22 @@ function parseAntigravityCredentials(raw: string): ParsedAntigravityCredentials 
 	return rawToken.length > 0 ? { accessToken: rawToken } : null;
 }
 
+function createCustomImageModel(baseUrl: string, id: string): Model<"openai-responses"> {
+	return {
+		id,
+		name: id,
+		api: "openai-responses",
+		provider: "openai",
+		baseUrl: baseUrl.replace(/\/+$/, ""),
+		reasoning: false,
+		input: ["text"],
+		output: ["text", "image"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 128_000,
+		maxTokens: 16_384,
+	};
+}
+
 async function findAntigravityCredentials(
 	modelRegistry: ModelRegistry,
 	sessionId?: string,
@@ -697,10 +713,14 @@ async function findImageApiKey(
 	if (configuredImageConfig && configuredImageConfig.provider !== "auto") {
 		const config = configuredImageConfig;
 		if (config.provider === "custom") {
-			const baseUrl = config.customUrl;
+			const baseUrl = config.customUrl?.trim();
 			const apiKey = config.customKey ?? (config.customKeyEnv ? Bun.env[config.customKeyEnv] : undefined);
 			if (baseUrl && apiKey) {
-				return { provider: "openai", apiKey, model: undefined };
+				return {
+					provider: "openai",
+					apiKey,
+					model: createCustomImageModel(baseUrl, config.model ?? IMAGE_PROVIDER_DEFAULTS.openai),
+				};
 			}
 			return null;
 		}

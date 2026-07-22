@@ -13,6 +13,7 @@ import type { ReadonlySessionManager } from "@gajae-code/coding-agent/session/se
 import {
 	getImageGenToolsWithRegistry,
 	imageGenTool,
+	setConfiguredImageModel,
 	setPreferredImageProvider,
 } from "@gajae-code/coding-agent/tools/image-gen";
 
@@ -21,6 +22,7 @@ const originalOpenRouterKey = Bun.env.OPENROUTER_API_KEY;
 const originalGeminiKey = Bun.env.GEMINI_API_KEY;
 const originalGoogleKey = Bun.env.GOOGLE_API_KEY;
 const originalOpenAIBaseUrl = Bun.env.OPENAI_BASE_URL;
+const originalCustomImageKey = Bun.env.TEST_CUSTOM_IMAGE_API_KEY;
 const generatedImagePaths: string[] = [];
 
 afterEach(async () => {
@@ -47,7 +49,13 @@ afterEach(async () => {
 	} else {
 		Bun.env.GOOGLE_API_KEY = originalGoogleKey;
 	}
+	if (originalCustomImageKey === undefined) {
+		delete Bun.env.TEST_CUSTOM_IMAGE_API_KEY;
+	} else {
+		Bun.env.TEST_CUSTOM_IMAGE_API_KEY = originalCustomImageKey;
+	}
 	setPreferredImageProvider("auto");
+	setConfiguredImageModel(null);
 });
 
 function clearFallbackImageProviderEnv(): void {
@@ -311,6 +319,36 @@ describe("imageGenTool", () => {
 		generatedImagePaths.push(...(result.details?.imagePaths ?? []));
 
 		expect(requestUrl).toBe("https://api.openai.com/v1/responses");
+	});
+	it("routes configured custom image models through their configured base URL", async () => {
+		let requestUrl: string | undefined;
+		let requestBody: unknown;
+		const fetchMock: typeof fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+			requestUrl = input.toString();
+			requestBody = JSON.parse(String(init?.body));
+			return new Response(
+				JSON.stringify({
+					output: [{ type: "image_generation_call", result: Buffer.from("fake-webp").toString("base64") }],
+				}),
+				{ status: 200, headers: { "content-type": "application/json" } },
+			);
+		}) as unknown as typeof fetch;
+		fetchMock.preconnect = originalFetch.preconnect;
+		global.fetch = fetchMock;
+		Bun.env.TEST_CUSTOM_IMAGE_API_KEY = "test-custom-key";
+		setConfiguredImageModel({
+			provider: "custom",
+			model: "proxy-image-model",
+			customUrl: "https://images.example.test/v1/",
+			customKeyEnv: "TEST_CUSTOM_IMAGE_API_KEY",
+		});
+
+		const result = await imageGenTool.execute("call-custom", { subject: "a cat" }, undefined, makeOpenRouterCtx());
+		generatedImagePaths.push(...(result.details?.imagePaths ?? []));
+
+		expect(requestUrl).toBe("https://images.example.test/v1/responses");
+		expect(requestBody).toMatchObject({ model: "proxy-image-model", tool_choice: { type: "image_generation" } });
+		expect(result.details?.provider).toBe("openai");
 	});
 });
 

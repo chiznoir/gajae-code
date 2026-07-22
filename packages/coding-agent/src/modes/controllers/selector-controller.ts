@@ -1133,7 +1133,10 @@ export class SelectorController {
 				this.ctx.showStatus("Custom image endpoint requires a base URL");
 				return;
 			}
-			customKey = await this.ctx.showHookInput("Custom image endpoint API key (or env var name)");
+			model = await this.ctx.showHookInput("Custom image model", IMAGE_PROVIDER_DEFAULTS.openai);
+			if (model === undefined) return;
+			model = model.trim() || IMAGE_PROVIDER_DEFAULTS.openai;
+			customKey = await this.ctx.showHookInput("Custom image endpoint API key");
 		}
 		const scope = await this.ctx.showHookInput(
 			"Scope: 'session' (this session only) or 'default' (persist)",
