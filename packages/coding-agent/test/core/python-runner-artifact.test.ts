@@ -2,7 +2,10 @@ import { afterEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { createRunnerScriptCache, createRunnerScriptInitializer } from "@gajae-code/coding-agent/eval/py/runner-artifact";
+import {
+	createRunnerScriptCache,
+	createRunnerScriptInitializer,
+} from "@gajae-code/coding-agent/eval/py/runner-artifact";
 import RUNNER_SCRIPT from "../../src/eval/py/runner.py" with { type: "text" };
 
 describe("Python runner artifact", () => {
