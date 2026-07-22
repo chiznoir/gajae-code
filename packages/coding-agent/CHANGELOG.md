@@ -4,6 +4,7 @@
 ### Added
 
 - `/btw` now opens an ephemeral multi-turn side chat: plain text continues the side thread until Esc returns to the main chat, while visible text-only context stays outside the main transcript and session observability/debug hooks and is scrubbed synchronously on close or abort.
+- Added `statusLine.showActionHints` (default: `true`) to hide contextual action hints while retaining configured status-line segments.
 
 ### Fixed
 

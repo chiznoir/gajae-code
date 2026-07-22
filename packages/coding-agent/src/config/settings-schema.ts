@@ -819,6 +819,15 @@ export const SETTINGS_SCHEMA = {
 		type: "boolean",
 		default: true,
 	},
+	"statusLine.showActionHints": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "appearance",
+			label: "Status Line Action Hints",
+			description: "Show contextual keyboard shortcuts in the status line",
+		},
+	},
 
 	"statusLine.leftSegments": { type: "array", default: [] as StatusLineSegmentId[] },
 
@@ -3740,6 +3749,7 @@ export interface StatusLineSettings {
 	maxRows: number;
 	showHookStatus: boolean;
 	showSkillHud: boolean;
+	showActionHints: boolean;
 	leftSegments: StatusLineSegmentId[];
 	rightSegments: StatusLineSegmentId[];
 	segmentOptions: Record<string, unknown>;

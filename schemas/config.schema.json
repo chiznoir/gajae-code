@@ -432,6 +432,11 @@
 					"type": "boolean",
 					"default": true
 				},
+				"showActionHints": {
+					"type": "boolean",
+					"description": "Show contextual keyboard shortcuts in the status line",
+					"default": true
+				},
 				"leftSegments": {
 					"type": "array",
 					"items": true,
