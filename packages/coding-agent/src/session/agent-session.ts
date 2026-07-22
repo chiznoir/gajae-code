@@ -105,6 +105,16 @@ import {
 	type FallbackAttemptToken,
 	type FallbackTriggerClass,
 } from "@gajae-code/ai/utils/fallback-transport";
+import {
+	BTW_MAX_ANSWER_UTF8_BYTES,
+	BTW_MAX_QUESTION_UTF8_BYTES,
+	BTW_STREAM_IDLE_TIMEOUT_MS,
+	BTW_STREAM_TOTAL_TIMEOUT_MS,
+	type BtwTextExchange,
+	boundBtwExchanges,
+	truncateUtf8,
+	utf8ByteLength,
+} from "./btw-contract";
 
 export interface ForkContextSeedMetadata {
 	sourceSessionId: string;
@@ -827,7 +837,6 @@ function isLocalModelEndpoint(model: Model | undefined): boolean {
 }
 
 const IRC_REPLY_MAX_BYTES = 4096;
-const BTW_ESTABLISHMENT_TIMEOUT_MS = 15_000;
 
 export type EphemeralTurnPurpose = "btw" | "background";
 
@@ -837,8 +846,34 @@ interface EphemeralTurnBaseArgs {
 	signal?: AbortSignal;
 }
 
+export interface BtwRoleTextMessage {
+	role: "user" | "assistant";
+	text: string;
+}
+
+export interface BtwConversationScope {
+	model: Model;
+	systemPrompt: string[];
+	messages: BtwRoleTextMessage[];
+	thinkingLevel: ThinkingLevel;
+	hideThinkingSummary: boolean;
+	serviceTier: ServiceTier | undefined;
+	credentialSessionId: string;
+	providerAffinitySessionId: string;
+	sideSessionId: string;
+}
+
+export interface BtwTurnCapture {
+	question: string;
+	scope: BtwConversationScope | undefined;
+}
+
 export type EphemeralTurnArgs =
-	| (EphemeralTurnBaseArgs & { purpose: "btw" })
+	| (Omit<EphemeralTurnBaseArgs, "promptText"> & {
+			purpose: "btw";
+			turn: BtwTurnCapture;
+			contextExchanges?: readonly BtwTextExchange[];
+	  })
 	| (EphemeralTurnBaseArgs & {
 			purpose?: "background";
 			/** Internal caller-supplied, non-persistent context such as the IRC roster. */
@@ -13993,167 +14028,127 @@ export class AgentSession {
 		this.#ircRosterClaim = null;
 	}
 
+	createBtwConversationScope(instruction: string): BtwConversationScope {
+		const model = this.model;
+		if (!model) throw new Error("No active model on session");
+		const providerAffinitySessionId = this.agent.providerSessionId ?? this.agent.sessionId ?? this.sessionId;
+		return {
+			model,
+			systemPrompt: [...this.systemPrompt, instruction],
+			messages: this.#projectBtwVisibleText(this.buildDisplaySessionContext().messages),
+			thinkingLevel: this.thinkingLevel ?? ThinkingLevel.Off,
+			hideThinkingSummary: this.agent.hideThinkingSummary ?? false,
+			serviceTier: this.serviceTier,
+			credentialSessionId: providerAffinitySessionId,
+			providerAffinitySessionId,
+			sideSessionId: `${providerAffinitySessionId}:btw:${crypto.randomUUID()}`,
+		};
+	}
+
+	#projectBtwVisibleText(messages: readonly AgentMessage[]): BtwRoleTextMessage[] {
+		const projected: BtwRoleTextMessage[] = [];
+		for (const message of messages) {
+			if (message.role !== "user" && message.role !== "assistant") continue;
+			const text = (
+				typeof message.content === "string"
+					? message.content
+					: message.content
+							.filter((block): block is TextContent => block.type === "text")
+							.map(block => block.text)
+							.join("")
+			).trim();
+			if (!text) continue;
+			projected.push({ role: message.role, text });
+		}
+		return projected;
+	}
+
+	#buildBtwAssistantMessage(text: string): AssistantMessage {
+		return {
+			role: "assistant",
+			content: [{ type: "text", text }],
+			api: "btw",
+			provider: "btw",
+			model: "btw",
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+			timestamp: 0,
+		};
+	}
 	/**
-	 * Run a single ephemeral side-channel turn against this session's current
-	 * model + system prompt + history. No tools are used and session history is
-	 * not modified. Background turns retain the IRC/session behavior used by
-	 * autoreplies; `/btw` turns use an isolated committed-context policy.
+	 * Run a single ephemeral side-channel turn without modifying session history.
+	 * Background turns retain IRC/session behavior. `/btw` turns require a
+	 * pre-frozen, visible-text-only scope and bypass extension context transforms,
+	 * provider observability hooks, and session persistence surfaces.
 	 */
 	async runEphemeralTurn(args: EphemeralTurnArgs): Promise<EphemeralTurnResult> {
 		args.signal?.throwIfAborted();
-		const isBtw = args.purpose === "btw";
-		// `/btw` captures every provider-facing parent facet synchronously so an
-		// in-flight foreground mutation cannot create a mixed-generation request.
-		const btwSnapshot = isBtw
-			? this.#buildBtwEphemeralSnapshot(
-					cloneJsonValueForForkSeed(this.buildDisplaySessionContext().messages),
-					args.promptText,
-				)
-			: undefined;
-		const model = this.model;
-		const systemPrompt = isBtw ? [...this.systemPrompt] : undefined;
-		const thinkingLevel = this.thinkingLevel;
-		const hideThinkingSummary = this.agent.hideThinkingSummary;
-		const serviceTier = this.serviceTier;
-		const providerAffinitySessionId = this.agent.providerSessionId ?? this.agent.sessionId ?? this.sessionId;
-		const sideSessionId = isBtw ? `${providerAffinitySessionId}:btw:${crypto.randomUUID()}` : undefined;
-		const backgroundArgs = isBtw ? undefined : args;
-		const callerOwnsRosterClaim = backgroundArgs?.ircRosterClaim !== undefined;
-		const rosterClaim = isBtw
-			? null
-			: callerOwnsRosterClaim
-				? backgroundArgs?.ircRosterClaim
-				: this.#claimIrcRosterCandidate();
+		if (args.purpose === "btw") return await this.#runBtwTurn(args);
+
+		const callerOwnsRosterClaim = args.ircRosterClaim !== undefined;
+		const rosterClaim = callerOwnsRosterClaim ? args.ircRosterClaim : this.#claimIrcRosterCandidate();
 		const rosterClaimIsCurrent = () =>
 			!rosterClaim || this.#isCurrentIrcRosterClaim(rosterClaim.token, rosterClaim.epoch);
-		const prependMessagesValid = () => rosterClaimIsCurrent() && backgroundArgs?.prependMessagesValid?.() !== false;
+		const prependMessagesValid = () => rosterClaimIsCurrent() && args.prependMessagesValid?.() !== false;
 		const rosterMessage = !callerOwnsRosterClaim && rosterClaimIsCurrent() ? rosterClaim?.message : undefined;
 		try {
+			const model = this.model;
 			if (!model) throw new Error("No active model on session");
-			const credentialSessionId = isBtw ? providerAffinitySessionId : this.sessionId;
-			const apiKey = await awaitEphemeralAbort(
-				this.#modelRegistry.getApiKey(model, credentialSessionId),
-				args.signal,
-			);
+			const apiKey = await awaitEphemeralAbort(this.#modelRegistry.getApiKey(model, this.sessionId), args.signal);
 			if (!apiKey) throw new Error(`No API key for ${model.provider}/${model.id}`);
-
 			const prependMessages = prependMessagesValid()
-				? [...(rosterMessage ? [rosterMessage] : []), ...(backgroundArgs?.prependMessages ?? [])]
+				? [...(rosterMessage ? [rosterMessage] : []), ...(args.prependMessages ?? [])]
 				: undefined;
-			let snapshot = btwSnapshot ?? this.#buildEphemeralSnapshot(args.promptText, prependMessages);
+			let snapshot = this.#buildEphemeralSnapshot(args.promptText, prependMessages);
 			let llmMessages = await awaitEphemeralAbort(this.convertMessagesToLlm(snapshot, args.signal), args.signal);
-			if (!isBtw && prependMessages && !prependMessagesValid()) {
+			if (prependMessages && !prependMessagesValid()) {
 				snapshot = this.#buildEphemeralSnapshot(args.promptText);
 				llmMessages = await awaitEphemeralAbort(this.convertMessagesToLlm(snapshot, args.signal), args.signal);
 			}
-			const context: Context = {
-				systemPrompt: systemPrompt ?? this.systemPrompt,
-				messages: llmMessages,
-				tools: [],
-			};
-
+			const context: Context = { systemPrompt: this.systemPrompt, messages: llmMessages, tools: [] };
+			const ephemeralSessionId = crypto.randomUUID();
+			const options = this.prepareSimpleStreamOptions(
+				{
+					apiKey,
+					sessionId: ephemeralSessionId,
+					metadata: buildSessionMetadata(
+						ephemeralSessionId,
+						model.provider,
+						this.#modelRegistry.authStorage,
+						this.sessionId,
+					),
+					reasoning: toReasoningEffort(this.thinkingLevel),
+					hideThinkingSummary: this.agent.hideThinkingSummary,
+					serviceTier: this.serviceTier,
+					signal: args.signal,
+					toolChoice: "none",
+				},
+				model.provider,
+			);
+			args.signal?.throwIfAborted();
 			let replyText = "";
 			let assistantMessage: AssistantMessage | undefined;
-			if (isBtw) {
-				const establishmentAbort = new AbortController();
-				const requestSignal = args.signal
-					? AbortSignal.any([args.signal, establishmentAbort.signal])
-					: establishmentAbort.signal;
-				const timeoutError = new Error(
-					`/btw provider did not produce an event within ${BTW_ESTABLISHMENT_TIMEOUT_MS / 1000} seconds`,
-				);
-				timeoutError.name = "TimeoutError";
-				let establishmentTimer: NodeJS.Timeout | undefined;
-				try {
-					requestSignal.throwIfAborted();
-					const options: SimpleStreamOptions = {
-						apiKey,
-						sessionId: sideSessionId!,
-						metadata: buildSessionMetadata(
-							sideSessionId!,
-							model.provider,
-							this.#modelRegistry.authStorage,
-							providerAffinitySessionId,
-						),
-						reasoning: toReasoningEffort(thinkingLevel),
-						hideThinkingSummary,
-						serviceTier,
-						onPayload: this.#onPayload,
-						signal: requestSignal,
-						toolChoice: "none",
-						requestMaxRetries: 0,
-						streamMaxRetries: 0,
-						streamFirstEventTimeoutMs: 0,
-					};
-					establishmentTimer = setTimeout(
-						() => establishmentAbort.abort(timeoutError),
-						BTW_ESTABLISHMENT_TIMEOUT_MS,
-					);
-					establishmentTimer.unref?.();
-					const stream = streamSimple(model, context, options);
-					let receivedProviderEvent = false;
-					for await (const event of stream) {
-						if (!receivedProviderEvent && event.type !== "start") {
-							receivedProviderEvent = true;
-							clearTimeout(establishmentTimer);
-							establishmentTimer = undefined;
-						}
-						if (event.type === "text_delta") {
-							replyText += event.delta;
-							args.onTextDelta?.(event.delta);
-						} else if (event.type === "done") {
-							assistantMessage = event.message;
-							break;
-						} else if (event.type === "error") {
-							throw new Error(event.error.errorMessage || "Ephemeral turn failed");
-						}
-					}
-					requestSignal.throwIfAborted();
-				} catch (error) {
-					if (establishmentAbort.signal.aborted && !args.signal?.aborted) throw timeoutError;
-					throw error;
-				} finally {
-					if (establishmentTimer) clearTimeout(establishmentTimer);
-				}
-			} else {
-				const ephemeralSessionId = crypto.randomUUID();
-				const options = this.prepareSimpleStreamOptions(
-					{
-						apiKey,
-						sessionId: ephemeralSessionId,
-						metadata: buildSessionMetadata(
-							ephemeralSessionId,
-							model.provider,
-							this.#modelRegistry.authStorage,
-							this.sessionId,
-						),
-						reasoning: toReasoningEffort(thinkingLevel),
-						hideThinkingSummary,
-						serviceTier,
-						signal: args.signal,
-						toolChoice: "none",
-					},
-					model.provider,
-				);
-				args.signal?.throwIfAborted();
-				const stream = streamSimple(model, context, options);
-				for await (const event of stream) {
-					if (event.type === "text_delta") {
-						replyText += event.delta;
-						args.onTextDelta?.(event.delta);
-					} else if (event.type === "done") {
-						assistantMessage = event.message;
-						break;
-					} else if (event.type === "error") {
-						throw new Error(event.error.errorMessage || "Ephemeral turn failed");
-					}
+			for await (const event of streamSimple(model, context, options)) {
+				if (event.type === "text_delta") {
+					replyText += event.delta;
+					args.onTextDelta?.(event.delta);
+				} else if (event.type === "done") {
+					assistantMessage = event.message;
+					break;
+				} else if (event.type === "error") {
+					throw new Error(event.error.errorMessage || "Ephemeral turn failed");
 				}
 			}
-
 			if (!assistantMessage) throw new Error("Ephemeral turn ended without a final message");
 			args.signal?.throwIfAborted();
 			if (
-				!isBtw &&
 				!callerOwnsRosterClaim &&
 				rosterClaim &&
 				assistantMessage.stopReason !== "error" &&
@@ -14161,19 +14156,115 @@ export class AgentSession {
 			) {
 				this.#commitIrcRosterClaim(rosterClaim.token, rosterClaim.epoch);
 			}
-			args.signal?.throwIfAborted();
 			return { replyText: replyText.trim(), assistantMessage };
 		} finally {
-			if (!isBtw && !callerOwnsRosterClaim && rosterClaim) {
-				this.#releaseIrcRosterClaim(rosterClaim.token, rosterClaim.epoch);
-			}
+			if (!callerOwnsRosterClaim && rosterClaim) this.#releaseIrcRosterClaim(rosterClaim.token, rosterClaim.epoch);
 		}
 	}
 
-	/** Build a `/btw` snapshot from an already-cloned committed context. */
-	#buildBtwEphemeralSnapshot(messages: AgentMessage[], promptText: string): AgentMessage[] {
-		messages.push(this.#buildEphemeralPromptMessage(promptText));
-		return messages;
+	async #runBtwTurn(args: Extract<EphemeralTurnArgs, { purpose: "btw" }>): Promise<EphemeralTurnResult> {
+		const model = args.turn.scope?.model;
+		const credentialSessionId = args.turn.scope?.credentialSessionId;
+		if (!model || !credentialSessionId) throw new Error("The /btw conversation scope was scrubbed.");
+		if (utf8ByteLength(args.turn.question) > BTW_MAX_QUESTION_UTF8_BYTES) {
+			throw new RangeError(`/btw questions are limited to ${BTW_MAX_QUESTION_UTF8_BYTES} UTF-8 bytes.`);
+		}
+		const apiKey = await awaitEphemeralAbort(this.#modelRegistry.getApiKey(model, credentialSessionId), args.signal);
+		if (!apiKey) throw new Error(`No API key for ${model.provider}/${model.id}`);
+		const scope = args.turn.scope;
+		if (!scope) throw new Error("The /btw conversation scope was scrubbed.");
+		const messages = scope.messages.map(message => ({
+			role: message.role,
+			content: [{ type: "text" as const, text: message.text }],
+		})) as Message[];
+		for (const exchange of boundBtwExchanges(args.contextExchanges ?? [])) {
+			messages.push({
+				role: "user",
+				content: [{ type: "text", text: exchange.question }],
+			} as Message);
+			messages.push({
+				role: "assistant",
+				content: [{ type: "text", text: exchange.answer }],
+			} as Message);
+		}
+		messages.push({
+			role: "user",
+			content: [{ type: "text", text: args.turn.question }],
+		} as Message);
+		const context: Context = { systemPrompt: scope.systemPrompt, messages, tools: [] };
+		const timeoutAbort = new AbortController();
+		const requestSignal = args.signal ? AbortSignal.any([args.signal, timeoutAbort.signal]) : timeoutAbort.signal;
+		const options: SimpleStreamOptions = {
+			apiKey,
+			sessionId: scope.sideSessionId,
+			reasoning: toReasoningEffort(scope.thinkingLevel),
+			hideThinkingSummary: scope.hideThinkingSummary,
+			serviceTier: scope.serviceTier,
+			signal: requestSignal,
+			toolChoice: "none",
+			requestMaxRetries: 0,
+			streamMaxRetries: 0,
+			streamFirstEventTimeoutMs: 0,
+		};
+		const iterator = streamSimple(scope.model, context, options)[Symbol.asyncIterator]();
+		let replyText = "";
+		let completed = false;
+		let active = true;
+		let onTextDelta = args.onTextDelta;
+		let idleTimer: NodeJS.Timeout | undefined;
+		const timeout = (message: string) => {
+			const error = new Error(message);
+			error.name = "TimeoutError";
+			timeoutAbort.abort(error);
+		};
+		const resetIdleTimer = () => {
+			if (idleTimer) clearTimeout(idleTimer);
+			idleTimer = setTimeout(
+				() => timeout(`/btw provider was idle for ${BTW_STREAM_IDLE_TIMEOUT_MS / 1000} seconds`),
+				BTW_STREAM_IDLE_TIMEOUT_MS,
+			);
+			idleTimer.unref?.();
+		};
+		const totalTimer = setTimeout(
+			() => timeout(`/btw provider exceeded ${BTW_STREAM_TOTAL_TIMEOUT_MS / 1000} seconds`),
+			BTW_STREAM_TOTAL_TIMEOUT_MS,
+		);
+		totalTimer.unref?.();
+		resetIdleTimer();
+		const consume = async () => {
+			while (active) {
+				const result = await iterator.next();
+				if (result.done || !active) break;
+				resetIdleTimer();
+				const event = result.value;
+				if (event.type === "text_delta") {
+					const bounded = truncateUtf8(replyText + event.delta, BTW_MAX_ANSWER_UTF8_BYTES);
+					const delta = bounded.slice(replyText.length);
+					replyText = bounded;
+					if (delta) onTextDelta?.(delta);
+				} else if (event.type === "done") {
+					completed = true;
+					break;
+				} else if (event.type === "error") {
+					throw new Error(event.error.errorMessage || "Ephemeral turn failed");
+				}
+			}
+		};
+		try {
+			await awaitEphemeralAbort(consume(), requestSignal);
+			requestSignal.throwIfAborted();
+			if (!completed) throw new Error("Ephemeral turn ended without a final message");
+			const finalText = replyText.trim();
+			return { replyText: finalText, assistantMessage: this.#buildBtwAssistantMessage(finalText) };
+		} finally {
+			active = false;
+			onTextDelta = undefined;
+			replyText = "";
+			context.messages = [];
+			if (idleTimer) clearTimeout(idleTimer);
+			clearTimeout(totalTimer);
+			void iterator.return?.().catch(() => undefined);
+		}
 	}
 
 	/** Build a background snapshot with in-flight assistant and optional context. */

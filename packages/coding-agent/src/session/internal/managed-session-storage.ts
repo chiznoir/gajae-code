@@ -12,9 +12,11 @@ import {
 	openRecoveryFsRoot,
 	type RecoveryFsRoot,
 	renameNoReplacePath,
+	repairOwnerOnlyPathSecurityExpected,
 	snapshotDirectoryTree,
 	verifyOwnerOnlyFdSecurity,
 	verifyOwnerOnlyPathSecurity,
+	verifyOwnerOnlyPathSecurityExpected,
 } from "@gajae-code/natives";
 
 export const MANAGED_ARTIFACT_MAX_DEPTH = 32;
@@ -26,6 +28,8 @@ const LOCK_HEARTBEAT_MS = 10_000;
 const LOCK_WAIT_MS = 5_000;
 
 const LOCK_STALE_RECHECK_MS = 100;
+
+export type ManagedSessionSecurityPolicy = "default" | "windows-existing-verify-first";
 
 export type ManagedStorageFailure =
 	| "migration_busy"
@@ -216,14 +220,16 @@ export function retainManagedDirectoryAuthority(
 	}
 }
 
-function ensureDirectoryComponent(pathname: string): void {
+function ensureDirectoryComponent(pathname: string): boolean {
+	let created = false;
 	try {
 		fs.mkdirSync(pathname, { mode: 0o700 });
+		created = true;
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
 	}
 	assertSafeDirectory(pathname);
-	secure(pathname, "directory");
+	return created;
 }
 
 export function assertManagedDirectoryRoot(root: ManagedDirectoryRoot): void {
@@ -263,10 +269,66 @@ function secure(pathname: string, kind: "directory" | "file"): void {
 	if (!verified.ok) throw securityError(pathname, verified);
 }
 
+function windowsExistingVerifyFirst(policy: ManagedSessionSecurityPolicy): boolean {
+	return process.platform === "win32" && policy === "windows-existing-verify-first";
+}
+
+function assertManagedPathIdentity(pathname: string, kind: "directory" | "file", expected: fs.BigIntStats): void {
+	const current = fs.lstatSync(pathname, { bigint: true });
+	if (current.isSymbolicLink()) throw new Error("reparse_point");
+	const expectedKind = kind === "directory" ? current.isDirectory() : current.isFile();
+	if (!expectedKind) throw new Error(kind === "directory" ? "not_directory" : "not_file");
+	if (current.dev !== expected.dev || current.ino !== expected.ino) throw new Error("identity_mismatch");
+}
+
+function verifyExistingManagedPathSecurity(
+	pathname: string,
+	kind: "directory" | "file",
+	expected: fs.BigIntStats,
+): void {
+	const verified = validateNativeSecurityResult(
+		verifyOwnerOnlyPathSecurityExpected(pathname, kind, expected.dev, expected.ino),
+		"verify",
+		kind,
+	);
+	assertManagedPathIdentity(pathname, kind, expected);
+	if (!verified.ok) throw securityError(pathname, verified);
+}
+
+function secureExistingManagedDirectory(pathname: string, kind: "directory" | "file"): void {
+	const named = fs.lstatSync(pathname, { bigint: true });
+	const safeKind = kind === "directory" ? named.isDirectory() : named.isFile();
+	if (!safeKind || named.isSymbolicLink()) throw new Error(`Unsafe managed ${kind}: ${pathname}`);
+	const verified = validateNativeSecurityResult(
+		verifyOwnerOnlyPathSecurityExpected(pathname, kind, named.dev, named.ino),
+		"verify",
+		kind,
+	);
+	assertManagedPathIdentity(pathname, kind, named);
+	if (verified.ok) return;
+	if (verified.code !== "acl_verify_failed") throw securityError(pathname, verified);
+	const repaired = validateNativeSecurityResult(
+		repairOwnerOnlyPathSecurityExpected(pathname, kind, named.dev, named.ino),
+		"verify",
+		kind,
+	);
+	if (!repaired.ok) throw securityError(pathname, repaired);
+	assertManagedPathIdentity(pathname, kind, named);
+}
+
+function secureManagedDirectory(pathname: string, created: boolean, policy: ManagedSessionSecurityPolicy): void {
+	if (!created && windowsExistingVerifyFirst(policy)) {
+		secureExistingManagedDirectory(pathname, "directory");
+		return;
+	}
+	secure(pathname, "directory");
+}
+
 /** Internal retained-root capability for one managed descendant subtree. */
 export class ManagedSessionDescendantStore {
 	readonly #root: ManagedDirectoryRoot;
 	readonly #baseDir: string;
+	readonly #policy: ManagedSessionSecurityPolicy;
 	readonly #authority: RecoveryFsRoot | undefined;
 	readonly #authorityBaseDir: string;
 	readonly #subtreeRoot: ManagedDirectoryRoot;
@@ -275,11 +337,13 @@ export class ManagedSessionDescendantStore {
 		root: ManagedDirectoryRoot,
 		baseDir: string,
 		retained?: { authority: RecoveryFsRoot; authorityBaseDir: string },
+		policy?: ManagedSessionSecurityPolicy,
 	) {
 		assertManagedDirectoryRoot(root);
 		managedRelativePath(root, baseDir);
 		this.#root = root;
 		this.#baseDir = path.resolve(baseDir);
+		this.#policy = policy ?? "default";
 		this.#authorityBaseDir = retained?.authorityBaseDir ?? this.#baseDir;
 		if (retained) {
 			const relative = path.relative(retained.authorityBaseDir, this.#baseDir).split(path.sep).join("/");
@@ -300,7 +364,7 @@ export class ManagedSessionDescendantStore {
 			this.#authority = retained.authority;
 			return;
 		}
-		ensureManagedDirectory(this.#baseDir, root);
+		ensureManagedDirectory(this.#baseDir, root, this.#policy);
 		const subtreeStat = fs.lstatSync(this.#baseDir, { bigint: true });
 		this.#subtreeRoot = Object.freeze({ canonicalPath: this.#baseDir, dev: subtreeStat.dev, ino: subtreeStat.ino });
 		if (process.platform === "linux") {
@@ -332,19 +396,28 @@ export class ManagedSessionDescendantStore {
 		return this.#subtreeRoot;
 	}
 
+	get securityPolicy(): ManagedSessionSecurityPolicy {
+		return this.#policy;
+	}
+
 	deriveSubtree(relativePath: string): ManagedSessionDescendantStore {
 		const child = this.ensureDirectory(relativePath);
 		const resolved = this.#resolve(relativePath);
-		if (!this.#authority) return new ManagedSessionDescendantStore(this.#root, resolved);
+		if (!this.#authority) return new ManagedSessionDescendantStore(this.#root, resolved, undefined, this.#policy);
 		const retainedChild = this.#authority.retainManagedDirectory(
 			this.#relative(resolved),
 			child.dev.toString(),
 			child.ino.toString(),
 		);
-		return new ManagedSessionDescendantStore(this.#root, resolved, {
-			authority: retainedChild,
-			authorityBaseDir: resolved,
-		});
+		return new ManagedSessionDescendantStore(
+			this.#root,
+			resolved,
+			{
+				authority: retainedChild,
+				authorityBaseDir: resolved,
+			},
+			this.#policy,
+		);
 	}
 
 	retainAuthority(): RecoveryFsRoot | undefined {
@@ -371,12 +444,19 @@ export class ManagedSessionDescendantStore {
 				return;
 			}
 		} else {
-			const verified = validateNativeSecurityResult(
-				verifyOwnerOnlyPathSecurity(this.#baseDir, "directory"),
-				"verify",
-				"directory",
-			);
-			if (!verified.ok) throw securityError(this.#baseDir, verified);
+			const named = fs.lstatSync(this.#baseDir, { bigint: true });
+			if (!named.isDirectory() || named.isSymbolicLink())
+				throw new Error(`Unsafe managed directory: ${this.#baseDir}`);
+			if (windowsExistingVerifyFirst(this.#policy))
+				verifyExistingManagedPathSecurity(this.#baseDir, "directory", named);
+			else {
+				const verified = validateNativeSecurityResult(
+					verifyOwnerOnlyPathSecurity(this.#baseDir, "directory"),
+					"verify",
+					"directory",
+				);
+				if (!verified.ok) throw securityError(this.#baseDir, verified);
+			}
 		}
 		this.#assertBound();
 	}
@@ -421,7 +501,7 @@ export class ManagedSessionDescendantStore {
 				ino: BigInt(ensured.identity.ino),
 			});
 		}
-		ensureManagedDirectory(this.#resolve(relativePath), this.#root);
+		ensureManagedDirectory(this.#resolve(relativePath), this.#root, this.#policy);
 		const named = fs.lstatSync(this.#resolve(relativePath), { bigint: true });
 		return Object.freeze({ canonicalPath: this.#resolve(relativePath), dev: named.dev, ino: named.ino });
 	}
@@ -434,13 +514,13 @@ export class ManagedSessionDescendantStore {
 			this.#assertBound();
 			return;
 		}
-		await publishManagedFileNoReplace(resolved, bytes, undefined, this.#root);
+		await publishManagedFileNoReplace(resolved, bytes, undefined, this.#root, this.#policy);
 	}
 
 	publishNoReplaceSync(relativePath: string, bytes: Uint8Array): void {
 		const resolved = this.#resolve(relativePath);
 		if (!this.#authority) {
-			publishManagedFileNoReplaceSync(resolved, bytes, this.#root);
+			publishManagedFileNoReplaceSync(resolved, bytes, this.#root, this.#policy);
 			this.#assertBound();
 			return;
 		}
@@ -453,7 +533,7 @@ export class ManagedSessionDescendantStore {
 		this.#assertBound();
 		const resolved = this.#resolve(relativePath);
 		if (!this.#authority) {
-			await replaceManagedFile(resolved, bytes, this.#subtreeRoot);
+			await replaceManagedFile(resolved, bytes, this.#subtreeRoot, this.#policy);
 			this.#assertBound();
 			return;
 		}
@@ -466,7 +546,7 @@ export class ManagedSessionDescendantStore {
 		this.#assertBound();
 		const resolved = this.#resolve(relativePath);
 		if (!this.#authority) {
-			replaceManagedFileSync(resolved, bytes, this.#subtreeRoot);
+			replaceManagedFileSync(resolved, bytes, this.#subtreeRoot, this.#policy);
 			this.#assertBound();
 			return;
 		}
@@ -1060,25 +1140,43 @@ function sameFileIdentity(left: fs.BigIntStats, right: fs.BigIntStats): boolean 
 }
 
 /** Create a managed directory and fail closed unless its owner-only mode/ACL verifies. */
-export function ensureManagedDirectory(pathname: string, root?: ManagedDirectoryRoot): void {
+export function ensureManagedDirectory(
+	pathname: string,
+	root?: ManagedDirectoryRoot,
+	policy: ManagedSessionSecurityPolicy = "default",
+): void {
 	if (!root) {
+		let existed = false;
+		try {
+			const named = fs.lstatSync(pathname);
+			existed = true;
+			if (!named.isDirectory() || named.isSymbolicLink()) throw new Error(`Unsafe managed directory: ${pathname}`);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		}
 		fs.mkdirSync(pathname, { recursive: true, mode: 0o700 });
 		assertSafeDirectory(pathname);
-		secure(pathname, "directory");
+		if (existed && windowsExistingVerifyFirst(policy)) secureExistingManagedDirectory(pathname, "directory");
+		else secure(pathname, "directory");
 		return;
 	}
 	ensureManagedRoot(root);
+	const components = managedRelativePath(root, pathname);
+	if (components.length === 0) {
+		if (windowsExistingVerifyFirst(policy)) secureExistingManagedDirectory(root.canonicalPath, "directory");
+		return;
+	}
 	let current = root.canonicalPath;
-	for (const component of managedRelativePath(root, pathname)) {
+	if (windowsExistingVerifyFirst(policy)) secureExistingManagedDirectory(current, "directory");
+	else secure(current, "directory");
+	for (const component of components) {
 		// Re-inspect the captured root or already-secured descendant before every
 		// descent; a replaced component cannot grant authority to the next one.
 		if (current === root.canonicalPath) assertManagedDirectoryRoot(root);
-		else {
-			assertSafeDirectory(current);
-			secure(current, "directory");
-		}
+		else assertSafeDirectory(current);
 		current = path.join(current, component);
-		ensureDirectoryComponent(current);
+		const created = ensureDirectoryComponent(current);
+		secureManagedDirectory(current, created, policy);
 	}
 }
 
@@ -1123,9 +1221,10 @@ export async function publishManagedFileNoReplace(
 	bytes: Uint8Array,
 	assertOwned?: () => void,
 	root?: ManagedDirectoryRoot,
+	policy: ManagedSessionSecurityPolicy = "default",
 ): Promise<void> {
 	const parent = path.dirname(destination);
-	ensureManagedDirectory(parent, root);
+	ensureManagedDirectory(parent, root, policy);
 	const staging = path.join(parent, `.${path.basename(destination)}.${randomUUID()}.staging`);
 	let fd: number | undefined;
 	let stagingIdentity: { dev: bigint; ino: bigint } | undefined;
@@ -1208,9 +1307,10 @@ export function publishManagedFileNoReplaceSync(
 	destination: string,
 	bytes: Uint8Array,
 	root?: ManagedDirectoryRoot,
+	policy: ManagedSessionSecurityPolicy = "default",
 ): void {
 	const parent = path.dirname(destination);
-	ensureManagedDirectory(parent, root);
+	ensureManagedDirectory(parent, root, policy);
 	const staging = path.join(parent, `.${path.basename(destination)}.${randomUUID()}.staging`);
 	let fd: number | undefined;
 	let stagingIdentity: { dev: bigint; ino: bigint } | undefined;
@@ -1291,9 +1391,14 @@ export function publishManagedFileNoReplaceSync(
 }
 
 /** Replace one managed regular file while retaining the secured staging fd through publication. */
-export function replaceManagedFileSync(destination: string, bytes: Uint8Array, root: ManagedDirectoryRoot): void {
+export function replaceManagedFileSync(
+	destination: string,
+	bytes: Uint8Array,
+	root: ManagedDirectoryRoot,
+	policy: ManagedSessionSecurityPolicy = "default",
+): void {
 	const parent = path.dirname(destination);
-	ensureManagedDirectory(parent, root);
+	ensureManagedDirectory(parent, root, policy);
 	const staging = path.join(parent, `.${path.basename(destination)}.${randomUUID()}.replacement`);
 	let fd: number | undefined;
 	let stagedIdentity: { dev: bigint; ino: bigint } | undefined;
@@ -1338,8 +1443,9 @@ export async function replaceManagedFile(
 	destination: string,
 	bytes: Uint8Array,
 	root: ManagedDirectoryRoot,
+	policy: ManagedSessionSecurityPolicy = "default",
 ): Promise<void> {
-	replaceManagedFileSync(destination, bytes, root);
+	replaceManagedFileSync(destination, bytes, root, policy);
 }
 
 /** Copy the exact bytes captured from one no-follow source descriptor. */
@@ -1348,11 +1454,12 @@ export async function copyManagedFileNoReplace(
 	destination: string,
 	snapshot = captureManagedFileNoFollow(source),
 	root?: ManagedDirectoryRoot,
+	policy: ManagedSessionSecurityPolicy = "default",
 ): Promise<void> {
 	const named = captureManagedFileNoFollow(source);
 	if (!sameIdentity(snapshot.identity, named.identity) || !snapshot.bytes.equals(named.bytes))
 		throw new Error("source_changed");
-	await publishManagedFileNoReplace(destination, snapshot.bytes, undefined, root);
+	await publishManagedFileNoReplace(destination, snapshot.bytes, undefined, root, policy);
 	const destinationSnapshot = captureManagedFileNoFollow(destination);
 	if (!destinationSnapshot.bytes.equals(snapshot.bytes)) throw new Error("durability_failed");
 }
@@ -1362,8 +1469,9 @@ export async function acquireManagedLock(
 	locksDirectory: string,
 	name: string,
 	root?: ManagedDirectoryRoot,
+	policy: ManagedSessionSecurityPolicy = "default",
 ): Promise<ManagedStorageLock> {
-	ensureManagedDirectory(locksDirectory, root);
+	ensureManagedDirectory(locksDirectory, root, policy);
 	const lockPath = path.join(locksDirectory, `${name}.lock`);
 	const deadline = Date.now() + LOCK_WAIT_MS;
 	let staleObservedAt: number | undefined;
@@ -1513,7 +1621,10 @@ export function fsyncManagedArtifactTree(root: string): NativeDirectoryTreeSnaps
 		const stat = fs.lstatSync(pathname);
 		if (stat.isSymbolicLink()) throw new Error("unsafe_artifacts");
 		if (stat.isFile()) {
-			const fd = fs.openSync(pathname, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+			const fd = fs.openSync(
+				pathname,
+				(process.platform === "win32" ? fs.constants.O_WRONLY : fs.constants.O_RDONLY) | fs.constants.O_NOFOLLOW,
+			);
 			try {
 				fs.fsyncSync(fd);
 			} finally {

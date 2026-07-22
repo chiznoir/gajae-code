@@ -21,7 +21,12 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * confirmed-dead owner's lock in generation 10, legacy stopped-tombstone
  * reclamation in generation 11, force-escalated SIGKILL of an unresponsive
  * older-generation owner during automatic generation-upgrade reload in
- * generation 12, and restored macOS daemon signaling (kill(2) with a start-time
- * incarnation recheck, replacing the darwin no-op) in generation 13.
+ * generation 12, restored macOS daemon signaling (kill(2) with a start-time
+ * incarnation recheck, replacing the darwin no-op) in generation 13, retained
+ * legacy stopped-lock reclamation in generation 14, Windows expected-identity
+ * ACL verification and repair in generation 15, identity-fenced stale endpoint
+ * startup recovery in generation 16, Telegram topic recovery authority fencing
+ * in generation 17, and fail-closed blank-token validation plus lifecycle-startup
+ * stop fencing in generation 18.
  */
-export const DAEMON_GENERATION = 13;
+export const DAEMON_GENERATION = 18;

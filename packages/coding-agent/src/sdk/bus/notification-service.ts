@@ -251,18 +251,28 @@ export function formatNotificationStatusReport(report: NotificationStatusReport)
 
 // --- endpoint / daemon file readers -------------------------------------
 
-interface EndpointView {
+export interface NotificationEndpointView {
 	sessionId: string;
 	pid: number | undefined;
 	stale: boolean;
 }
 
-type EndpointFileRead =
-	| { kind: "endpoint"; view: EndpointView; identity: NotificationEndpointFileIdentity }
+export type NotificationEndpointLiveness = "live" | "dead" | "unknown";
+
+/**
+ * Classification used by recovery and startup takeover. A file is an endpoint
+ * only when it has endpoint authority fields; lifecycle/audit records are never
+ * candidates for endpoint cleanup.
+ */
+export type NotificationEndpointClassification =
+	| {
+			kind: "endpoint";
+			view: NotificationEndpointView;
+			liveness: NotificationEndpointLiveness;
+			identity: NotificationEndpointFileIdentity;
+	  }
 	| { kind: "non-endpoint" }
 	| { kind: "unreadable" };
-
-type EndpointLiveness = "live" | "dead" | "unknown";
 
 /**
  * Classify an endpoint using owner-proof semantics. An endpoint is only `dead`
@@ -271,7 +281,10 @@ type EndpointLiveness = "live" | "dead" | "unknown";
  * must never be treated as dead — removing it could delete a live session's
  * discovery file that simply omitted a pid.
  */
-function endpointLiveness(view: EndpointView, pidAlive: (pid: number) => boolean): EndpointLiveness {
+export function notificationEndpointLiveness(
+	view: NotificationEndpointView,
+	pidAlive: (pid: number) => boolean,
+): NotificationEndpointLiveness {
 	if (view.stale) return "dead";
 	if (view.pid === undefined) return "unknown";
 	return pidAlive(view.pid) ? "live" : "dead";
@@ -314,11 +327,19 @@ function isCanonicalLifecycleArtifactName(name: string): boolean {
 	);
 }
 
-function unreadableEndpointResult(file: string): EndpointFileRead {
+function unreadableEndpointResult(file: string): NotificationEndpointClassification {
 	return isCanonicalLifecycleArtifactName(path.basename(file)) ? { kind: "non-endpoint" } : { kind: "unreadable" };
 }
 
-async function readEndpointView(fs: NotificationServiceFs, file: string): Promise<EndpointFileRead> {
+/**
+ * Read and classify one endpoint candidate. The returned identity belongs to
+ * exactly the bytes inspected and is required for any later deletion.
+ */
+export async function classifyNotificationEndpoint(
+	fs: Pick<NotificationServiceFs, "readEndpointFile">,
+	file: string,
+	pidAlive: (pid: number) => boolean,
+): Promise<NotificationEndpointClassification> {
 	let endpoint: NotificationEndpointFile;
 	let raw: string;
 	try {
@@ -334,16 +355,19 @@ async function readEndpointView(fs: NotificationServiceFs, file: string): Promis
 		return unreadableEndpointResult(file);
 	}
 	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return { kind: "non-endpoint" };
+	if (path.basename(file) === "broker.json") return { kind: "non-endpoint" };
 	const rec = parsed as Record<string, unknown>;
 	if (isLifecycleArtifact(rec) || typeof rec.url !== "string" || typeof rec.token !== "string")
 		return { kind: "non-endpoint" };
+	const view: NotificationEndpointView = {
+		sessionId: typeof rec.sessionId === "string" ? rec.sessionId : path.basename(file, ".json"),
+		pid: safePositiveInteger(rec.pid),
+		stale: rec.stale === true,
+	};
 	return {
 		kind: "endpoint",
-		view: {
-			sessionId: typeof rec.sessionId === "string" ? rec.sessionId : path.basename(file, ".json"),
-			pid: safePositiveInteger(rec.pid),
-			stale: rec.stale === true,
-		},
+		view,
+		liveness: notificationEndpointLiveness(view, pidAlive),
 		identity: endpoint.identity,
 	};
 }
@@ -604,14 +628,13 @@ export async function checkNotificationHealth(opts: HealthOptions): Promise<Noti
 	let unknownEndpoints = 0;
 	let unreadable = 0;
 	for (const name of files) {
-		const record = await readEndpointView(fs, path.join(dir, name));
+		const record = await classifyNotificationEndpoint(fs, path.join(dir, name), pidAlive);
 		if (record.kind === "non-endpoint") continue;
 		if (record.kind === "unreadable") {
 			unreadable += 1;
 			continue;
 		}
-		const view = record.view;
-		switch (endpointLiveness(view, pidAlive)) {
+		switch (record.liveness) {
 			case "live":
 				live += 1;
 				break;
@@ -1040,7 +1063,7 @@ export async function recoverNotifications(opts: RecoveryOptions): Promise<Notif
 	let unreadable = 0;
 	for (const name of files) {
 		const file = path.join(dir, name);
-		const record = await readEndpointView(fs, file);
+		const record = await classifyNotificationEndpoint(fs, file, pidAlive);
 		if (record.kind === "non-endpoint") continue;
 		if (record.kind === "unreadable") {
 			// Leave unparseable files untouched: they may be mid-write by a live server.
@@ -1048,7 +1071,7 @@ export async function recoverNotifications(opts: RecoveryOptions): Promise<Notif
 			continue;
 		}
 		const view = record.view;
-		if (endpointLiveness(view, pidAlive) !== "dead") {
+		if (record.liveness !== "dead") {
 			// Keep live AND unknown (PID-less) endpoints: only positive proof of
 			// death (a stale tombstone or a dead pid) authorizes removal.
 			kept += 1;

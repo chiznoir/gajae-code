@@ -3038,6 +3038,21 @@ describe("AskTool Round-0 intent recovery", () => {
 		expect(question).not.toHaveProperty("workflowGate");
 	});
 
+	it("normalizes a null optional deepInterview field on an ordinary ask", () => {
+		const result = validateAsk({
+			questions: [
+				{
+					id: "ordinary",
+					question: "Choose one",
+					options: [{ label: "First" }, { label: "Second" }],
+					deepInterview: null,
+				},
+			],
+		});
+
+		expect(result.questions[0]).not.toHaveProperty("deepInterview");
+	});
+
 	it("terminally rejects every recovery-shaped near-miss before coercion", () => {
 		const recorder = spyOn(deepInterviewRecorder, "appendOrMergeDeepInterviewRound");
 		const gateEmitter = { isUnattended: () => true, emitGate: vi.fn() };
@@ -3088,8 +3103,6 @@ describe("AskTool Round-0 intent recovery", () => {
 			encodedDeepInterview.questions[0].deepInterview,
 		) as never;
 		const nullQuestions = { questions: null } as unknown as Record<string, unknown>;
-		const nullDeepInterview = roundZeroPair();
-		nullDeepInterview.questions[0].deepInterview = null as never;
 		const malformedContractOnly = roundZeroPair();
 		Reflect.deleteProperty(malformedContractOnly.questions[0].deepInterview, "intent_review");
 		malformedContractOnly.questions[0].deepInterview.round = 1;
@@ -3134,7 +3147,6 @@ describe("AskTool Round-0 intent recovery", () => {
 			encodedQuestion,
 			encodedDeepInterview,
 			nullQuestions,
-			nullDeepInterview,
 			malformedContractOnly,
 			malformedReviewOnly,
 			sparseAdapterContext,

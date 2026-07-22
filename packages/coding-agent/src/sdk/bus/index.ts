@@ -30,7 +30,7 @@ import { promisify } from "node:util";
 import { ThinkingLevel } from "@gajae-code/agent-core";
 import type { ImageContent, TextContent, Tool } from "@gajae-code/ai";
 import { NotificationServer, nativeBuildInfo } from "@gajae-code/natives";
-import { logger, postmortem, prompt, VERSION } from "@gajae-code/utils";
+import { logger, postmortem, VERSION } from "@gajae-code/utils";
 import { Settings } from "../../config/settings";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "../../extensibility/extensions";
 import { toAgentWireEventPayload } from "../../modes/shared/agent-wire/event-envelope";
@@ -40,7 +40,6 @@ import {
 	type WorkflowGateTerminalController,
 	type WorkflowGateTerminalProof,
 } from "../../modes/shared/agent-wire/workflow-gate-broker";
-import btwUserPrompt from "../../prompts/system/btw-user.md" with { type: "text" };
 import type { AgentSessionEvent } from "../../session/agent-session";
 import { parseThinkingLevel } from "../../thinking";
 import type {
@@ -2778,7 +2777,7 @@ export function createNotificationsExtension(
 		sdkHostModeSupported?: boolean;
 
 		onSdkRequest?: (kind: "control" | "query", connectionId: string, frame: Record<string, unknown>) => void;
-		runEphemeralTurn?: (promptText: string, signal: AbortSignal) => Promise<{ replyText: string }>;
+		runBtwTurn?: (question: string, signal: AbortSignal) => Promise<{ replyText: string }>;
 		/** Observes settlement of optional session-branch startup after reconciliation completes. */
 		onBranchStartupSettled?: (receipt: { sessionId: string; status: SessionStartResult["status"] }) => void;
 		readNotificationFile?: (path: string) => Promise<Buffer>;
@@ -3587,10 +3586,10 @@ export function createNotificationsExtension(
 		};
 
 		const ephemeralTurns = new EphemeralTurnHost(sendSdkFrame, async (question, signal) => {
-			if (!options.runEphemeralTurn) throw new Error("Ephemeral turns are unavailable.");
+			if (!options.runBtwTurn) throw new Error("Ephemeral turns are unavailable.");
 			const generation = initializedRuntime.policyGeneration;
 			if (initializedRuntime.policySuspended) throw new Error("Notification policy is provisional.");
-			const result = await options.runEphemeralTurn(prompt.render(btwUserPrompt, { question }), signal);
+			const result = await options.runBtwTurn(question, signal);
 			if (
 				initializedRuntime.policySuspended ||
 				initializedRuntime.policyGeneration !== generation ||

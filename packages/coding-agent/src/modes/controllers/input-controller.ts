@@ -752,6 +752,29 @@ export class InputController {
 	async submitText(text: string, composer: ComposerSubmissionOptions): Promise<void> {
 		text = text.trim();
 		if ((!isSettingsInitialized() || settings.get("emojiAutocomplete")) && text) text = expandEmoticons(text);
+		if (this.ctx.hasActiveBtw()) {
+			if (!text) return;
+			if (!text.startsWith("/")) {
+				const result = await this.ctx.handleBtwFollowUp(text);
+				if (result === "accepted" && this.#canModifyComposer(composer)) {
+					this.ctx.editor.setText("");
+					this.ctx.pendingImages = [];
+				}
+				return;
+			}
+		}
+
+		if (/^\/btw(?:\s|$)/.test(text)) {
+			const slashResult = await executeBuiltinSlashCommand(text, {
+				ctx: this.ctx,
+				handleBackgroundCommand: () => this.handleBackgroundCommand(),
+				composer,
+			});
+			if (slashResult === true) {
+				this.ctx.pendingImages = [];
+				return;
+			}
+		}
 
 		// Empty submit while streaming with queued messages: flush queues immediately
 		if (!text && this.ctx.session.isStreaming && this.ctx.session.queuedMessageCount > 0) {
@@ -1357,6 +1380,14 @@ export class InputController {
 	async handleFollowUp(): Promise<void> {
 		const text = this.ctx.editor.getText().trim();
 		if (!text) return;
+		// While /btw is open, plain text stays in the side chat. Slash-origin
+		// input keeps normal dispatch so commands remain available.
+		if (this.ctx.hasActiveBtw() && !text.startsWith("/")) {
+			if ((await this.ctx.handleBtwFollowUp(text)) === "accepted") {
+				this.ctx.editor.setText("");
+			}
+			return;
+		}
 
 		// Compaction first: while compacting, queue free text and `/skill:*`
 		// commands in the compaction-local queue. `flushCompactionQueue`

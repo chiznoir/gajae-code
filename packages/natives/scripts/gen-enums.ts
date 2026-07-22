@@ -209,12 +209,20 @@ function applyPathIdentityTypes(dts: string): string {
 			'export declare function applyOwnerOnlyFdSecurity(path: string, kind: "directory" | "file", callerFd: number): NativeOwnerOnlySecurityResult',
 		)
 		.replace(
+			/^export declare function verifyOwnerOnlyPathSecurityExpected\([^\n]*$/m,
+			'export declare function verifyOwnerOnlyPathSecurityExpected(path: string, kind: "directory" | "file", expectedDev: bigint, expectedIno: bigint): NativeOwnerOnlySecurityResult',
+		)
+		.replace(
 			/^export declare function verifyOwnerOnlyPathSecurity\([^\n]*$/m,
 			'export declare function verifyOwnerOnlyPathSecurity(path: string, kind: "directory" | "file"): NativeOwnerOnlySecurityResult',
 		)
 		.replace(
 			/^export declare function verifyOwnerOnlyFdSecurity\([^\n]*$/m,
 			'export declare function verifyOwnerOnlyFdSecurity(path: string, kind: "directory" | "file", callerFd: number): NativeOwnerOnlySecurityResult',
+		)
+		.replace(
+			/^export declare function repairOwnerOnlyPathSecurityExpected\([^\n]*$/m,
+			'export declare function repairOwnerOnlyPathSecurityExpected(path: string, kind: "directory" | "file", expectedDev: bigint, expectedIno: bigint): NativeOwnerOnlySecurityResult',
 		)
 		.replace(/export interface NativeCanonicalDirectoryIdentity \{[\s\S]*?\n\}/, identity)
 		.replace(

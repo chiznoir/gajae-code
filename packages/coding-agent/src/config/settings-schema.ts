@@ -819,6 +819,15 @@ export const SETTINGS_SCHEMA = {
 		type: "boolean",
 		default: true,
 	},
+	"statusLine.showActionHints": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "appearance",
+			label: "Status Line Action Hints",
+			description: "Show contextual keyboard shortcuts in the status line",
+		},
+	},
 
 	"statusLine.leftSegments": { type: "array", default: [] as StatusLineSegmentId[] },
 
@@ -2451,9 +2460,9 @@ export const SETTINGS_SCHEMA = {
 		default: false,
 		ui: {
 			tab: "tools",
-			label: "Insane Search Fallback",
+			label: "Insane Search Fallback (Compatibility)",
 			description:
-				"Opt in to the vendored insane-search escalation for blocked public URL reads (403/WAF/JS-gated). Off by default. Requires preinstalled python3 + curl_cffi (and node + playwright/stealth for the browser phase); changes network posture by enabling TLS/browser impersonation for public pages.",
+				"Compatibility-only preference. Remote renderer fallback stays disabled because it cannot preserve validated per-hop network routing.",
 		},
 	},
 
@@ -3290,23 +3299,64 @@ export const SETTINGS_SCHEMA = {
 	},
 	"providers.image": {
 		type: "enum",
-		values: ["auto", "openai", "gemini", "openrouter", "antigravity"] as const,
+		values: ["auto", "openai", "gemini", "openrouter", "antigravity", "custom"] as const,
 		default: "auto",
 		ui: {
 			tab: "providers",
-			label: "Image Provider",
-			description: "Provider for image generation tool",
+			label: "Image Generation",
+			description: "Provider and model for image generation tool",
 			options: [
 				{
 					value: "auto",
 					label: "Auto",
 					description: "Priority: GPT model image tool > Antigravity > OpenRouter > Gemini",
 				},
-				{ value: "openai", label: "OpenAI", description: "Uses the active GPT Responses/Codex model" },
+				{ value: "openai", label: "OpenAI", description: "Uses gpt-image-2 via OpenAI Responses/Codex" },
 				{ value: "gemini", label: "Gemini", description: "Requires GEMINI_API_KEY" },
 				{ value: "openrouter", label: "OpenRouter", description: "Requires OPENROUTER_API_KEY" },
 				{ value: "antigravity", label: "Antigravity", description: "Requires login with google-antigravity" },
+				{
+					value: "custom",
+					label: "Custom",
+					description: "OpenAI-compatible endpoint (set providers.imageCustomUrl)",
+				},
 			],
+		},
+	},
+	"providers.imageModel": {
+		type: "string",
+		default: undefined,
+		ui: {
+			tab: "providers",
+			label: "Image Model",
+			description: "Override the default image generation model for the selected provider",
+		},
+	},
+	"providers.imageCustomUrl": {
+		type: "string",
+		default: undefined,
+		ui: {
+			tab: "providers",
+			label: "Image Custom URL",
+			description: "Base URL for custom OpenAI-compatible image endpoint",
+		},
+	},
+	"providers.imageCustomKey": {
+		type: "string",
+		default: undefined,
+		ui: {
+			tab: "providers",
+			label: "Image Custom API Key",
+			description: "API key for custom OpenAI-compatible image endpoint",
+		},
+	},
+	"providers.imageCustomKeyEnv": {
+		type: "string",
+		default: undefined,
+		ui: {
+			tab: "providers",
+			label: "Image Custom API Key Env",
+			description: "Environment variable name holding the API key for custom image endpoint",
 		},
 	},
 
@@ -3740,6 +3790,7 @@ export interface StatusLineSettings {
 	maxRows: number;
 	showHookStatus: boolean;
 	showSkillHud: boolean;
+	showActionHints: boolean;
 	leftSegments: StatusLineSegmentId[];
 	rightSegments: StatusLineSegmentId[];
 	segmentOptions: Record<string, unknown>;

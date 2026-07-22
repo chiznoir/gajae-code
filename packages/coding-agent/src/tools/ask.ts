@@ -317,7 +317,7 @@ function isRoundZeroRecoveryCandidate(value: unknown): boolean {
 		const question = parseEncodedContainer(rawQuestion);
 		if (typeof question !== "object" || question === null || !Object.hasOwn(question, "deepInterview")) return false;
 		const deepInterview = parseEncodedContainer((question as Record<string, unknown>).deepInterview);
-		if (typeof deepInterview !== "object" || deepInterview === null) return deepInterview === null;
+		if (typeof deepInterview !== "object" || deepInterview === null) return false;
 		const metadata = deepInterview as Record<string, unknown>;
 		return Object.hasOwn(metadata, "intent_contract") || Object.hasOwn(metadata, "intent_review");
 	});

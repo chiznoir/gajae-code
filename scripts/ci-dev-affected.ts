@@ -61,6 +61,7 @@ const NATIVE_BUILD_KEYS: ReadonlySet<string> = new Set(["native-build", "native-
 // not follow the source-file basename convention. They supplement, rather than
 // replace, direct-basename test selection and owner fallback tasks.
 const BEHAVIORAL_OWNER_TESTS: Readonly<Record<string, readonly string[]>> = {
+	"artifacts/architecture-2383-eval.json": ["packages/ai/test/anthropic-cache-eval.integration.test.ts"],
 	"packages/coding-agent/src/main.ts": ["packages/coding-agent/test/startup-update-contract.test.ts"],
 };
 
@@ -86,7 +87,7 @@ export interface Task {
 	command: readonly string[];
 	cwd?: string;
 	capabilities?: TaskCapabilities;
-	phase?: "legacy" | "native-producer" | "ts-build" | "cargo-build";
+	phase?: "legacy" | "native-producer" | "ts-build" | "cargo-build" | "python";
 }
 
 export interface TaskCapabilities {
@@ -237,6 +238,7 @@ export function planFullTasks(packages: readonly WorkspacePackage[]): Task[] {
 	add(tasks, "rust-check", "Rust check", ["bun", "run", "check:rs"]);
 	addRustTestTasks(tasks);
 	add(tasks, "cli-smoke", "GJC CLI smoke test", ["bun", "run", "ci:test:smoke"]);
+	addPythonTasks(tasks);
 	add(tasks, "runtime-check", "Runtime checks (needs native addon)", ["bun", "run", "check:runtime"], resolvePackageCwd("packages/coding-agent"));
 	// root-check (ci:check:full) is intentionally omitted: Main CI runs it in the
 	// dedicated native-free `check` job, so emitting it here would double-run it.
@@ -262,6 +264,12 @@ function addRustTestTasks(tasks: Map<string, Task>): void {
 	}
 }
 
+
+function addPythonTasks(tasks: Map<string, Task>): void {
+	add(tasks, "python-check", "Python SDK type check", ["bun", "run", "check:py-sdk"], undefined, { rust: false, nextest: false, nativeConsumer: false, nativeProducer: false }, "python");
+	add(tasks, "python-test", "Python SDK tests", ["bun", "run", "test:py-sdk"], undefined, { rust: false, nextest: false, nativeConsumer: true, nativeProducer: false }, "python");
+	add(tasks, "python-build-smoke", "Python SDK build smoke", ["bun", "run", "ci:test:py-sdk-build"], undefined, { rust: false, nextest: false, nativeConsumer: false, nativeProducer: false }, "python");
+}
 async function resolvePlannedTasks(paths: readonly string[]): Promise<Task[]> {
 	if (isForceFullMode()) return planFullTasks(await getWorkspacePackages());
 	const fromArtifact = await loadCanonicalPlan();
@@ -329,6 +337,7 @@ function isNativeBuildKey(key: string): boolean {
 // build task, so the shard can always download the artifact built once upstream.
 function taskNeedsNative(key: string): boolean {
 	return (
+		key === "python-test" ||
 		key === "root-test" ||
 		key === "root-check" ||
 		key === "check:@gajae-code/coding-agent" ||
@@ -428,14 +437,19 @@ async function emitFullMatrix(): Promise<void> {
 
 	const githubOutput = process.env.GITHUB_OUTPUT;
 	if (!githubOutput) return;
-	const shards = entries
-		.filter(entry => !entry.nativeBuild)
-		.map(entry => ({ key: entry.key, identity: entry.identity, description: entry.description, native: entry.native, rust: entry.rust, nextest: entry.nextest }));
+	const shards = tasks
+		.filter(task => task.capabilities?.nativeProducer !== true && task.phase !== "python")
+		.map(task => {
+			const entry = describeTasks([task])[0]!;
+			return { key: entry.key, identity: entry.identity, description: entry.description, native: entry.native, rust: entry.rust, nextest: entry.nextest };
+		});
 	const hasNative = entries.some(entry => entry.nativeBuild);
+	const hasPython = tasks.some(task => task.phase === "python");
 	const lines = [
 		`matrix=${JSON.stringify({ include: shards })}`,
 		`has_tasks=${shards.length > 0}`,
 		`has_native=${hasNative}`,
+		`has_python=${hasPython}`,
 		"",
 	];
 	await fs.appendFile(githubOutput, lines.join("\n"));
@@ -457,16 +471,21 @@ async function emitMatrix(): Promise<void> {
 
 	const githubOutput = process.env.GITHUB_OUTPUT;
 	if (!githubOutput) return;
-	const shards = entries
-		.filter(entry => !entry.nativeBuild)
-		.map(entry => ({ key: entry.key, identity: entry.identity, description: entry.description, native: entry.native, rust: entry.rust, nextest: entry.nextest }));
+	const shards = tasks
+		.filter(task => task.capabilities?.nativeProducer !== true && task.phase !== "python")
+		.map(task => {
+			const entry = describeTasks([task])[0]!;
+			return { key: entry.key, identity: entry.identity, description: entry.description, native: entry.native, rust: entry.rust, nextest: entry.nextest };
+		});
 	const hasNative = entries.some(entry => entry.nativeBuild);
+	const hasPython = tasks.some(task => task.phase === "python");
 	const hasDarwinArm64TabWorkerSmoke = needsDarwinArm64TabWorkerSmoke(paths);
 	const hasWindowsSessionPath = needsWindowsSessionPathRegression(paths);
 	const lines = [
 		`matrix=${JSON.stringify({ include: shards })}`,
 		`has_tasks=${shards.length > 0}`,
 		`has_native=${hasNative}`,
+		`has_python=${hasPython}`,
 		`has_darwin_arm64_tab_worker_smoke=${hasDarwinArm64TabWorkerSmoke}`,
 		`has_windows_session_path=${hasWindowsSessionPath}`,
 		`plan_digest=${digest}`,
@@ -735,6 +754,10 @@ export function planTasks(paths: readonly string[], packages: readonly Workspace
 		add(tasks, "bridge-client-sdk-package-smoke", "Bridge-client SDK package smoke", ["bun", "packages/coding-agent/scripts/build-sdk-package-smoke.ts"]);
 	}
 
+	if (paths.some(isPythonPath)) {
+		addPythonTasks(tasks);
+		addNativeBuild(tasks);
+	}
 	if (rustChanged) {
 		add(tasks, "rust-check", "Rust check", ["bun", "run", "check:rs"]);
 		add(tasks, "rust-test", "Rust tests", ["bun", "run", "test:rs"]);
@@ -799,6 +822,10 @@ export function planTargetedTasks(paths: readonly string[], packages: readonly W
 		if (isRustPath(changedPath)) {
 			add(tasks, "rust-check", "Rust check", ["bun", "run", "check:rs"]);
 			add(tasks, "rust-test", "Rust tests", ["bun", "run", "test:rs"]);
+			continue;
+		}
+		if (isPythonPath(changedPath)) {
+			addPythonTasks(tasks);
 			continue;
 		}
 		if (isInstallPath(changedPath)) {
@@ -986,9 +1013,17 @@ function addNativeBuild(tasks: Map<string, Task>): void {
 	add(tasks, "native-linux-x64", "Build linux x64 native addons", ["bash", "-lc", 'TARGET_VARIANTS="baseline modern" bun scripts/ci-build-native.ts']);
 }
 
-function add(tasks: Map<string, Task>, key: string, description: string, command: readonly string[], cwd?: string): void {
+function add(
+	tasks: Map<string, Task>,
+	key: string,
+	description: string,
+	command: readonly string[],
+	cwd?: string,
+	capabilities?: TaskCapabilities,
+	phase?: Task["phase"],
+): void {
 	if (!tasks.has(key)) {
-		tasks.set(key, { key, description, command, cwd });
+		tasks.set(key, { key, description, command, cwd, capabilities, phase });
 	}
 }
 
@@ -1083,6 +1118,10 @@ function addReleasePublishTasks(tasks: Map<string, Task>): void {
 	addTestFileTask(tasks, "scripts/release-evidence.test.ts");
 }
 
+
+function isPythonPath(changedPath: string): boolean {
+	return changedPath.startsWith("python/gjc-sdk/");
+}
 
 function isRustPath(changedPath: string): boolean {
 	const fileName = path.basename(changedPath);
@@ -1438,6 +1477,7 @@ export interface AffectedAggregateResults {
 	plan: string;
 	native: string;
 	shards: string;
+	python: string;
 	windowsDoctor: string;
 	windowsDoctorRequired: string;
 	telegramGuard: string;
@@ -1446,6 +1486,7 @@ export interface AffectedAggregateResults {
 	telegramWindowsRequired: string;
 	hasNative: string;
 	hasTasks: string;
+	hasPython: string;
 	darwinArm64TabWorkerSmoke: string;
 	darwinArm64TabWorkerSmokeRequired: string;
 }
@@ -1454,8 +1495,10 @@ export function validateAffectedAggregate(results: AffectedAggregateResults): vo
 	if (results.plan !== "success") throw new Error("planner did not succeed");
 	if (results.hasNative !== "true" && results.hasNative !== "false") throw new Error(`planner emitted invalid has_native=${results.hasNative}`);
 	if (results.hasTasks !== "true" && results.hasTasks !== "false") throw new Error(`planner emitted invalid has_tasks=${results.hasTasks}`);
+	if (results.hasPython !== "true" && results.hasPython !== "false") throw new Error(`planner emitted invalid has_python=${results.hasPython}`);
 	if (results.native !== (results.hasNative === "true" ? "success" : "skipped")) throw new Error(results.hasNative === "true" ? "required native build did not succeed" : "unplanned native build was not skipped");
 	if (results.shards !== (results.hasTasks === "true" ? "success" : "skipped")) throw new Error(results.hasTasks === "true" ? "required affected shards did not succeed" : "unplanned affected shards were not skipped");
+	if (results.python !== (results.hasPython === "true" ? "success" : "skipped")) throw new Error(results.hasPython === "true" ? "required Python matrix did not succeed" : "unplanned Python matrix was not skipped");
 	if (results.windowsDoctorRequired !== "true" && results.windowsDoctorRequired !== "false") throw new Error(`planner emitted invalid windows_doctor_required=${results.windowsDoctorRequired}`);
 	if (results.windowsDoctor !== (results.windowsDoctorRequired === "true" ? "success" : "skipped")) throw new Error(results.windowsDoctorRequired === "true" ? "required Windows dev:doctor did not succeed" : "unplanned Windows dev:doctor was not skipped");
 	if (results.darwinArm64TabWorkerSmokeRequired !== "true" && results.darwinArm64TabWorkerSmokeRequired !== "false") throw new Error(`planner emitted invalid darwin_arm64_tab_worker_smoke_required=${results.darwinArm64TabWorkerSmokeRequired}`);
@@ -1471,6 +1514,7 @@ async function validateAggregate(): Promise<void> {
 		plan: Bun.env.CI_DEV_PLAN_RESULT?.trim() || "",
 		native: Bun.env.CI_DEV_NATIVE_RESULT?.trim() || "",
 		shards: Bun.env.CI_DEV_SHARDS_RESULT?.trim() || "",
+		python: Bun.env.CI_DEV_PYTHON_RESULT?.trim() || "",
 		windowsDoctor: Bun.env.CI_DEV_WINDOWS_DOCTOR_RESULT?.trim() || "",
 		windowsDoctorRequired: Bun.env.CI_DEV_WINDOWS_DOCTOR_REQUIRED?.trim() || "",
 		telegramGuard: Bun.env.CI_DEV_TELEGRAM_GUARD_RESULT?.trim() || "",
@@ -1479,6 +1523,7 @@ async function validateAggregate(): Promise<void> {
 		telegramWindowsRequired: Bun.env.CI_DEV_TELEGRAM_WINDOWS_REQUIRED?.trim() || "",
 		hasNative: Bun.env.CI_DEV_HAS_NATIVE?.trim() || "",
 		hasTasks: Bun.env.CI_DEV_HAS_TASKS?.trim() || "",
+		hasPython: Bun.env.CI_DEV_HAS_PYTHON?.trim() || "",
 		darwinArm64TabWorkerSmoke: Bun.env.CI_DEV_DARWIN_ARM64_TAB_WORKER_SMOKE_RESULT?.trim() || "",
 		darwinArm64TabWorkerSmokeRequired: Bun.env.CI_DEV_DARWIN_ARM64_TAB_WORKER_SMOKE_REQUIRED?.trim() || "",
 	};
@@ -1487,8 +1532,10 @@ async function validateAggregate(): Promise<void> {
 	console.log(`affected-plan: ${results.plan}`);
 	console.log(`affected-native: ${results.native}`);
 	console.log(`affected-shards: ${results.shards}`);
+	console.log(`affected-python-matrix: ${results.python}`);
 	console.log(`planned native work: ${results.hasNative}`);
 	console.log(`planned shard work: ${results.hasTasks}`);
+	console.log(`planned Python work: ${results.hasPython}`);
 	console.log(`windows-dev-doctor: ${results.windowsDoctor}`);
 	console.log(`planned Windows dev:doctor: ${results.windowsDoctorRequired}`);
 	console.log(`darwin-arm64 tab-worker smoke: ${results.darwinArm64TabWorkerSmoke}`);
@@ -1504,11 +1551,12 @@ async function validateAggregate(): Promise<void> {
 	console.log("Affected path validation: all required shards passed");
 }
 
-function validatePlanCapabilities(tasks: readonly Task[], results: Pick<AffectedAggregateResults, "hasNative" | "hasTasks">, mode: string): void {
+function validatePlanCapabilities(tasks: readonly Task[], results: Pick<AffectedAggregateResults, "hasNative" | "hasTasks" | "hasPython">, mode: string): void {
 	if (mode !== "pr" && mode !== "push") throw new Error("affected-plan-invalid: invalid plan mode");
 	const expectedHasNative = String(tasks.some(task => task.capabilities?.nativeProducer === true));
-	const expectedHasTasks = String(tasks.some(task => task.capabilities?.nativeProducer !== true));
-	if (results.hasNative !== expectedHasNative || results.hasTasks !== expectedHasTasks) throw new Error("affected-plan-invalid: plan capability flags mismatch");
+	const expectedHasTasks = String(tasks.some(task => task.capabilities?.nativeProducer !== true && task.phase !== "python"));
+	const expectedHasPython = String(tasks.some(task => task.phase === "python"));
+	if (results.hasNative !== expectedHasNative || results.hasTasks !== expectedHasTasks || results.hasPython !== expectedHasPython) throw new Error("affected-plan-invalid: plan capability flags mismatch");
 }
 
 const AFFECTED_EVIDENCE_MANIFEST = ".ci-dev-affected-evidence.json";
@@ -1566,7 +1614,7 @@ async function readEvidenceFile(root: string, relative: string): Promise<string>
 async function checkEvidenceDirectory(root: string, relative: string): Promise<string> { return checkedEvidencePath(root, relative, "directory"); }
 
 function expectedEvidenceTasks(tasks: readonly Task[]): EvidenceTask[] {
-	return tasks.filter(task => task.capabilities?.nativeProducer !== true).map(task => ({ key: task.key, identity: canonicalTaskIdentity(task) }));
+	return tasks.filter(task => task.capabilities?.nativeProducer !== true && task.phase !== "python").map(task => ({ key: task.key, identity: canonicalTaskIdentity(task) }));
 }
 function expectedEvidenceNames(tasks: readonly Task[]): string[] {
 	return [AFFECTED_PLAN_NAME, ...expectedEvidenceTasks(tasks).map((_, index) => `${AFFECTED_SHARD_DIR}/${index}.json`)];
@@ -1579,6 +1627,7 @@ function aggregateFromEnv(): AffectedAggregateResults {
 		plan: requiredEnv("CI_DEV_PLAN_RESULT"),
 		native: requiredEnv("CI_DEV_NATIVE_RESULT"),
 		shards: requiredEnv("CI_DEV_SHARDS_RESULT"),
+		python: requiredEnv("CI_DEV_PYTHON_RESULT"),
 		windowsDoctor: requiredEnv("CI_DEV_WINDOWS_DOCTOR_RESULT"),
 		windowsDoctorRequired: requiredEnv("CI_DEV_WINDOWS_DOCTOR_REQUIRED"),
 		telegramGuard: requiredEnv("CI_DEV_TELEGRAM_GUARD_RESULT"),
@@ -1587,6 +1636,7 @@ function aggregateFromEnv(): AffectedAggregateResults {
 		telegramWindowsRequired: requiredEnv("CI_DEV_TELEGRAM_WINDOWS_REQUIRED"),
 		hasNative: requiredEnv("CI_DEV_HAS_NATIVE"),
 		hasTasks: requiredEnv("CI_DEV_HAS_TASKS"),
+		hasPython: requiredEnv("CI_DEV_HAS_PYTHON"),
 		darwinArm64TabWorkerSmoke: requiredEnv("CI_DEV_DARWIN_ARM64_TAB_WORKER_SMOKE_RESULT"),
 		darwinArm64TabWorkerSmokeRequired: requiredEnv("CI_DEV_DARWIN_ARM64_TAB_WORKER_SMOKE_REQUIRED"),
 	};
@@ -1600,6 +1650,7 @@ function parseAggregate(value: unknown): AffectedAggregateResults {
 			"native",
 			"shards",
 			"windowsDoctor",
+			"python",
 			"windowsDoctorRequired",
 			"telegramGuard",
 			"telegramGuardRequired",
@@ -1607,6 +1658,7 @@ function parseAggregate(value: unknown): AffectedAggregateResults {
 			"telegramWindowsRequired",
 			"hasNative",
 			"hasTasks",
+			"hasPython",
 			"darwinArm64TabWorkerSmoke",
 			"darwinArm64TabWorkerSmokeRequired",
 		],
@@ -1617,6 +1669,7 @@ function parseAggregate(value: unknown): AffectedAggregateResults {
 		plan: value.plan as string,
 		native: value.native as string,
 		shards: value.shards as string,
+		python: value.python as string,
 		windowsDoctor: value.windowsDoctor as string,
 		windowsDoctorRequired: value.windowsDoctorRequired as string,
 		telegramGuard: value.telegramGuard as string,
@@ -1625,6 +1678,7 @@ function parseAggregate(value: unknown): AffectedAggregateResults {
 		telegramWindowsRequired: value.telegramWindowsRequired as string,
 		hasNative: value.hasNative as string,
 		hasTasks: value.hasTasks as string,
+		hasPython: value.hasPython as string,
 		darwinArm64TabWorkerSmoke: value.darwinArm64TabWorkerSmoke as string,
 		darwinArm64TabWorkerSmokeRequired: value.darwinArm64TabWorkerSmokeRequired as string,
 	};
@@ -1745,7 +1799,7 @@ async function validateShardReceipts(): Promise<void> {
 	const tasks = await loadCanonicalPlan();
 	if (!tasks) throw new Error("affected-plan-invalid: shard receipt validation requires a canonical plan");
 	const expected = tasks
-		.filter(task => task.capabilities?.nativeProducer !== true)
+		.filter(task => task.capabilities?.nativeProducer !== true && task.phase !== "python")
 		.map(task => ({ key: task.key, identity: canonicalTaskIdentity(task) }))
 		.sort((left, right) => left.key.localeCompare(right.key));
 	const receiptDir = path.resolve(repoRoot, Bun.env.CI_DEV_SHARD_RECEIPTS?.trim() || ".ci-dev-shard-receipts");
@@ -1805,7 +1859,7 @@ function deserializeTask(value: unknown): Task {
 	assertExactKeys(capabilities, ["rust", "nextest", "nativeConsumer", "nativeProducer"], "task capabilities");
 	if (value.cwd !== undefined && value.cwd !== ".") normalizeInventoryPath(value.cwd);
 	const phase = value.phase;
-	if (phase !== "legacy" && phase !== "native-producer" && phase !== "ts-build" && phase !== "cargo-build") throw new Error("affected-plan-invalid: missing task phase");
+	if (phase !== "legacy" && phase !== "native-producer" && phase !== "ts-build" && phase !== "cargo-build" && phase !== "python") throw new Error("affected-plan-invalid: missing task phase");
 	return {
 		key: value.key,
 		identity: value.identity,

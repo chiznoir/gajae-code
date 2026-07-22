@@ -1959,6 +1959,13 @@ export interface RecoveryFsResult {
 
 export declare function renameNoReplacePath(sourcePath: string, destinationPath: string): NativeExactUnlinkResult
 
+/**
+ * Repair the owner-only ACL for an existing path only when its retained
+ * no-follow handle still identifies the expected object. The expected
+ * identity is checked before any ACL mutation and again after the repair.
+ */
+export declare function repairOwnerOnlyPathSecurityExpected(path: string, kind: "directory" | "file", expectedDev: bigint, expectedIno: bigint): NativeOwnerOnlySecurityResult
+
 /** A client reply forwarded to the TypeScript host for gate resolution. */
 export interface ReplyEvent {
   /**
@@ -2186,6 +2193,12 @@ export declare function truncateToWidth(text: string, maxWidth: number, ellipsis
 export declare function verifyOwnerOnlyFdSecurity(path: string, kind: "directory" | "file", callerFd: number): NativeOwnerOnlySecurityResult
 
 export declare function verifyOwnerOnlyPathSecurity(path: string, kind: "directory" | "file"): NativeOwnerOnlySecurityResult
+
+/**
+ * Verify owner-only security for the exact expected target using a no-follow
+ * handle. The target identity is checked before and after verification.
+ */
+export declare function verifyOwnerOnlyPathSecurityExpected(path: string, kind: "directory" | "file", expectedDev: bigint, expectedIno: bigint): NativeOwnerOnlySecurityResult
 
 /**
  * Calculate visible width of text, excluding ANSI escape sequences.

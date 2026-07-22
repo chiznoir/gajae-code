@@ -92,6 +92,7 @@ import type { FileSlashCommand } from "../extensibility/slash-commands";
 import type { HindsightSessionState } from "../hindsight/state";
 import { initializeLocalRoot, LocalProtocolHandler, type LocalProtocolOptions } from "../internal-urls";
 import { resolveMemoryBackend } from "../memory-backend";
+import btwUserPrompt from "../prompts/system/btw-user.md" with { type: "text" };
 import asyncResultTemplate from "../prompts/tools/async-result.md" with { type: "text" };
 import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
 import { MCPManager } from "../runtime-mcp";
@@ -149,6 +150,7 @@ import {
 	ReadTool,
 	ResolveTool,
 	SearchTool,
+	setConfiguredImageModel,
 	setPreferredImageProvider,
 	setPreferredSearchProvider,
 	setSearchFallbackProviders,
@@ -1158,14 +1160,26 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		applyConfiguredSearchTimeout(settings);
 
 		const imageProvider = settings.get("providers.image");
+		const imageModel = settings.get("providers.imageModel");
+		const imageCustomUrl = settings.get("providers.imageCustomUrl");
+		const imageCustomKey = settings.get("providers.imageCustomKey");
+		const imageCustomKeyEnv = settings.get("providers.imageCustomKeyEnv");
 		if (
 			imageProvider === "auto" ||
 			imageProvider === "openai" ||
 			imageProvider === "gemini" ||
 			imageProvider === "openrouter" ||
-			imageProvider === "antigravity"
+			imageProvider === "antigravity" ||
+			imageProvider === "custom"
 		) {
-			setPreferredImageProvider(imageProvider);
+			setPreferredImageProvider(imageProvider === "custom" ? "auto" : imageProvider);
+			setConfiguredImageModel({
+				provider: imageProvider,
+				model: imageModel ?? null,
+				customUrl: imageCustomUrl,
+				customKey: imageCustomKey,
+				customKeyEnv: imageCustomKeyEnv,
+			});
 		}
 
 		const sessionManager =
@@ -1590,13 +1604,19 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// which collapses to the parent's dir for subagents (they adopt the
 		// parent's ArtifactManager) so one lookup hits everything.
 		const getArtifactsDir = () => sessionManager.getArtifactsDir();
+		const localProtocolOptions = options.localProtocolOptions ?? {
+			getArtifactsDir,
+			isManagedDestination: () => sessionManager.isManagedDestination(),
+			getManagedLegacyLocalMigrationSource: () => sessionManager.getManagedLegacyLocalMigrationSource(),
+			getSessionId: () => sessionManager.getSessionId(),
+		};
 		if (!options.parentTaskPrefix) {
 			setActiveSkills(skills);
 			setActiveRules([...rulebookRules, ...alwaysApplyRules]);
 			if (asyncJobManager) AsyncJobManager.setInstance(asyncJobManager);
 		}
+		await initializeLocalRoot(localProtocolOptions);
 		if (options.localProtocolOptions) {
-			await initializeLocalRoot(options.localProtocolOptions);
 			disposeLocalProtocolOverride = LocalProtocolHandler.installOverride(options.localProtocolOptions);
 		}
 		toolSession.getArtifactsDir = getArtifactsDir;
@@ -1849,9 +1869,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						spawnedByGjc,
 						sdkHostModeSupported: options.sdkHostModeSupported,
 						ensureProviderDaemon: options.ensureNotificationProviderDaemon,
-						runEphemeralTurn: async (promptText, signal) => {
+						runBtwTurn: async (question, signal) => {
 							if (!session) throw new Error("Ephemeral turns are unavailable.");
-							const { replyText } = await session.runEphemeralTurn({ promptText, signal });
+							const { replyText } = await session.runEphemeralTurn({
+								purpose: "btw",
+								turn: { question, scope: session.createBtwConversationScope(btwUserPrompt) },
+								signal,
+							});
 							return { replyText };
 						},
 					});

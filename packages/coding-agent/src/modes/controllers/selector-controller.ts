@@ -101,8 +101,10 @@ import {
 } from "../../setup/model-onboarding-guidance";
 import { addApiCompatibleProvider, formatProviderSetupResult } from "../../setup/provider-onboarding";
 import {
+	IMAGE_PROVIDER_DEFAULTS,
 	isConfigurableSearchProviderId,
 	isSearchProviderPreference,
+	setConfiguredImageModel,
 	setPreferredImageProvider,
 	setPreferredSearchProvider,
 	setSearchFallbackProviders,
@@ -190,6 +192,7 @@ export function buildStatusLineSettings(settingsInstance: Settings): StatusLineS
 		rightSegments: settingsInstance.get("statusLine.rightSegments"),
 		separator: settingsInstance.get("statusLine.separator"),
 		showHookStatus: settingsInstance.get("statusLine.showHookStatus"),
+		showActionHints: settingsInstance.get("statusLine.showActionHints"),
 		sessionAccent: settingsInstance.get("statusLine.sessionAccent"),
 		maxRows: settingsInstance.get("statusLine.maxRows"),
 		segmentOptions: settingsInstance.get("statusLine.segmentOptions"),
@@ -1103,6 +1106,68 @@ export class SelectorController {
 		}
 	}
 
+	async #handleImageGenerationConfig(): Promise<void> {
+		const provider = await this.ctx.showHookInput(
+			"Image Generation provider (auto, openai, gemini, openrouter, antigravity, custom)",
+			"auto",
+		);
+		if (provider === undefined) return;
+		const normalized = provider.trim().toLowerCase();
+		const validProviders = ["auto", "openai", "gemini", "openrouter", "antigravity", "custom"];
+		if (!validProviders.includes(normalized)) {
+			this.ctx.showStatus(`Invalid image provider: ${normalized}. Valid: ${validProviders.join(", ")}`);
+			return;
+		}
+		let model: string | undefined;
+		if (normalized !== "auto" && normalized !== "custom") {
+			const defaultModel = IMAGE_PROVIDER_DEFAULTS[normalized];
+			model = await this.ctx.showHookInput(`Image model for ${normalized} (default: ${defaultModel})`, defaultModel);
+			if (model === undefined) return;
+			model = model.trim() || defaultModel;
+		}
+		let customUrl: string | undefined;
+		let customKey: string | undefined;
+		if (normalized === "custom") {
+			customUrl = await this.ctx.showHookInput("Custom image endpoint base URL");
+			if (!customUrl?.trim()) {
+				this.ctx.showStatus("Custom image endpoint requires a base URL");
+				return;
+			}
+			model = await this.ctx.showHookInput("Custom image model", IMAGE_PROVIDER_DEFAULTS.openai);
+			if (model === undefined) return;
+			model = model.trim() || IMAGE_PROVIDER_DEFAULTS.openai;
+			customKey = await this.ctx.showHookInput("Custom image endpoint API key");
+		}
+		const scope = await this.ctx.showHookInput(
+			"Scope: 'session' (this session only) or 'default' (persist)",
+			"session",
+		);
+		if (scope === undefined) return;
+		const persistDefault = scope.trim().toLowerCase() === "default";
+
+		const imageProvider = normalized as "auto" | "openai" | "gemini" | "openrouter" | "antigravity" | "custom";
+		setPreferredImageProvider(imageProvider === "custom" ? "auto" : imageProvider);
+		setConfiguredImageModel({
+			provider: imageProvider,
+			model: model ?? null,
+			customUrl: customUrl?.trim(),
+			customKey: customKey?.trim(),
+		});
+
+		if (persistDefault) {
+			this.ctx.settings.set("providers.image", imageProvider);
+			if (model) this.ctx.settings.set("providers.imageModel", model);
+			if (customUrl?.trim()) this.ctx.settings.set("providers.imageCustomUrl", customUrl.trim());
+			if (customKey?.trim()) this.ctx.settings.set("providers.imageCustomKey", customKey.trim());
+		}
+
+		const displayModel =
+			model ?? (normalized !== "auto" && normalized !== "custom" ? IMAGE_PROVIDER_DEFAULTS[normalized] : undefined);
+		const label = normalized === "auto" ? "Auto" : `${normalized}${displayModel ? ` (${displayModel})` : ""}`;
+		this.ctx.showStatus(`Image Generation: ${label}${persistDefault ? " (default)" : " (session)"}`);
+		this.ctx.ui.requestRender();
+	}
+
 	showCustomProviderWizard(): void {
 		this.showSelector(done => {
 			let wizard: CustomProviderWizardComponent;
@@ -1516,6 +1581,7 @@ export class SelectorController {
 			case "statusLine.separator":
 			case "statusLineShowHooks":
 			case "statusLine.showHookStatus":
+			case "statusLine.showActionHints":
 			case "statusLine.sessionAccent":
 			case "statusLine.maxRows":
 			case "statusLine.leftSegments":
@@ -1563,16 +1629,34 @@ export class SelectorController {
 				}
 				break;
 			case "providers.image":
+			case "providers.imageModel":
+			case "providers.imageCustomUrl":
+			case "providers.imageCustomKey":
+			case "providers.imageCustomKeyEnv": {
+				const imgProvider = this.ctx.settings.get("providers.image");
+				const imgModel = this.ctx.settings.get("providers.imageModel");
+				const imgCustomUrl = this.ctx.settings.get("providers.imageCustomUrl");
+				const imgCustomKey = this.ctx.settings.get("providers.imageCustomKey");
+				const imgCustomKeyEnv = this.ctx.settings.get("providers.imageCustomKeyEnv");
 				if (
-					value === "auto" ||
-					value === "openai" ||
-					value === "gemini" ||
-					value === "openrouter" ||
-					value === "antigravity"
+					imgProvider === "auto" ||
+					imgProvider === "openai" ||
+					imgProvider === "gemini" ||
+					imgProvider === "openrouter" ||
+					imgProvider === "antigravity" ||
+					imgProvider === "custom"
 				) {
-					setPreferredImageProvider(value);
+					setPreferredImageProvider(imgProvider === "custom" ? "auto" : imgProvider);
+					setConfiguredImageModel({
+						provider: imgProvider,
+						model: imgModel ?? null,
+						customUrl: imgCustomUrl,
+						customKey: imgCustomKey,
+						customKeyEnv: imgCustomKeyEnv,
+					});
 				}
 				break;
+			}
 
 			// MCP update injection - live subscribe/unsubscribe
 			case "mcp.notifications":
@@ -1629,6 +1713,11 @@ export class SelectorController {
 						}
 						if (selection.kind === "deleteProfile") {
 							await this.#deleteCustomModelPreset(selection.profileName, modelSelector);
+							return;
+						}
+						if (selection.kind === "imageGeneration") {
+							done();
+							await this.#handleImageGenerationConfig();
 							return;
 						}
 						if (selection.kind === "profile") {
@@ -2057,10 +2146,7 @@ export class SelectorController {
 	}
 
 	async showSessionSelector(): Promise<void> {
-		const sessions = await SessionManager.listForResumePickerReadOnly(
-			this.ctx.sessionManager.getCwd(),
-			this.ctx.sessionManager.getSessionDir(),
-		);
+		const sessions = await this.ctx.sessionManager.listForResumePickerReadOnly();
 		this.showSelector(done => {
 			const selector = new SessionSelectorComponent(
 				sessions,
@@ -2156,8 +2242,16 @@ export class SelectorController {
 		this.#clearTransientSessionUi();
 		const migrationPolicy =
 			this.ctx.settings?.get("session.directoryMigration") === "disabled" ? "disabled" : "copy-retain";
-		const writableSessionPath = await SessionManager.prepareManagedCandidateForWrite(sessionPath, migrationPolicy);
-
+		let writableSessionPath = sessionPath;
+		if (this.ctx.sessionManager.isManagedDestination()) {
+			const inspection = await SessionManager.inspectSessionTailReadOnly(sessionPath);
+			if (inspection.kind === "error") throw new Error(`Could not inspect selected session: ${inspection.reason}`);
+			writableSessionPath = await this.ctx.sessionManager.prepareManagedCandidateForStrictAdoption(
+				sessionPath,
+				migrationPolicy,
+				inspection.identity,
+			);
+		}
 		// Switch session via AgentSession (emits hook and tool session events)
 		if (!(await this.ctx.session.switchSession(writableSessionPath))) return;
 		const switchingToDifferentSession = previousSessionId !== this.ctx.sessionManager.getSessionId();

@@ -558,6 +558,57 @@ pub fn verify_owner_only_path_security(
 	}
 	platform::verify_owner_only_path_security(Path::new(&path), &kind)
 }
+/// Verify owner-only ACL security without mutation only when the retained
+/// no-follow handle identifies the expected object before and after inspection.
+#[napi]
+pub fn verify_owner_only_path_security_expected(
+	path: String,
+	kind: String,
+	expected_dev: BigInt,
+	expected_ino: BigInt,
+) -> NativeOwnerOnlySecurityResult {
+	if path.contains('\0') {
+		return NativeOwnerOnlySecurityResult::failure("io_error");
+	}
+	let (dev_negative, expected_dev, dev_lossless) = expected_dev.get_u64();
+	let (ino_negative, expected_ino, ino_lossless) = expected_ino.get_u64();
+	if dev_negative || ino_negative || !dev_lossless || !ino_lossless {
+		return NativeOwnerOnlySecurityResult::failure("identity_mismatch");
+	}
+	platform::verify_owner_only_path_security_expected(
+		Path::new(&path),
+		&kind,
+		expected_dev,
+		expected_ino,
+	)
+}
+
+/// Repair an owner-only ACL on a retained expected path.
+///
+/// Its no-follow handle must still identify the expected object before repair
+/// and again after final ACL verification.
+#[napi]
+pub fn repair_owner_only_path_security_expected(
+	path: String,
+	kind: String,
+	expected_dev: BigInt,
+	expected_ino: BigInt,
+) -> NativeOwnerOnlySecurityResult {
+	if path.contains('\0') {
+		return NativeOwnerOnlySecurityResult::failure("io_error");
+	}
+	let (dev_negative, expected_dev, dev_lossless) = expected_dev.get_u64();
+	let (ino_negative, expected_ino, ino_lossless) = expected_ino.get_u64();
+	if dev_negative || ino_negative || !dev_lossless || !ino_lossless {
+		return NativeOwnerOnlySecurityResult::failure("identity_mismatch");
+	}
+	platform::repair_owner_only_path_security_expected(
+		Path::new(&path),
+		&kind,
+		expected_dev,
+		expected_ino,
+	)
+}
 
 /// Apply owner-only security to the exact caller descriptor and its retained
 /// no-follow path. The descriptor is duplicated with close-on-exec and is never
@@ -2032,6 +2083,23 @@ pub(crate) mod platform {
 			Ok(authority) => verify_authority(&authority, kind),
 			Err(result) => result,
 		}
+	}
+	pub(super) fn verify_owner_only_path_security_expected(
+		_: &Path,
+		_: &str,
+		_: u64,
+		_: u64,
+	) -> NativeOwnerOnlySecurityResult {
+		NativeOwnerOnlySecurityResult::failure("acl_unavailable")
+	}
+
+	pub(super) fn repair_owner_only_path_security_expected(
+		_: &Path,
+		_: &str,
+		_: u64,
+		_: u64,
+	) -> NativeOwnerOnlySecurityResult {
+		NativeOwnerOnlySecurityResult::failure("acl_unavailable")
 	}
 
 	#[cfg(target_os = "linux")]
@@ -4465,6 +4533,236 @@ mod platform {
 		Ok(buffer)
 	}
 
+	#[derive(Clone, Copy)]
+	enum OwnerOnlyAclState {
+		Clean,
+		RepairableMismatch,
+		UnsafeMismatch,
+		OwnerMismatch,
+	}
+
+	fn acl_entries_are_structurally_valid(
+		dacl: *mut ACL,
+		ace_count: u32,
+		acl_start: usize,
+		acl_end: usize,
+	) -> bool {
+		for index in 0..ace_count {
+			let mut ace: *mut c_void = null_mut();
+			// SAFETY: `dacl` and `ace` remain inside the live descriptor returned by
+			// GetSecurityInfo, and `ace` is a writable output pointer.
+			if unsafe { GetAce(dacl, index, &mut ace) } == 0 || ace.is_null() {
+				return false;
+			}
+			let ace_start = ace as usize;
+			let Some(header_end) = ace_start.checked_add(size_of::<ACE_HEADER>()) else {
+				return false;
+			};
+			if ace_start < acl_start || header_end > acl_end {
+				return false;
+			}
+			// SAFETY: the fixed ACE header range is bounded by the ACL extent; the
+			// unaligned read avoids imposing an alignment assumption on GetAce.
+			let header = unsafe { std::ptr::read_unaligned(ace.cast::<ACE_HEADER>()) };
+			let ace_size = usize::from(header.AceSize);
+			let Some(ace_end) = ace_start.checked_add(ace_size) else {
+				return false;
+			};
+			if ace_size < size_of::<ACE_HEADER>() || ace_end > acl_end {
+				return false;
+			}
+			if header.AceType == 0 {
+				let sid_offset = std::mem::offset_of!(ACCESS_ALLOWED_ACE, SidStart);
+				let Some(sid_end) = sid_offset.checked_add(8) else {
+					return false;
+				};
+				if sid_end > ace_size {
+					return false;
+				}
+				// SAFETY: `sid_offset..ace_size` lies within the checked ACE and ACL
+				// extents, and the descriptor remains live through validation.
+				let ace_sid = unsafe {
+					std::slice::from_raw_parts(ace.cast::<u8>().add(sid_offset), ace_size - sid_offset)
+				};
+				if valid_sid(ace_sid).is_none() {
+					return false;
+				}
+			}
+		}
+		true
+	}
+
+	fn inspect_owner_only_acl(
+		handle: HANDLE,
+		kind: &str,
+		sid: &[u8],
+	) -> Result<OwnerOnlyAclState, &'static str> {
+		let mut owner = null_mut();
+		let mut dacl = null_mut();
+		let mut descriptor = null_mut();
+		// SAFETY: the retained handle is valid and all output pointers are writable
+		// until the returned LocalAlloc descriptor is released below.
+		let status = unsafe {
+			GetSecurityInfo(
+				handle,
+				SE_FILE_OBJECT,
+				SECURITY_OWNER_DACL,
+				&mut owner,
+				null_mut(),
+				&mut dacl,
+				null_mut(),
+				&mut descriptor,
+			)
+		};
+		if status != 0 {
+			if !descriptor.is_null() {
+				// SAFETY: a non-null descriptor returned by GetSecurityInfo remains owned by
+				// this function on the error path.
+				unsafe { LocalFree(descriptor) };
+			}
+			return Err("acl_unavailable");
+		}
+		if descriptor.is_null() {
+			return Err("acl_unavailable");
+		}
+		let result = if owner.is_null() {
+			Err("acl_unavailable")
+		} else {
+			// SAFETY: GetSecurityInfo returned owner within the live security
+			// descriptor; `sid` is a validated current-user SID.
+			let owner_matches = unsafe { EqualSid(owner, sid.as_ptr().cast_mut().cast()) } != 0;
+			if !owner_matches {
+				Ok(OwnerOnlyAclState::OwnerMismatch)
+			} else {
+				let mut control = 0u16;
+				let mut revision = 0u32;
+				// SAFETY: `descriptor` is the live allocation returned by GetSecurityInfo
+				// and both outputs are writable local scalars.
+				let control_ok = unsafe {
+					windows_sys::Win32::Security::GetSecurityDescriptorControl(
+						descriptor,
+						&mut control,
+						&mut revision,
+					)
+				} != 0;
+				if !control_ok {
+					Ok(OwnerOnlyAclState::UnsafeMismatch)
+				} else {
+					let protected_dacl = control & SE_DACL_PROTECTED != 0;
+					// SAFETY: zero is a valid output initialization for ACL_SIZE_INFORMATION.
+					let mut acl_info: ACL_SIZE_INFORMATION = unsafe { std::mem::zeroed() };
+					let acl_ok = !dacl.is_null()
+						// SAFETY: GetSecurityInfo returned `dacl` within its still-live
+						// descriptor and `acl_info` is an aligned writable output.
+						&& unsafe {
+							GetAclInformation(
+								dacl,
+								(&raw mut acl_info).cast(),
+								u32::try_from(size_of::<ACL_SIZE_INFORMATION>())
+									.expect("ACL info size fits u32"),
+								AclSizeInformation,
+							)
+						} != 0;
+					if !acl_ok {
+						Ok(OwnerOnlyAclState::UnsafeMismatch)
+					} else {
+						let acl_start = dacl as usize;
+						let acl_bytes = acl_info.AclBytesInUse as usize;
+						let acl_end = acl_start.checked_add(acl_bytes);
+						let structurally_valid = acl_bytes >= size_of::<ACL>()
+							&& acl_end.is_some_and(|end| {
+								acl_entries_are_structurally_valid(dacl, acl_info.AceCount, acl_start, end)
+							});
+						if !structurally_valid {
+							Ok(OwnerOnlyAclState::UnsafeMismatch)
+						} else {
+							let expected_flags = if kind == "directory" {
+								OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE
+							} else {
+								0
+							};
+							let exact_owner_ace = if acl_info.AceCount == 1 {
+								let mut ace: *mut c_void = null_mut();
+								// SAFETY: structural validation above proved that this single ACE
+								// is present and bounded; `ace` is a writable output pointer.
+								if unsafe { GetAce(dacl, 0, &mut ace) } == 0 || ace.is_null() {
+									false
+								} else {
+									let header =
+										unsafe { std::ptr::read_unaligned(ace.cast::<ACE_HEADER>()) };
+									let ace_size = usize::from(header.AceSize);
+									let sid_offset = std::mem::offset_of!(ACCESS_ALLOWED_ACE, SidStart);
+									let mask_offset = std::mem::offset_of!(ACCESS_ALLOWED_ACE, Mask);
+									if header.AceType != 0
+										|| header.AceFlags != expected_flags
+										|| mask_offset
+											.checked_add(size_of::<u32>())
+											.is_none_or(|end| end > ace_size)
+										|| sid_offset > ace_size
+									{
+										false
+									} else {
+										// SAFETY: structural validation proved the mask and SID ranges
+										// are inside the live ACE.
+										let mask = unsafe {
+											std::ptr::read_unaligned(
+												ace.cast::<u8>().add(mask_offset).cast::<u32>(),
+											)
+										};
+										let ace_sid = unsafe {
+											std::slice::from_raw_parts(
+												ace.cast::<u8>().add(sid_offset),
+												ace_size - sid_offset,
+											)
+										};
+										owner_only_ace_mask_is_safe(mask)
+											&& valid_sid(ace_sid).is_some()
+											// SAFETY: both pointers identify complete validated SIDs
+											// that remain live through comparison.
+											&& unsafe {
+												EqualSid(
+													ace_sid.as_ptr().cast_mut().cast(),
+													sid.as_ptr().cast_mut().cast(),
+												)
+											} != 0
+									}
+								}
+							} else {
+								false
+							};
+							if protected_dacl && exact_owner_ace {
+								Ok(OwnerOnlyAclState::Clean)
+							} else {
+								Ok(OwnerOnlyAclState::RepairableMismatch)
+							}
+						}
+					}
+				}
+			}
+		};
+		// SAFETY: GetSecurityInfo allocated `descriptor` with LocalAlloc and it is
+		// released once after all owner, ACL, and ACE reads have completed.
+		unsafe { LocalFree(descriptor) };
+		result
+	}
+
+	fn verify_owner_only_handle(handle: HANDLE, kind: &str) -> NativeOwnerOnlySecurityResult {
+		let sid = match current_user_sid() {
+			Ok(sid) => sid,
+			Err(()) => return NativeOwnerOnlySecurityResult::failure("acl_unavailable"),
+		};
+		match inspect_owner_only_acl(handle, kind, &sid) {
+			Ok(OwnerOnlyAclState::Clean) => NativeOwnerOnlySecurityResult::success(),
+			Ok(OwnerOnlyAclState::OwnerMismatch) => {
+				NativeOwnerOnlySecurityResult::failure("owner_mismatch")
+			},
+			Ok(OwnerOnlyAclState::RepairableMismatch | OwnerOnlyAclState::UnsafeMismatch) => {
+				NativeOwnerOnlySecurityResult::failure("acl_verify_failed")
+			},
+			Err(code) => NativeOwnerOnlySecurityResult::failure(code),
+		}
+	}
+
 	pub(super) fn apply_owner_only_path_security(
 		path: &Path,
 		kind: &str,
@@ -4509,135 +4807,118 @@ mod platform {
 			Ok(handle) => handle,
 			Err(result) => return result,
 		};
+		verify_owner_only_handle(handle.target, kind)
+	}
+	pub(super) fn verify_owner_only_path_security_expected(
+		path: &Path,
+		kind: &str,
+		expected_dev: u64,
+		expected_ino: u64,
+	) -> NativeOwnerOnlySecurityResult {
+		let handle = match open_exact(path, kind, READ_CONTROL) {
+			Ok(handle) => handle,
+			Err(result) => return result,
+		};
+		// SAFETY: zero is a valid initialized representation for this output struct.
+		let mut initial_information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+		if unsafe { GetFileInformationByHandle(handle.target, &mut initial_information) } == 0 {
+			return NativeOwnerOnlySecurityResult::failure(last_error_code());
+		}
+		if !expected_handle_identity_matches(&initial_information, expected_dev, expected_ino) {
+			return NativeOwnerOnlySecurityResult::failure("identity_mismatch");
+		}
+		let verified = verify_owner_only_handle(handle.target, kind);
+		// SAFETY: zero is a valid initialized representation for this output struct.
+		let mut final_information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+		if unsafe { GetFileInformationByHandle(handle.target, &mut final_information) } == 0 {
+			return NativeOwnerOnlySecurityResult::failure(last_error_code());
+		}
+		if !expected_handle_identity_matches(&final_information, expected_dev, expected_ino) {
+			return NativeOwnerOnlySecurityResult::failure("identity_mismatch");
+		}
+		verified
+	}
+
+	fn expected_handle_identity_matches(
+		information: &BY_HANDLE_FILE_INFORMATION,
+		expected_dev: u64,
+		expected_ino: u64,
+	) -> bool {
+		let ino =
+			(u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow);
+		u64::from(information.dwVolumeSerialNumber) == expected_dev && ino == expected_ino
+	}
+
+	pub(super) fn repair_owner_only_path_security_expected(
+		path: &Path,
+		kind: &str,
+		expected_dev: u64,
+		expected_ino: u64,
+	) -> NativeOwnerOnlySecurityResult {
+		let handle = match open_exact(path, kind, WRITE_DAC | READ_CONTROL) {
+			Ok(handle) => handle,
+			Err(result) => return result,
+		};
+		// SAFETY: zero is a valid initialized representation for this output struct.
+		let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+		if unsafe { GetFileInformationByHandle(handle.target, &mut information) } == 0 {
+			return NativeOwnerOnlySecurityResult::failure(last_error_code());
+		}
+		if !expected_handle_identity_matches(&information, expected_dev, expected_ino) {
+			return NativeOwnerOnlySecurityResult::failure("identity_mismatch");
+		}
 		let sid = match current_user_sid() {
 			Ok(sid) => sid,
 			Err(()) => return NativeOwnerOnlySecurityResult::failure("acl_unavailable"),
 		};
-		let mut owner = null_mut();
-		let mut dacl = null_mut();
-		let mut descriptor = null_mut();
-		// SAFETY: the retained handle is valid and all output pointers are writable
-		// until the returned LocalAlloc descriptor is released below.
+		match inspect_owner_only_acl(handle.target, kind, &sid) {
+			Ok(OwnerOnlyAclState::Clean) => return NativeOwnerOnlySecurityResult::success(),
+			Ok(OwnerOnlyAclState::OwnerMismatch) => {
+				return NativeOwnerOnlySecurityResult::failure("owner_mismatch");
+			},
+			Ok(OwnerOnlyAclState::UnsafeMismatch) => {
+				return NativeOwnerOnlySecurityResult::failure("acl_verify_failed");
+			},
+			Ok(OwnerOnlyAclState::RepairableMismatch) => {},
+			Err(code) => return NativeOwnerOnlySecurityResult::failure(code),
+		}
+		let dacl = match owner_only_dacl(&sid, kind) {
+			Ok(dacl) => dacl,
+			Err(()) => return NativeOwnerOnlySecurityResult::failure("acl_apply_failed"),
+		};
+		// SAFETY: the retained handle identifies the prechecked object; `dacl` contains
+		// a validated, live Windows security structure for this synchronous call.
 		let status = unsafe {
-			GetSecurityInfo(
+			SetSecurityInfo(
 				handle.target,
 				SE_FILE_OBJECT,
-				SECURITY_OWNER_DACL,
-				&mut owner,
+				DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
 				null_mut(),
-				&mut dacl,
 				null_mut(),
-				&mut descriptor,
+				dacl.as_ptr().cast(),
+				null_mut(),
 			)
 		};
-		if status != 0 || descriptor.is_null() {
-			return NativeOwnerOnlySecurityResult::failure("acl_unavailable");
+		if status != 0 {
+			return NativeOwnerOnlySecurityResult::failure("acl_apply_failed");
 		}
-		if owner.is_null() {
-			// SAFETY: GetSecurityInfo returned this live LocalAlloc descriptor, which is
-			// released exactly once on this failure path.
-			unsafe { LocalFree(descriptor) };
-			return NativeOwnerOnlySecurityResult::failure("acl_unavailable");
+		// SAFETY: zero is a valid initialized representation for this output struct.
+		let mut final_information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+		if unsafe { GetFileInformationByHandle(handle.target, &mut final_information) } == 0 {
+			return NativeOwnerOnlySecurityResult::failure(last_error_code());
 		}
-		// SAFETY: GetSecurityInfo returned owner within the live security descriptor;
-		// `sid` is a validated current-user SID.
-		let owner_matches = unsafe { EqualSid(owner, sid.as_ptr().cast_mut().cast()) } != 0;
-		let mut control = 0u16;
-		let mut revision = 0u32;
-		// SAFETY: `descriptor` is the live allocation returned by GetSecurityInfo and
-		// both outputs are writable local scalars.
-		let protected_dacl = unsafe {
-			windows_sys::Win32::Security::GetSecurityDescriptorControl(
-				descriptor,
-				&mut control,
-				&mut revision,
-			)
-		} != 0 && control & SE_DACL_PROTECTED != 0;
-		// SAFETY: zero is a valid output initialization for ACL_SIZE_INFORMATION.
-		let mut acl_info: ACL_SIZE_INFORMATION = unsafe { std::mem::zeroed() };
-		let acl_ok = !dacl.is_null()
-			// SAFETY: GetSecurityInfo returned `dacl` within its still-live descriptor and
-			// `acl_info` is an aligned writable output of the exact checked size.
-			&& unsafe {
-				GetAclInformation(
-					dacl,
-					(&raw mut acl_info).cast(),
-					u32::try_from(size_of::<ACL_SIZE_INFORMATION>()).expect("ACL info size fits u32"),
-					AclSizeInformation,
-				)
-			} != 0;
-		let expected_flags = if kind == "directory" {
-			OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE
-		} else {
-			0
-		};
-		let exact_owner_ace = if acl_ok && acl_info.AceCount == 1 {
-			let acl_start = dacl as usize;
-			let acl_bytes = acl_info.AclBytesInUse as usize;
-			let acl_end = acl_start.checked_add(acl_bytes);
-			let mut ace: *mut c_void = null_mut();
-			// SAFETY: GetAclInformation validated the one-entry ACL in the live descriptor
-			// and `ace` is a writable out-pointer.
-			let got_ace = unsafe { GetAce(dacl, 0, &mut ace) } != 0;
-			if got_ace && !ace.is_null() {
-				let ace_start = ace as usize;
-				let header_end = ace_start.checked_add(size_of::<ACE_HEADER>());
-				if acl_bytes < size_of::<ACL>()
-					|| ace_start < acl_start
-					|| header_end.is_none_or(|end| acl_end.is_none_or(|acl_end| end > acl_end))
-				{
-					false
-				} else {
-					// SAFETY: the fixed ACE header range is fully bounded by AclBytesInUse;
-					// unaligned read avoids imposing an alignment assumption on GetAce.
-					let header = unsafe { std::ptr::read_unaligned(ace.cast::<ACE_HEADER>()) };
-					let ace_size = usize::from(header.AceSize);
-					let ace_end = ace_start.checked_add(ace_size);
-					let sid_offset = std::mem::offset_of!(ACCESS_ALLOWED_ACE, SidStart);
-					let mask_offset = std::mem::offset_of!(ACCESS_ALLOWED_ACE, Mask);
-					let minimum_ace_size = sid_offset.checked_add(sid.len()).unwrap_or(usize::MAX);
-					if ace_size < minimum_ace_size
-						|| mask_offset
-							.checked_add(size_of::<u32>())
-							.is_none_or(|end| end > ace_size)
-						|| ace_end.is_none_or(|end| acl_end.is_none_or(|acl_end| end > acl_end))
-						|| header.AceType != 0
-						|| header.AceFlags != expected_flags
-					{
-						false
-					} else {
-						// SAFETY: the mask range is bounded by the validated ACE size and ACL extent.
-						let mask = unsafe {
-							std::ptr::read_unaligned(ace.cast::<u8>().add(mask_offset).cast::<u32>())
-						};
-						// SAFETY: the trailing SID range is bounded by both AceSize and
-						// AclBytesInUse, and the descriptor remains live through comparison.
-						let ace_sid = unsafe {
-							std::slice::from_raw_parts(
-								ace.cast::<u8>().add(sid_offset),
-								ace_size - sid_offset,
-							)
-						};
-						owner_only_ace_mask_is_safe(mask) && valid_sid(ace_sid).is_some()
-							// SAFETY: both pointers identify complete validated SIDs that remain live.
-							&& unsafe {
-								EqualSid(ace_sid.as_ptr().cast_mut().cast(), sid.as_ptr().cast_mut().cast())
-							} != 0
-					}
-				}
-			} else {
-				false
-			}
-		} else {
-			false
-		};
-		// SAFETY: GetSecurityInfo allocated `descriptor` with LocalAlloc and it is
-		// released once after all owner, ACL, and ACE reads have completed.
-		unsafe { LocalFree(descriptor) };
-		if owner_matches && protected_dacl && exact_owner_ace {
-			NativeOwnerOnlySecurityResult::success()
-		} else {
-			NativeOwnerOnlySecurityResult::failure("acl_verify_failed")
+		if !expected_handle_identity_matches(&final_information, expected_dev, expected_ino) {
+			return NativeOwnerOnlySecurityResult::failure("identity_mismatch");
+		}
+		match inspect_owner_only_acl(handle.target, kind, &sid) {
+			Ok(OwnerOnlyAclState::Clean) => NativeOwnerOnlySecurityResult::success(),
+			Ok(OwnerOnlyAclState::OwnerMismatch) => {
+				NativeOwnerOnlySecurityResult::failure("owner_mismatch")
+			},
+			Ok(OwnerOnlyAclState::RepairableMismatch | OwnerOnlyAclState::UnsafeMismatch) => {
+				NativeOwnerOnlySecurityResult::failure("acl_verify_failed")
+			},
+			Err(code) => NativeOwnerOnlySecurityResult::failure(code),
 		}
 	}
 
@@ -5223,6 +5504,23 @@ mod platform {
 	pub(super) fn verify_owner_only_path_security(
 		_: &Path,
 		_: &str,
+	) -> NativeOwnerOnlySecurityResult {
+		NativeOwnerOnlySecurityResult::failure("acl_unavailable")
+	}
+	pub(super) fn verify_owner_only_path_security_expected(
+		_: &Path,
+		_: &str,
+		_: u64,
+		_: u64,
+	) -> NativeOwnerOnlySecurityResult {
+		NativeOwnerOnlySecurityResult::failure("acl_unavailable")
+	}
+
+	pub(super) fn repair_owner_only_path_security_expected(
+		_: &Path,
+		_: &str,
+		_: u64,
+		_: u64,
 	) -> NativeOwnerOnlySecurityResult {
 		NativeOwnerOnlySecurityResult::failure("acl_unavailable")
 	}

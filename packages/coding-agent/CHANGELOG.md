@@ -1,8 +1,28 @@
 # Changelog
 
 ## [Unreleased]
+### Added
+
+- `/btw` now opens an ephemeral multi-turn side chat: plain text continues the side thread until Esc returns to the main chat, while visible text-only context stays outside the main transcript and session observability/debug hooks and is scrubbed synchronously on close or abort.
+- Added `statusLine.showActionHints` (default: `true`) to hide contextual action hints while retaining configured status-line segments.
+- `skill_discovery` empty results now carry a `notice` when discovery config caused the emptiness — naming the exact disabled setting (`skills.enabled`, `skills.enablePiProject`, or `skills.enablePiUser`) and the `gjc config set` command to enable it. Previously a disabled config was indistinguishable from "no skills exist", silently hiding freshly written user/project skills.
+
+### Fixed
+
+- Ordinary `ask` calls now normalize a provider-emitted `deepInterview: null` placeholder instead of misclassifying it as malformed Round-0 intent recovery data and rejecting it before coercion.
+- Documented that custom OpenAI-compatible models omit vision by default: when `input` is unset, GJC treats the model as text-only and strips images with `[image omitted: model does not support vision]`. Vision backends must set `input: [text, image]` in `models.yml`.
+- Restored `/models` preset landing navigation after the Image Generation row and made compaction/pruning regression fixtures use an explicit 200K context boundary instead of a mutable provider descriptor default.
+- Fixed Windows legacy session artifact migration by using native directory identity size, a traversable detached-path alias, and writable file handles for final durability sync.
+- `gjc setup credentials` now auto-imports only OAuth credentials with a finite expiry strictly in the future. Expired or malformed-expiry discoveries remain visible as non-importable records, and existing imported credentials remain recoverable through `/login`.
+- Resumed managed sessions now complete the verified legacy `local://` artifact migration before synchronous path resolution, preserving legacy scratch files instead of failing startup with a migration-order error.
+- Corrected Telegram's uncertain lifecycle guidance so create, close, and resume commands describe their own possible outcome; close and resume no longer display the create-only duplicate-start warning.
 
 ## [0.11.6] - 2026-07-21
+## [0.11.5] - 2026-07-20
+### Fixed
+
+- Internal transcript PageUp/PageDown now keeps moving through tool-output and other non-semantic rows instead of intermittently becoming a no-op after scrolling through anchored conversation content.
+
 ## [0.11.5] - 2026-07-20
 ### Changed
 - Telegram live-message streaming now defaults on for configured Telegram notifications through one durable global preference, supports live in-session preference refresh without weakening redaction, and keeps Discord and Slack finalized-only; process environment overrides remain available.
@@ -11,14 +31,25 @@
 - Session files now use v5 authority records. Do not roll back to a v4 writer after v5 session data has been created: v4 writers cannot preserve independent MCP and discovered-built-in selections.
 
 ### Fixed
+- SQLite `read` raw queries now accept exactly one explicit `SELECT` statement, reject comments and statement tails before opening the database, recheck the invariant at execution, and enable SQLite query-only mode as defense in depth.
+- Direct HTTP(S) marketplace catalogs now use connection-bound public-address validation, bounded redirects, and a 2 MiB response limit before parsing or caching.
+- Bounded MCP list pagination by cursor-cycle, page-count, and item-count limits while preserving abort and cache behavior.
+- Shell environment snapshots now use one process-private temporary root with exclusive private files, trusted cache validation, and whole-root shutdown cleanup instead of a predictable shared directory.
+- Python kernel startup now materializes its bundled runner in one process-private temporary directory with exclusive file creation instead of consulting a predictable shared cache path.
+- SSH command construction and discovery now reject malformed destinations with unsafe prefixes or control characters while preserving normal host, address, username, and alias forms.
 - Fixed the `subagent` tool's `resume` action silently swallowing manager failures. Resume outcomes other than `context_unavailable`/`not_found` (`no_runner`, `resume_failed`, `owner_shutdown_in_progress`, …) were dropped and the stale terminal subagent snapshot was returned as if the resume had succeeded, so ralplan's re-review loop believed the persisted Planner had resumed when it had not and never fell back correctly. The resume action now surfaces every non-ok reason (matching the `steer` branch), and the task resume runner marks a resumed subprocess that aborted or exited non-zero as a `failed` job (carrying its rendered failure summary) instead of reporting it `completed`.
+- Daemon timeout flags now reject missing, malformed, non-positive, fractional, whitespace-containing, and unsafe integer values before daemon command side effects instead of partially parsing them.
 - Hardened standalone HTML session exports so session identifiers, provider/model labels, and embedded raster images remain confined to their intended HTML contexts; malformed image payloads are omitted.
+- Restored legacy `gjc coordinator-mcp` and root `gjc --team --team-size <n>` routing to their native MCP and team commands, with strict team-size validation that prevents malformed legacy flags from selecting team lifecycle actions.
+- Fixed the `subagent` tool's `resume` action silently swallowing manager failures. Resume outcomes other than `context_unavailable`/`not_found` (`no_runner`, `resume_failed`, `owner_shutdown_in_progress`, …) were dropped and the stale terminal subagent snapshot was returned as if the resume had succeeded, so ralplan's re-review loop believed the persisted Planner had resumed when it had not and never fell back correctly. The resume action now surfaces every non-ok reason (matching the `steer` branch), and the task resume runner marks a resumed subprocess that aborted or exited non-zero as a `failed` job (preserving its error text) instead of reporting it `completed`.
+- OpenRouter image generation now retrieves provider-returned HTTP(S) images only through connection-bound public-address validation, revalidates bounded redirects, and enforces image content-type and byte limits before buffering.
 - Fixed the `subagent` tool's `resume` failing immediately for a persisted ralplan Planner. A subagent that finishes by calling `yield` (or is torn down right after a tool executes) left the saved session ending on an assistant `toolCall` with no matching `toolResult`; replaying that history on resume produced an invalid provider request (a `tool_use` not followed by a `tool_result`) that failed the resumed turn at once. Resumed transcripts now reconcile any trailing unpaired tool call with a synthesized placeholder result before the first resumed prompt. Additionally, a failed/no-op resume leg no longer overwrites the prior run's success output artifact with an empty file.
 - Fixed persisted subagent resumes being rejected before session reconstruction with `Session is inside managed storage but is not an authorized managed candidate`. Child session files intentionally live inside their parent session's artifact directory and are not top-level resume-picker candidates; the task resume path now explicitly opens the exact internally registered child session directory while retaining strict candidate validation for user-selected managed sessions.
 - Managed session resume scans now read only a bounded no-follow header prefix from foreign workspace transcripts, while fully recapturing and revalidating owned candidates before granting migration, receipt, or deletion authority.
 - Secret obfuscation now uses authenticated process-local placeholders that remain stable within a running process and opaque after restart.
 - Workspace-wide LSP diagnostics now fail closed instead of launching build or typecheck subprocesses outside execution-tool authorization; concrete-file and glob diagnostics remain available.
 - Clean, side-effect-free canonical provider stream first-event and next-event watchdog failures now retry on bare single-model legacy sessions; explicit legacy disable, managed fallback, and fail-closed structured, non-watchdog, or unsafe attempts are unchanged.
+- Remote MCP HTTP and SSE responses now enforce finite content and message budgets before parsing or dispatch.
 - Added fail-closed managed tmux owner SIGABRT recovery: exact-child supervisor receipts and pre-CLI admission now bind replacement ownership, strict durable Ultragoal/transcript evidence reconciles terminal child yields over stale nonterminal runtime state, recovery hydration remains write-free until an ownership fence, and hostile identity, corruption, concurrency, and path boundaries preserve dirty product files (#2681).
 - Restored non-root startup on Synology and other Linux container filesystems that definitively report POSIX ACL storage unsupported for managed session paths; explicit `--session-dir` semantics and all owner, mode, type, symlink, identity, and scope-binding checks remain unchanged and fail closed (#2687).
 - Preserved access to legal SQLite table names beginning with `sqlite` but not reserved `sqlite_`.
@@ -59,6 +90,10 @@
 - Workflow-state handoff no longer self-locks the active-state cache, so a same-turn skill handoff (e.g. ultragoal → ralplan) completes instead of stalling behind a lock the handoff itself still holds (#2638).
 - SDK host shutdown now retries a failed broker unregister instead of short-circuiting with a stale broker-index entry, while retained startup-cleanup owner-release failures remain isolated from the red extension-error path (#2625).
 - Non-TTY launches now fail fast when stdin is empty and automatically use print mode for positional prompts and `@file` inputs, preventing orphaned interactive TUI processes (#2507).
+
+### Fixed
+
+- The command palette now labels `app.session.fork` as “Branch from message,” matching its user-message selector and `AgentSession.branch()` behavior while preserving the existing action ID for keybinding compatibility.
 
 ## [0.11.2] - 2026-07-19
 
