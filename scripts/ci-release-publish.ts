@@ -57,6 +57,8 @@ interface PublishPackage {
 	kind: "typescript" | "native" | "native-platform" | "manifest";
 	/** Extra build steps before manifest rewrite (e.g. esbuild bundles). */
 	preBuild?: readonly (readonly string[])[];
+	/** Extra build steps after publish-manifest rewrite (e.g. generated release identity). */
+	postRewriteBuild?: readonly (readonly string[])[];
 	/** Extra entries to splice into `files`. */
 	extraFiles?: readonly string[];
 	/** Extra TypeScript declaration configs beyond `tsconfig.publish.json`. */
@@ -161,7 +163,15 @@ export const packages: PublishPackage[] = [
 	},
 	{ dir: "packages/agent", kind: "typescript" },
 	{ dir: "packages/bridge-client", kind: "typescript" },
-	{ dir: "packages/coding-agent", kind: "typescript" },
+	{
+		dir: "packages/coding-agent",
+		kind: "typescript",
+		postRewriteBuild: [
+			["bun", "run", "generate:lifecycle-source-closure"],
+			["bun", "run", "check:lifecycle-source-closure"],
+			["bun", "run", "smoke:lifecycle-source-closure-package"],
+		],
+	},
 	{ dir: "packages/gajae-code", kind: "manifest" },
 ];
 const dependencyFieldNames = [
@@ -423,6 +433,9 @@ async function preparePackage(pkg: PublishPackage): Promise<PackageManifest> {
 		}
 		await emitTypeDeclarations(pkg);
 		manifest = await rewriteManifest(pkgDir, pkg.extraFiles ?? []);
+	}
+	for (const argv of pkg.postRewriteBuild ?? []) {
+		await $`${argv}`.cwd(pkgDir);
 	}
 	assertPinnedPackagePublishConfig(manifest, pkg.dir);
 	return manifest;

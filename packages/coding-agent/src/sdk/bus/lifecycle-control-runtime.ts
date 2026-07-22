@@ -12,6 +12,18 @@ import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 import type { NotificationControlServer as NativeNotificationControlServer } from "@gajae-code/natives";
 import { logger } from "@gajae-code/utils";
+import generatedSourceClosureManifest from "../../daemon/lifecycle-source-closure.generated.json";
+import { fingerprintWorktreeRuntime, resolveGjcRuntimeArgv } from "../../daemon/runtime";
+import { planLaunchWorktree } from "../../gjc-runtime/launch-worktree";
+import {
+	digestLifecycleLaunchCommand,
+	LIFECYCLE_LAUNCH_ATTESTATION_ENV,
+	LIFECYCLE_LAUNCH_ATTESTATION_FILE_ENV,
+	type LifecycleLaunchAttestationExpectation,
+	projectLifecycleSourceManifestIdentity,
+	type WorktreeLaunchBinding,
+	waitForLifecycleLaunchAttestation,
+} from "../../gjc-runtime/lifecycle-launch-attestation";
 import { readLinuxProcStartTime } from "../../gjc-runtime/linux-proc";
 import {
 	MANAGED_OWNER_PREDECESSOR_GENERATION_ENV,
@@ -21,13 +33,19 @@ import {
 	MANAGED_OWNER_TRANSCRIPT_PATH_ENV,
 } from "../../gjc-runtime/managed-owner-admission";
 import {
+	MANAGED_OWNER_BINDING_REF_ENV,
 	MANAGED_OWNER_INCARNATION_ENV,
 	MANAGED_OWNER_RUN_ID_ENV,
 	MANAGED_OWNER_SUPERVISOR_ARG,
+	type ManagedOwnerBinding,
+	type ManagedOwnerLaunchBindingRef,
+	writeManagedOwnerLaunchBindingRef,
 } from "../../gjc-runtime/managed-owner-supervisor";
 import { tmuxRuntimeSessionPath } from "../../gjc-runtime/session-layout";
 import {
 	GJC_COORDINATOR_SESSION_ID_ENV,
+	GJC_COORDINATOR_SESSION_LAUNCH_ID_ENV,
+	GJC_COORDINATOR_SESSION_READINESS_FILE_ENV,
 	GJC_COORDINATOR_SESSION_STATE_FILE_ENV,
 	GJC_TMUX_OWNER_GENERATION_ENV,
 	GJC_TMUX_OWNER_SERVER_KEY_ENV,
@@ -66,6 +84,7 @@ import type {
 import { normalizeLifecyclePath } from "./lifecycle-commands";
 import {
 	type AuditEvent,
+	CleanSpawnFailure,
 	type CreateEffectResult,
 	handleLifecycleRequest,
 	type LedgerDoc,
@@ -536,7 +555,7 @@ async function executeLifecycleTmuxOwnerPlan(input: {
 	argv: string[];
 	sessionName: string;
 	ownerIsolationProbe?: OwnerIsolationProbe;
-	prepareSpawn?: () => void;
+	prepareSpawn?: () => void | Promise<void>;
 	onAttemptCreated?: (attempt: LifecycleAttemptExecution) => void;
 	previousBaseline: OwnerGenerationBaseline;
 }): Promise<LifecycleAttemptExecution> {
@@ -572,7 +591,7 @@ async function executeLifecycleTmuxOwnerPlan(input: {
 			(process.platform === "linux" && preSpawnProof.cgroup?.classification !== "safe"))
 	)
 		throw new Error("gjc_lifecycle_owner_server_unverifiable");
-	input.prepareSpawn?.();
+	await input.prepareSpawn?.();
 	if (!(await isLifecycleGenerationUnchanged(input.stateDir, input.sessionId, input.previousBaseline)))
 		throw new Error("gjc_lifecycle_owner_generation_changed");
 	const created = Bun.spawnSync(plan.execution.argv, {
@@ -780,7 +799,9 @@ async function completeLifecycleSpawnTransaction(input: {
 	sessionStateFile: string;
 	argv: string[];
 	ownerIsolationProbe?: OwnerIsolationProbe;
-	prepareSpawn?: () => void;
+	prepareSpawn?: () => void | Promise<void>;
+	verifyBeforeCommit?: () => Promise<void>;
+	verifyAfterMetadata?: () => Promise<void>;
 	previousBaseline?: OwnerGenerationBaseline;
 }): Promise<void> {
 	const previousBaseline =
@@ -800,6 +821,7 @@ async function completeLifecycleSpawnTransaction(input: {
 			ownerExecution.serverStartTime === undefined
 		)
 			throw new Error("gjc_lifecycle_owner_server_unverifiable");
+		if (input.verifyBeforeCommit) await input.verifyBeforeCommit();
 		await applyRequiredLifecycleTmuxMetadata(
 			input.tmux,
 			`${ownerExecution.nativeSessionId}:`,
@@ -817,6 +839,7 @@ async function completeLifecycleSpawnTransaction(input: {
 				serverPid: ownerExecution.serverPid,
 			},
 		);
+		if (input.verifyAfterMetadata) await input.verifyAfterMetadata();
 		if (
 			!(await reproveLifecycleAttempt({
 				tmux: input.tmux,
@@ -854,9 +877,82 @@ async function completeLifecycleSpawnTransaction(input: {
 		}
 		if (cleanupFailure !== undefined)
 			throw new AggregateError([error, cleanupFailure], "gjc_lifecycle_cleanup_uncertain");
-		throw error;
+		throw new CleanSpawnFailure(
+			ownerExecution ? "exact_owner_cleanup_completed" : "no_owner_attempt_created",
+			error instanceof Error ? error.message : "gjc_lifecycle_clean_spawn_failure",
+		);
 	}
 }
+/** Real daemon-safe tmux launcher: canonical owner-isolation plan + GJC tags. */
+const LIFECYCLE_LAUNCH_TIMEOUT_MS = 30_000;
+async function waitForExactManagedOwnerBinding(input: {
+	referenceFile: string;
+	childBindingFile: string;
+	reference: ManagedOwnerLaunchBindingRef;
+}): Promise<void> {
+	const deadline = Date.now() + LIFECYCLE_LAUNCH_TIMEOUT_MS;
+	for (;;) {
+		try {
+			const [referenceRaw, bindingRaw] = await Promise.all([
+				fsPromises.readFile(input.referenceFile, "utf8"),
+				fsPromises.readFile(input.childBindingFile, "utf8"),
+			]);
+			const reference = JSON.parse(referenceRaw) as ManagedOwnerLaunchBindingRef;
+			const binding = JSON.parse(bindingRaw) as ManagedOwnerBinding;
+			if (
+				JSON.stringify(reference) === JSON.stringify(input.reference) &&
+				binding.schema_version === 2 &&
+				binding.session_id === reference.session_id &&
+				binding.generation === reference.generation &&
+				binding.run_id === reference.run_id &&
+				binding.endpoint_incarnation === reference.endpoint_incarnation &&
+				binding.child_token === reference.child_token &&
+				binding.command_sha256 === reference.command_sha256
+			)
+				return;
+			throw new Error("gjc_lifecycle_managed_owner_binding_invalid");
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT" && !(error instanceof SyntaxError)) throw error;
+		}
+		if (Date.now() >= deadline) throw new Error("gjc_lifecycle_managed_owner_binding_timeout");
+		await Bun.sleep(25);
+	}
+}
+function lifecycleGitValue(cwd: string, args: string[]): string {
+	const result = Bun.spawnSync(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe" });
+	if (result.exitCode !== 0) throw new Error("gjc_lifecycle_worktree_git_identity_unavailable");
+	return result.stdout.toString().trim();
+}
+
+async function waitForLifecycleReadiness(
+	file: string,
+	sessionId: string,
+	launchId: string,
+	attestationDigest: string,
+): Promise<void> {
+	const deadline = Date.now() + LIFECYCLE_LAUNCH_TIMEOUT_MS;
+	for (;;) {
+		try {
+			const marker = JSON.parse(await fsPromises.readFile(file, "utf8")) as Record<string, unknown>;
+			if (
+				marker.session_id === sessionId &&
+				marker.launch_id === launchId &&
+				marker.state === "ready_for_input" &&
+				marker.ready_for_input === true &&
+				typeof marker.attestation_sha256 === "string" &&
+				/^[a-f0-9]{64}$/i.test(marker.attestation_sha256) &&
+				marker.attestation_sha256 === attestationDigest
+			)
+				return;
+			throw new Error("gjc_lifecycle_readiness_invalid");
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		}
+		if (Date.now() >= deadline) throw new Error("gjc_lifecycle_readiness_timeout");
+		await Bun.sleep(25);
+	}
+}
+
 /** Real daemon-safe tmux launcher: canonical owner-isolation plan + GJC tags. */
 export function daemonSpawnCreate(
 	env: NodeJS.ProcessEnv = process.env,
@@ -878,9 +974,93 @@ export function daemonSpawnCreate(
 		const generation = crypto.randomUUID();
 		const runId = crypto.randomUUID();
 		const incarnation = crypto.randomUUID();
-		// Detached: no interactive TTY needed (daemon-safe). These values contain
-		// only opaque ids and paths needed by the resident sidecar to publish its
-		// exact-owner terminal verdict.
+		const runtime = resolveGjcRuntimeArgv();
+		const childCommand = [runtime.execPath, ...runtime.argsPrefix, ...args];
+		const launchId = frame.target.kind === "worktree" ? crypto.randomUUID() : undefined;
+		const nonce = frame.target.kind === "worktree" ? crypto.randomUUID() : undefined;
+		const childToken = frame.target.kind === "worktree" ? crypto.randomUUID() : undefined;
+		const lifecycleRoot = path.join(stateDir, ids.intendedSessionId, "owner-lifecycle");
+		const launchBindingRefFile =
+			frame.target.kind === "worktree" && launchId
+				? path.join(lifecycleRoot, `launch-${launchId}.binding-ref.json`)
+				: undefined;
+		const attestationFile =
+			frame.target.kind === "worktree" && launchId
+				? path.join(lifecycleRoot, `launch-${launchId}.attestation.json`)
+				: undefined;
+		const readinessFile =
+			frame.target.kind === "worktree" && launchId
+				? path.join(lifecycleRoot, `launch-${launchId}.ready.json`)
+				: undefined;
+		const worktreePlan =
+			frame.target.kind === "worktree"
+				? planLaunchWorktree(cwd, { enabled: true, detached: false, name: frame.target.branch })
+				: undefined;
+		if (worktreePlan && !worktreePlan.enabled) throw new Error("gjc_lifecycle_worktree_plan_invalid");
+		const primaryCwd = frame.target.kind === "worktree" ? await fsPromises.realpath(cwd) : cwd;
+		const finalProjectCwd = worktreePlan?.enabled ? path.resolve(worktreePlan.worktreePath) : undefined;
+		const expectedGit =
+			frame.target.kind === "worktree" && finalProjectCwd
+				? {
+						top_level: finalProjectCwd,
+						common_dir: await fsPromises.realpath(
+							path.resolve(primaryCwd, lifecycleGitValue(primaryCwd, ["rev-parse", "--git-common-dir"])),
+						),
+						branch: frame.target.branch,
+					}
+				: undefined;
+		const expectedFingerprint = frame.target.kind === "worktree" ? await fingerprintWorktreeRuntime() : undefined;
+		const expectedRuntimeIdentity =
+			frame.target.kind === "worktree"
+				? { executable: runtime.execPath, argv_sha256: digestLifecycleLaunchCommand(childCommand) }
+				: undefined;
+		const launchBinding =
+			frame.target.kind === "worktree" &&
+			launchId &&
+			nonce &&
+			childToken &&
+			launchBindingRefFile &&
+			attestationFile &&
+			readinessFile &&
+			expectedFingerprint &&
+			expectedRuntimeIdentity
+				? {
+						launch_id: launchId,
+						nonce,
+						child_binding_basename: `child-${childToken}.binding.json`,
+						binding_ref_file: launchBindingRefFile,
+						child_token: childToken,
+						request_id: ids.lifecycleRequestId,
+						session_id: ids.intendedSessionId,
+						generation,
+						run_id: runId,
+						incarnation,
+						command_sha256: expectedRuntimeIdentity.argv_sha256,
+						expected_runtime_identity: expectedRuntimeIdentity,
+						expected_runtime_fingerprint: expectedFingerprint,
+						attestation_file: attestationFile,
+						deadline_ms: Date.now() + LIFECYCLE_LAUNCH_TIMEOUT_MS,
+						requested_branch: frame.target.branch,
+					}
+				: undefined;
+		const attestationBinding: WorktreeLaunchBinding | undefined = launchBinding
+			? {
+					launch_id: launchBinding.launch_id,
+					nonce: launchBinding.nonce,
+					child_token: launchBinding.child_token,
+					request_id: launchBinding.request_id,
+					session_id: launchBinding.session_id,
+					generation: launchBinding.generation,
+					run_id: launchBinding.run_id,
+					incarnation: launchBinding.incarnation,
+					command_sha256: launchBinding.command_sha256,
+					expected_runtime_identity: launchBinding.expected_runtime_identity,
+					expected_runtime_fingerprint: launchBinding.expected_runtime_fingerprint,
+					attestation_file: launchBinding.attestation_file,
+					deadline_ms: launchBinding.deadline_ms,
+					requested_branch: launchBinding.requested_branch,
+				}
+			: undefined;
 		const childEnv: Record<string, string> = {
 			GJC_TMUX_LAUNCHED: "1",
 			GJC_NOTIFICATIONS: "1",
@@ -891,9 +1071,22 @@ export function daemonSpawnCreate(
 			[GJC_TMUX_OWNER_GENERATION_ENV]: generation,
 			[GJC_TMUX_OWNER_STATE_DIR_ENV]: stateDir,
 			[GJC_TMUX_OWNER_SERVER_KEY_ENV]: "default",
-			GJC_MANAGED_OWNER_COMMAND_JSON: JSON.stringify(["gjc", ...args]),
+			GJC_MANAGED_OWNER_COMMAND_JSON: JSON.stringify(childCommand),
 			[MANAGED_OWNER_RUN_ID_ENV]: runId,
 			[MANAGED_OWNER_INCARNATION_ENV]: incarnation,
+			...(launchBinding
+				? {
+						[MANAGED_OWNER_BINDING_REF_ENV]: launchBinding.binding_ref_file,
+					}
+				: {}),
+			...(launchBinding
+				? {
+						[LIFECYCLE_LAUNCH_ATTESTATION_ENV]: JSON.stringify(attestationBinding),
+						[LIFECYCLE_LAUNCH_ATTESTATION_FILE_ENV]: attestationFile!,
+						[GJC_COORDINATOR_SESSION_LAUNCH_ID_ENV]: launchId!,
+						[GJC_COORDINATOR_SESSION_READINESS_FILE_ENV]: readinessFile!,
+					}
+				: {}),
 			...(predecessor
 				? {
 						[MANAGED_OWNER_PREDECESSOR_TOKEN_ENV]: predecessor.predecessorToken,
@@ -908,21 +1101,102 @@ export function daemonSpawnCreate(
 		const envPairs = Object.entries(childEnv)
 			.map(([key, value]) => `${key}=${shellQuote(value)}`)
 			.join(" ");
-		const command = `cd ${shellQuote(cwd)} && exec env ${envPairs} gjc ${shellQuote(MANAGED_OWNER_SUPERVISOR_ARG)}`;
+		const command = `cd ${shellQuote(cwd)} && exec env ${envPairs} ${shellQuote(runtime.execPath)} ${runtime.argsPrefix
+			.map(shellQuote)
+			.join(" ")} ${shellQuote(MANAGED_OWNER_SUPERVISOR_ARG)}`;
+		let attestationDigest: string | undefined;
+		const verifyBeforeCommit =
+			launchBinding && attestationFile && readinessFile && expectedRuntimeIdentity && finalProjectCwd && expectedGit
+				? async (): Promise<void> => {
+						const sourceManifest = projectLifecycleSourceManifestIdentity(generatedSourceClosureManifest);
+						if (!sourceManifest) throw new Error("gjc_lifecycle_source_manifest_unavailable");
+						await waitForExactManagedOwnerBinding({
+							referenceFile: launchBinding.binding_ref_file,
+							childBindingFile: path.join(lifecycleRoot, launchBinding.child_binding_basename),
+							reference: {
+								schema_version: 1,
+								launch_id: launchBinding.launch_id,
+								session_id: launchBinding.session_id,
+								generation: launchBinding.generation,
+								run_id: launchBinding.run_id,
+								endpoint_incarnation: launchBinding.incarnation,
+								child_token: launchBinding.child_token,
+								child_binding_basename: launchBinding.child_binding_basename,
+								command_sha256: launchBinding.command_sha256,
+							},
+						});
+						const expectation: LifecycleLaunchAttestationExpectation = {
+							launch_id: launchBinding.launch_id,
+							nonce: launchBinding.nonce,
+							request_id: launchBinding.request_id,
+							session_id: launchBinding.session_id,
+							generation: launchBinding.generation,
+							run_id: launchBinding.run_id,
+							incarnation: launchBinding.incarnation,
+							child_token: launchBinding.child_token,
+							command_sha256: launchBinding.command_sha256,
+							expected_runtime_identity: expectedRuntimeIdentity,
+							observed_runtime_fingerprint: expectedFingerprint!,
+							canonical_cwd: finalProjectCwd,
+							git: {
+								...expectedGit,
+								top_level: finalProjectCwd,
+								common_dir: await fsPromises.realpath(expectedGit.common_dir),
+							},
+							source_manifest: sourceManifest,
+						};
+						await waitForLifecycleLaunchAttestation(attestationFile, expectation, {
+							timeout_ms: LIFECYCLE_LAUNCH_TIMEOUT_MS,
+						});
+						attestationDigest = crypto
+							.createHash("sha256")
+							.update(await fsPromises.readFile(attestationFile))
+							.digest("hex");
+					}
+				: undefined;
+		const verifyAfterMetadata =
+			launchBinding && readinessFile
+				? async (): Promise<void> => {
+						if (!attestationDigest) throw new Error("gjc_lifecycle_attestation_digest_unavailable");
+						await waitForLifecycleReadiness(
+							readinessFile,
+							ids.intendedSessionId,
+							launchBinding.launch_id,
+							attestationDigest,
+						);
+					}
+				: undefined;
 		await completeLifecycleSpawnTransaction({
 			tmux,
 			env,
 			sessionId: ids.intendedSessionId,
 			generation,
 			stateDir,
-			cwd,
+			cwd: finalProjectCwd ?? cwd,
 			sessionName: name,
 			sessionStateFile,
 			argv: [tmux, "new-session", "-d", "-P", "-F", "#{session_id}", "-s", name, "sh", "-c", command],
 			ownerIsolationProbe: opts.ownerIsolationProbe,
-			prepareSpawn: () => {
-				if (frame.target.kind === "plain_dir") fs.mkdirSync(cwd, { recursive: true });
+			prepareSpawn: async () => {
+				if (frame.target.kind === "plain_dir") {
+					fs.mkdirSync(cwd, { recursive: true });
+					return;
+				}
+				if (!launchBinding) return;
+				await writeManagedOwnerLaunchBindingRef(launchBinding.binding_ref_file, {
+					schema_version: 1,
+					launch_id: launchBinding.launch_id,
+					session_id: launchBinding.session_id,
+					generation: launchBinding.generation,
+					run_id: launchBinding.run_id,
+					endpoint_incarnation: launchBinding.incarnation,
+					child_token: launchBinding.child_token,
+					child_binding_basename: launchBinding.child_binding_basename,
+					command_sha256: launchBinding.command_sha256,
+				});
 			},
+			verifyBeforeCommit,
+			verifyAfterMetadata,
 			previousBaseline,
 		});
 
@@ -1083,6 +1357,8 @@ export function daemonResumeSession(
 			throw new Error(`gjc_lifecycle_resume_cwd_unavailable: ${resolvedResumeCwd ?? "(missing)"}`);
 		}
 		const tmux = tmuxBinary.command;
+		const runtime = resolveGjcRuntimeArgv();
+		const childCommand = [runtime.execPath, ...runtime.argsPrefix, "--resume", resumeId];
 		const name = tmuxSessionNameFor(resumeId);
 		const sessionStateFile = lifecycleRuntimeStateFile(resolvedResumeCwd, resumeId, name);
 		const stateDir = path.dirname(sessionStateFile);
@@ -1099,7 +1375,7 @@ export function daemonResumeSession(
 			[GJC_TMUX_OWNER_GENERATION_ENV]: generation,
 			[GJC_TMUX_OWNER_STATE_DIR_ENV]: stateDir,
 			[GJC_TMUX_OWNER_SERVER_KEY_ENV]: "default",
-			GJC_MANAGED_OWNER_COMMAND_JSON: JSON.stringify(["gjc", "--resume", resumeId]),
+			GJC_MANAGED_OWNER_COMMAND_JSON: JSON.stringify(childCommand),
 			[MANAGED_OWNER_RUN_ID_ENV]: runId,
 			[MANAGED_OWNER_INCARNATION_ENV]: incarnation,
 			...(predecessor
@@ -1115,7 +1391,9 @@ export function daemonResumeSession(
 		const envPairs = Object.entries(childEnv)
 			.map(([key, value]) => `${key}=${shellQuote(value)}`)
 			.join(" ");
-		const command = `cd ${shellQuote(resolvedResumeCwd)} && exec env ${envPairs} gjc ${shellQuote(MANAGED_OWNER_SUPERVISOR_ARG)}`;
+		const command = `cd ${shellQuote(resolvedResumeCwd)} && exec env ${envPairs} ${shellQuote(runtime.execPath)} ${runtime.argsPrefix
+			.map(shellQuote)
+			.join(" ")} ${shellQuote(MANAGED_OWNER_SUPERVISOR_ARG)}`;
 		await completeLifecycleSpawnTransaction({
 			tmux,
 			env,

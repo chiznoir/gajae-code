@@ -6,6 +6,7 @@ import * as native from "@gajae-code/natives";
 
 import { Settings } from "../src/config/settings";
 import { TELEGRAM_PARSE_MODE } from "../src/sdk/bus/html-format";
+import { parseLifecycleCommand } from "../src/sdk/bus/lifecycle-commands";
 import { TelegramNotificationDaemon } from "../src/sdk/bus/telegram-daemon";
 import {
 	prepareManagedSessionScopeForWriteSync,
@@ -87,6 +88,19 @@ function writeSession(
 }
 
 describe("lifecycle command routing (G009)", () => {
+	test("parses the exact Telegram worktree command as a named worktree target", () => {
+		expect(
+			parseLifecycleCommand("/session_create worktree /home/jhchoi/clone/gajae-code fix-telegram-close"),
+		).toEqual({
+			kind: "create",
+			target: {
+				kind: "worktree",
+				repo: "/home/jhchoi/clone/gajae-code",
+				branch: "fix-telegram-close",
+			},
+			modelPreset: undefined,
+		});
+	});
 	test("a paired-chat /session_* command is detected and answered (no injection fallthrough)", async () => {
 		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-lc-route-"));
 		const { calls, api } = spyBot();

@@ -5,6 +5,7 @@ import type { SessionCloseFrame, SessionCreateFrame, SessionResumeFrame } from "
 import {
 	type AuditEvent,
 	auditRedactionRef,
+	CleanSpawnFailure,
 	canonicalRequest,
 	canonicalTarget,
 	classifyDuplicate,
@@ -484,6 +485,58 @@ describe("lifecycle orchestrator", () => {
 		if (out.status === "error") expect(out.reason).toBe("terminal_uncertain");
 		expect((await store.read()).entries[`${PAIRED}:100`]?.state).toBe("terminal_uncertain");
 	});
+	it("persists spawn_failed only for a typed clean pre-spawn failure", async () => {
+		const {
+			deps: d,
+			store,
+			audit,
+		} = deps({
+			spawnCreate: async () => {
+				throw new CleanSpawnFailure("no_owner_attempt_created", "private pre-spawn diagnostic");
+			},
+		});
+		const out = await handleLifecycleRequest(createFrame(), d);
+		expect(out).toEqual({
+			status: "error",
+			reason: "spawn_failed",
+			message: "session creation failed; send a new update to retry",
+		});
+		expect((await store.read()).entries[`${PAIRED}:100`]).toMatchObject({
+			state: "failure",
+			reason: "spawn_failed",
+		});
+		expect(audit.at(-1)).toMatchObject({ event: "failure", reason: "spawn_failed" });
+	});
+
+	it("persists spawn_failed after an exact-owner cleanup proves the failed attempt is gone", async () => {
+		const { deps: d, store } = deps({
+			spawnCreate: async () => {
+				throw new CleanSpawnFailure("exact_owner_cleanup_completed", "private exact-owner cleanup diagnostic");
+			},
+		});
+		const out = await handleLifecycleRequest(createFrame(), d);
+		expect(out).toMatchObject({ status: "error", reason: "spawn_failed" });
+		expect((await store.read()).entries[`${PAIRED}:100`]).toMatchObject({
+			state: "failure",
+			reason: "spawn_failed",
+		});
+	});
+
+	it("redacts unknown spawn diagnostics from terminal_uncertain responses", async () => {
+		const privateDiagnostic = "token=private-value /home/private/project";
+		const { deps: d } = deps({
+			spawnCreate: async () => {
+				throw new Error(privateDiagnostic);
+			},
+		});
+		const out = await handleLifecycleRequest(createFrame(), d);
+		expect(out).toEqual({
+			status: "error",
+			reason: "terminal_uncertain",
+			message: "lifecycle effect outcome unknown; manual check required",
+		});
+		expect(JSON.stringify(out)).not.toContain(privateDiagnostic);
+	});
 
 	it("fails closed on an ambiguous resume", async () => {
 		const { deps: d } = deps({
@@ -647,7 +700,7 @@ describe("lifecycle orchestrator", () => {
 		expect(out.status).toBe("error");
 		if (out.status === "error") {
 			expect(out.reason).toBe("terminal_uncertain");
-			expect(out.message).toContain("session_close effect failed");
+			expect(out.message).toBe("lifecycle effect outcome unknown; manual check required");
 		}
 		expect((await store.read()).entries[`${PAIRED}:302`]?.reason).toBe("close_refused");
 		expect(audit.at(-1)).toMatchObject({ event: "terminal_uncertain", reason: "close_refused" });

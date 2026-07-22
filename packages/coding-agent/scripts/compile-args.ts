@@ -58,14 +58,20 @@ export function buildReleaseCompileArgs(target: string, outfile: string): string
 	});
 }
 
-export function buildDevCompileArgs(outfile = "dist/gjc"): string[] {
-	return buildCompileArgs({
+export function buildDevCompileArgs(
+	outfile = "dist/gjc",
+	metafile?: string,
+	entrypoints: readonly string[] = devEntrypoints,
+): string[] {
+	const args = buildCompileArgs({
 		root: "../..",
-		entrypoints: devEntrypoints,
+		entrypoints: [...entrypoints],
 		outfile,
 		defines: devDefineFlags,
 		externals: compiledExternalPackages,
 	});
+	if (metafile) args.push("--metafile", metafile);
+	return args;
 }
 
 export function buildCompileArgs(options: CompileArgOptions): string[] {

@@ -1,7 +1,9 @@
 import { describe, expect, it } from "bun:test";
+import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { writeManagedOwnerLaunchBindingRef } from "@gajae-code/coding-agent/gjc-runtime/managed-owner-supervisor";
 import { sessionUltragoalDir } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
 import { lifecyclePaths } from "@gajae-code/coding-agent/gjc-runtime/tmux-owner-isolation";
 
@@ -57,6 +59,25 @@ function fastSigabrtCommand(): string[] {
 	if (process.platform !== "win32") return ["/bin/sh", "-c", "kill -ABRT $$"];
 	return [process.execPath, "-e", "process.kill(process.pid, 'SIGABRT')"];
 }
+async function writeLaunchReference(stateDir: string, command: string[], overrides: Record<string, unknown> = {}) {
+	const root = lifecyclePaths(stateDir, "session-2681", "generation-2681").root;
+	const launchId = "launch-2681";
+	const childToken = "preallocated-token";
+	const file = path.join(root, `launch-${launchId}.binding-ref.json`);
+	await writeManagedOwnerLaunchBindingRef(file, {
+		schema_version: 1,
+		launch_id: launchId,
+		session_id: "session-2681",
+		generation: "generation-2681",
+		run_id: "run-2681",
+		endpoint_incarnation: "incarnation-2681",
+		child_token: childToken,
+		child_binding_basename: `child-${childToken}.binding.json`,
+		command_sha256: crypto.createHash("sha256").update(JSON.stringify(command)).digest("hex"),
+		...overrides,
+	} as Parameters<typeof writeManagedOwnerLaunchBindingRef>[1]);
+	return { root, file, childToken };
+}
 
 describe("managed owner supervisor", () => {
 	it("records one exact durable SIGABRT receipt and exits with the abort status", async () => {
@@ -101,6 +122,43 @@ describe("managed owner supervisor", () => {
 			expect(result.exitCode).toBe(23);
 			const root = lifecyclePaths(stateDir, "session-2681", "generation-2681").root;
 			expect((await fs.readdir(root)).some(file => file.startsWith("sigabrt-"))).toBe(false);
+		} finally {
+			await fs.rm(stateDir, { recursive: true, force: true });
+		}
+	});
+	it("uses a caller-preallocated launch reference for exactly one child binding", async () => {
+		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-owner-"));
+		try {
+			const command = [process.execPath, "-e", "process.exit(0)"];
+			const { root, file, childToken } = await writeLaunchReference(stateDir, command);
+			await fs.writeFile(path.join(root, "child-decoy.binding.json"), '{"decoy":true}\n');
+			const result = await runSupervisor(stateDir, command, { GJC_MANAGED_OWNER_BINDING_REF: file });
+			expect(result.exitCode).toBe(0);
+			expect(await fs.readFile(path.join(root, `child-${childToken}.binding.json`), "utf8")).toContain(childToken);
+			expect(await fs.readFile(path.join(root, "child-decoy.binding.json"), "utf8")).toContain("decoy");
+		} finally {
+			await fs.rm(stateDir, { recursive: true, force: true });
+		}
+	});
+	it("rejects malformed, replayed, foreign, and command-mismatched launch references", async () => {
+		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-owner-"));
+		try {
+			const command = [process.execPath, "-e", "process.exit(0)"];
+			const { file } = await writeLaunchReference(stateDir, command);
+			await fs.writeFile(file, "{");
+			expect((await runSupervisor(stateDir, command, { GJC_MANAGED_OWNER_BINDING_REF: file })).stderr).toContain(
+				"managed_owner_launch_binding_ref_invalid",
+			);
+			await fs.rm(file);
+			const replay = await writeLaunchReference(stateDir, command, { generation: "foreign-generation" });
+			expect(
+				(await runSupervisor(stateDir, command, { GJC_MANAGED_OWNER_BINDING_REF: replay.file })).stderr,
+			).toContain("managed_owner_launch_binding_ref_mismatch");
+			await fs.rm(replay.file);
+			const mismatch = await writeLaunchReference(stateDir, [process.execPath, "-e", "process.exit(1)"]);
+			expect(
+				(await runSupervisor(stateDir, command, { GJC_MANAGED_OWNER_BINDING_REF: mismatch.file })).stderr,
+			).toContain("managed_owner_launch_binding_ref_mismatch");
 		} finally {
 			await fs.rm(stateDir, { recursive: true, force: true });
 		}

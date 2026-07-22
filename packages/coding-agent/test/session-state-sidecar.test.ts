@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, setSystemTime, spyOn } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, setSystemTime, spyOn } from "bun:test";
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
@@ -7,6 +7,7 @@ import { postmortem } from "@gajae-code/utils";
 import { sessionRuntimeDir } from "../src/gjc-runtime/session-layout";
 import {
 	eventAffectsCoordinatorRuntimeState,
+	GJC_COORDINATOR_SESSION_ATTESTATION_DIGEST_ENV,
 	GJC_COORDINATOR_SESSION_BRANCH_ENV,
 	GJC_COORDINATOR_SESSION_ID_ENV,
 	GJC_COORDINATOR_SESSION_LAUNCH_ID_ENV,
@@ -61,6 +62,12 @@ const ORIGINAL_SESSION_ID = process.env[GJC_COORDINATOR_SESSION_ID_ENV];
 const ORIGINAL_BRANCH = process.env[GJC_COORDINATOR_SESSION_BRANCH_ENV];
 const ORIGINAL_LAUNCH_ID = process.env[GJC_COORDINATOR_SESSION_LAUNCH_ID_ENV];
 const ORIGINAL_READINESS_FILE = process.env[GJC_COORDINATOR_SESSION_READINESS_FILE_ENV];
+const ORIGINAL_ATTESTATION_DIGEST = process.env[GJC_COORDINATOR_SESSION_ATTESTATION_DIGEST_ENV];
+const ORIGINAL_OWNER_GENERATION = process.env[GJC_TMUX_OWNER_GENERATION_ENV];
+const ORIGINAL_OWNER_STATE_DIR = process.env[GJC_TMUX_OWNER_STATE_DIR_ENV];
+const ORIGINAL_OWNER_SERVER_KEY = process.env[GJC_TMUX_OWNER_SERVER_KEY_ENV];
+const ORIGINAL_GJC_SESSION_ID = process.env.GJC_SESSION_ID;
+const ORIGINAL_TMUX_LAUNCHED = process.env.GJC_TMUX_LAUNCHED;
 const PROMPT_ACCEPTED_ENV = "GJC_SESSION_PROMPT_ACCEPTED_JSON";
 const BASELINE_DIRTY_ENV = "GJC_SESSION_WORKTREE_BASELINE_DIRTY";
 const ORIGINAL_PROMPT_ACCEPTED = process.env[PROMPT_ACCEPTED_ENV];
@@ -77,6 +84,24 @@ function git(cwd: string, args: string[]): void {
 	if (proc.exitCode !== 0) throw new Error(proc.stderr.toString() || `git ${args.join(" ")} failed`);
 }
 
+beforeEach(() => {
+	for (const name of [
+		GJC_COORDINATOR_SESSION_STATE_FILE_ENV,
+		GJC_COORDINATOR_SESSION_ID_ENV,
+		GJC_COORDINATOR_SESSION_BRANCH_ENV,
+		GJC_COORDINATOR_SESSION_LAUNCH_ID_ENV,
+		GJC_COORDINATOR_SESSION_READINESS_FILE_ENV,
+		GJC_COORDINATOR_SESSION_ATTESTATION_DIGEST_ENV,
+		GJC_TMUX_OWNER_GENERATION_ENV,
+		GJC_TMUX_OWNER_STATE_DIR_ENV,
+		GJC_TMUX_OWNER_SERVER_KEY_ENV,
+		PROMPT_ACCEPTED_ENV,
+		BASELINE_DIRTY_ENV,
+		"GJC_SESSION_ID",
+		"GJC_TMUX_LAUNCHED",
+	])
+		delete process.env[name];
+});
 afterEach(async () => {
 	if (ORIGINAL_STATE_FILE === undefined) delete process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV];
 	else process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = ORIGINAL_STATE_FILE;
@@ -88,10 +113,22 @@ afterEach(async () => {
 	else process.env[GJC_COORDINATOR_SESSION_LAUNCH_ID_ENV] = ORIGINAL_LAUNCH_ID;
 	if (ORIGINAL_READINESS_FILE === undefined) delete process.env[GJC_COORDINATOR_SESSION_READINESS_FILE_ENV];
 	else process.env[GJC_COORDINATOR_SESSION_READINESS_FILE_ENV] = ORIGINAL_READINESS_FILE;
+	if (ORIGINAL_ATTESTATION_DIGEST === undefined) delete process.env[GJC_COORDINATOR_SESSION_ATTESTATION_DIGEST_ENV];
+	else process.env[GJC_COORDINATOR_SESSION_ATTESTATION_DIGEST_ENV] = ORIGINAL_ATTESTATION_DIGEST;
 	if (ORIGINAL_PROMPT_ACCEPTED === undefined) delete process.env[PROMPT_ACCEPTED_ENV];
 	else process.env[PROMPT_ACCEPTED_ENV] = ORIGINAL_PROMPT_ACCEPTED;
 	if (ORIGINAL_BASELINE_DIRTY === undefined) delete process.env[BASELINE_DIRTY_ENV];
 	else process.env[BASELINE_DIRTY_ENV] = ORIGINAL_BASELINE_DIRTY;
+	if (ORIGINAL_OWNER_GENERATION === undefined) delete process.env[GJC_TMUX_OWNER_GENERATION_ENV];
+	else process.env[GJC_TMUX_OWNER_GENERATION_ENV] = ORIGINAL_OWNER_GENERATION;
+	if (ORIGINAL_OWNER_STATE_DIR === undefined) delete process.env[GJC_TMUX_OWNER_STATE_DIR_ENV];
+	else process.env[GJC_TMUX_OWNER_STATE_DIR_ENV] = ORIGINAL_OWNER_STATE_DIR;
+	if (ORIGINAL_OWNER_SERVER_KEY === undefined) delete process.env[GJC_TMUX_OWNER_SERVER_KEY_ENV];
+	else process.env[GJC_TMUX_OWNER_SERVER_KEY_ENV] = ORIGINAL_OWNER_SERVER_KEY;
+	if (ORIGINAL_GJC_SESSION_ID === undefined) delete process.env.GJC_SESSION_ID;
+	else process.env.GJC_SESSION_ID = ORIGINAL_GJC_SESSION_ID;
+	if (ORIGINAL_TMUX_LAUNCHED === undefined) delete process.env.GJC_TMUX_LAUNCHED;
+	else process.env.GJC_TMUX_LAUNCHED = ORIGINAL_TMUX_LAUNCHED;
 	await Promise.all(tempDirs.splice(0).map(dir => fs.rm(dir, { recursive: true, force: true })));
 });
 
@@ -1841,15 +1878,17 @@ describe("coordinator runtime state sidecar", () => {
 		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = "ready-session";
 		process.env[GJC_COORDINATOR_SESSION_LAUNCH_ID_ENV] = "ready-launch";
 		process.env[GJC_COORDINATOR_SESSION_READINESS_FILE_ENV] = readinessFile;
+		process.env[GJC_COORDINATOR_SESSION_ATTESTATION_DIGEST_ENV] = "a".repeat(64);
 		setSystemTime(new Date("2026-07-11T12:00:00.000Z"));
 
 		const marker = await persistCoordinatorRuntimeInputReady();
 
 		if (!marker) throw new Error("expected_runtime_readiness_marker");
 		expect(marker).toEqual({
-			schema_version: 1,
+			schema_version: 2,
 			session_id: "ready-session",
 			launch_id: "ready-launch",
+			attestation_sha256: "a".repeat(64),
 			state: "ready_for_input",
 			event: "interactive_input_ready",
 			source: "gjc_interactive_runtime",
@@ -1866,6 +1905,7 @@ describe("coordinator runtime state sidecar", () => {
 		delete process.env[GJC_COORDINATOR_SESSION_ID_ENV];
 		delete process.env[GJC_COORDINATOR_SESSION_LAUNCH_ID_ENV];
 		delete process.env[GJC_COORDINATOR_SESSION_READINESS_FILE_ENV];
+		delete process.env[GJC_COORDINATOR_SESSION_ATTESTATION_DIGEST_ENV];
 
 		expect(await persistCoordinatorRuntimeInputReady()).toBeNull();
 	});
@@ -1877,6 +1917,7 @@ describe("coordinator runtime state sidecar", () => {
 		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = "idempotent-session";
 		process.env[GJC_COORDINATOR_SESSION_LAUNCH_ID_ENV] = "idempotent-launch";
 		process.env[GJC_COORDINATOR_SESSION_READINESS_FILE_ENV] = readinessFile;
+		process.env[GJC_COORDINATOR_SESSION_ATTESTATION_DIGEST_ENV] = "b".repeat(64);
 		setSystemTime(new Date("2026-07-11T12:00:00.000Z"));
 		const first = await persistCoordinatorRuntimeInputReady();
 		const original = await Bun.file(readinessFile).text();
@@ -1888,6 +1929,34 @@ describe("coordinator runtime state sidecar", () => {
 		expect(await Bun.file(readinessFile).text()).toBe(original);
 		setSystemTime();
 	});
+	it("rejects a readiness marker whose attestation digest differs from the launch binding", async () => {
+		const root = await tempRoot();
+		const readinessFile = path.join(root, "runtime-input-ready.json");
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = path.join(root, "state.json");
+		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = "digest-session";
+		process.env[GJC_COORDINATOR_SESSION_LAUNCH_ID_ENV] = "digest-launch";
+		process.env[GJC_COORDINATOR_SESSION_READINESS_FILE_ENV] = readinessFile;
+		process.env[GJC_COORDINATOR_SESSION_ATTESTATION_DIGEST_ENV] = "d".repeat(64);
+		await Bun.write(
+			readinessFile,
+			JSON.stringify({
+				schema_version: 2,
+				session_id: "digest-session",
+				launch_id: "digest-launch",
+				attestation_sha256: "e".repeat(64),
+				state: "ready_for_input",
+				event: "interactive_input_ready",
+				source: "gjc_interactive_runtime",
+				ready_for_input: true,
+				created_at: "2026-07-11T12:00:00.000Z",
+			}),
+		);
+
+		await expect(persistCoordinatorRuntimeInputReady()).rejects.toMatchObject({
+			code: "runtime_readiness_marker_conflict",
+		});
+		expect((await readJson(readinessFile)).attestation_sha256).toBe("e".repeat(64));
+	});
 
 	it("rejects malformed and conflicting readiness markers without overwriting them", async () => {
 		const root = await tempRoot();
@@ -1896,6 +1965,7 @@ describe("coordinator runtime state sidecar", () => {
 		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = "conflict-session";
 		process.env[GJC_COORDINATOR_SESSION_LAUNCH_ID_ENV] = "conflict-launch";
 		process.env[GJC_COORDINATOR_SESSION_READINESS_FILE_ENV] = readinessFile;
+		process.env[GJC_COORDINATOR_SESSION_ATTESTATION_DIGEST_ENV] = "c".repeat(64);
 		await Bun.write(readinessFile, "not json");
 
 		await expect(persistCoordinatorRuntimeInputReady()).rejects.toMatchObject({
@@ -1912,6 +1982,7 @@ describe("coordinator runtime state sidecar", () => {
 				event: "interactive_input_ready",
 				source: "gjc_interactive_runtime",
 				ready_for_input: true,
+				attestation_sha256: "c".repeat(64),
 				created_at: "2026-07-11T12:00:00.000Z",
 			}),
 		);
@@ -1930,6 +2001,7 @@ describe("coordinator runtime state sidecar", () => {
 				event: "interactive_input_ready",
 				source: "gjc_interactive_runtime",
 				ready_for_input: true,
+				attestation_sha256: "c".repeat(64),
 				created_at: "",
 			}),
 		);
@@ -1946,6 +2018,7 @@ describe("coordinator runtime state sidecar", () => {
 		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = "race-session";
 		process.env[GJC_COORDINATOR_SESSION_LAUNCH_ID_ENV] = "race-launch";
 		process.env[GJC_COORDINATOR_SESSION_READINESS_FILE_ENV] = readinessFile;
+		process.env[GJC_COORDINATOR_SESSION_ATTESTATION_DIGEST_ENV] = "f".repeat(64);
 
 		const [left, right] = await Promise.all([
 			persistCoordinatorRuntimeInputReady(),
@@ -1966,6 +2039,7 @@ describe("coordinator runtime state sidecar", () => {
 		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = "independent-session";
 		process.env[GJC_COORDINATOR_SESSION_LAUNCH_ID_ENV] = "independent-launch";
 		process.env[GJC_COORDINATOR_SESSION_READINESS_FILE_ENV] = readinessFile;
+		process.env[GJC_COORDINATOR_SESSION_ATTESTATION_DIGEST_ENV] = "f".repeat(64);
 		const marker = await persistCoordinatorRuntimeInputReady();
 		if (!marker) throw new Error("expected_runtime_readiness_marker");
 

@@ -19,7 +19,11 @@ import {
 	type LifecycleControlServerFactory,
 	outcomeToResponse,
 } from "@gajae-code/coding-agent/sdk/bus/lifecycle-control-runtime";
-import type { LedgerEntry, OrchestratorDeps } from "@gajae-code/coding-agent/sdk/bus/lifecycle-orchestrator";
+import {
+	CleanSpawnFailure,
+	type LedgerEntry,
+	type OrchestratorDeps,
+} from "@gajae-code/coding-agent/sdk/bus/lifecycle-orchestrator";
 import { startDaemonLifecycleControl } from "@gajae-code/coding-agent/sdk/bus/telegram-daemon";
 import * as native from "@gajae-code/natives";
 import { getConfigRootDir, logger } from "@gajae-code/utils";
@@ -1722,29 +1726,31 @@ describe("lifecycle control runtime", () => {
 		fs.chmodSync(tmux, 0o755);
 		let probeCalls = 0;
 
-		await expect(
-			daemonSpawnCreate(
-				{ ...process.env, GJC_TMUX_COMMAND: tmux },
-				{
-					ownerIsolationProbe: {
-						readCallerCgroup: async () => "/gjc-lifecycle-test.scope\n",
-						probeServer: async () =>
-							++probeCalls === 1
-								? { state: "absent" }
-								: {
-										state: "safe",
-										pid: process.pid,
-										startTime: "1",
-										cgroup: { classification: "safe", scope: "/gjc-lifecycle-test.scope" },
-										sessionNames: ["gjc_lc_metadata-123"],
-									},
-					},
+		const effect = daemonSpawnCreate(
+			{ ...process.env, GJC_TMUX_COMMAND: tmux },
+			{
+				ownerIsolationProbe: {
+					readCallerCgroup: async () => "/gjc-lifecycle-test.scope\n",
+					probeServer: async () =>
+						++probeCalls === 1
+							? { state: "absent" }
+							: {
+									state: "safe",
+									pid: process.pid,
+									startTime: "1",
+									cgroup: { classification: "safe", scope: "/gjc-lifecycle-test.scope" },
+									sessionNames: ["gjc_lc_metadata-123"],
+								},
 				},
-			)(createFrame({ target: { kind: "existing_path", path: proj } }), {
-				lifecycleRequestId: "lc-metadata",
-				intendedSessionId: "metadata-123",
-			}),
-		).rejects.toThrow("gjc_lifecycle_metadata_write_failed");
+			},
+		);
+		const attempt = effect(createFrame({ target: { kind: "existing_path", path: proj } }), {
+			lifecycleRequestId: "lc-metadata",
+			intendedSessionId: "metadata-123",
+		});
+		await expect(attempt).rejects.toBeInstanceOf(CleanSpawnFailure);
+		await expect(attempt).rejects.toMatchObject({ proof: "exact_owner_cleanup_completed" });
+		await expect(attempt).rejects.toThrow("gjc_lifecycle_metadata_write_failed");
 		fs.rmSync(root, { recursive: true, force: true });
 	});
 	posixTmuxIt(

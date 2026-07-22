@@ -205,6 +205,20 @@ describe("default launch worktrees", () => {
 		expect(ensured.enabled && ensured.branchName).toBe("feature/demo");
 		expect(run("git", ["branch", "--show-current"], expectedPath)).toBe("feature/demo");
 	});
+	it("keeps an exact lifecycle worktree launch outside the primary checkout", async () => {
+		const repo = await createRepo("gjc-telegram-lifecycle-worktree-");
+		const primaryHead = run("git", ["rev-parse", "HEAD"], repo);
+		const primaryBranch = run("git", ["branch", "--show-current"], repo);
+		const launch = prepareLaunchWorktree(repo, ["--worktree=fix-telegram-close"]);
+
+		expect(launch.args).toEqual([]);
+		expect(launch.worktree.enabled && launch.worktree.branchName).toBe("fix-telegram-close");
+		expect(run("git", ["rev-parse", "--show-toplevel"], launch.cwd)).toBe(launch.cwd);
+		expect(run("git", ["branch", "--show-current"], launch.cwd)).toBe("fix-telegram-close");
+		expect(launch.cwd).not.toBe(repo);
+		expect(run("git", ["rev-parse", "HEAD"], repo)).toBe(primaryHead);
+		expect(run("git", ["branch", "--show-current"], repo)).toBe(primaryBranch);
+	});
 
 	it("keeps launch worktree slugs collision-resistant for similar branch names", async () => {
 		const repo = await createRepo("gjc-launch-collision-worktree-");

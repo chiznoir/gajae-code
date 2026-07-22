@@ -87,6 +87,21 @@ export interface CreateEffectResult {
 export interface ResumeEffectResult extends CreateEffectResult {
 	mode: "reattached" | "cold_restarted";
 }
+/** Evidence that permits durable classification of a failed create as clean. */
+export type CleanSpawnFailureProof = "no_owner_attempt_created" | "exact_owner_cleanup_completed";
+
+/** A spawn failure whose no-effect or exact-cleanup outcome was proven by the effect. */
+export class CleanSpawnFailure extends Error {
+	readonly cleanSpawnFailure = true;
+
+	constructor(
+		readonly proof: CleanSpawnFailureProof,
+		message = "gjc_lifecycle_clean_spawn_failure",
+	) {
+		super(message);
+		this.name = "CleanSpawnFailure";
+	}
+}
 
 /** Injected effects + policy. Pure orchestration calls into these. */
 export interface OrchestratorDeps {
@@ -441,11 +456,24 @@ export async function handleLifecycleRequest(
 			const failedPromptRef = Reflect.get(err, "startupPromptRef");
 			if (typeof failedPromptRef === "string") entry.startupPromptRef = failedPromptRef;
 		}
+		const cleanSpawnFailure = err instanceof CleanSpawnFailure;
+		if (frame.type === "session_create" && cleanSpawnFailure) {
+			Object.assign(entry, {
+				state: "failure",
+				updatedAt: deps.now(),
+				reason: "spawn_failed" as const,
+			});
+			await deps.store.write(doc);
+			await deps.audit({ ...baseAudit, event: "failure", reason: "spawn_failed" });
+			return {
+				status: "error",
+				reason: "spawn_failed",
+				message: "session creation failed; send a new update to retry",
+			};
+		}
 		// A side effect may have occurred; do not repeat it automatically. Mark
 		// terminal-uncertain so a retry reconciles instead of duplicating work.
-		let reason: LifecycleErrorReason = "terminal_uncertain";
-		if (frame.type === "session_create") reason = "spawn_failed";
-		if (frame.type === "session_close") reason = "close_refused";
+		const reason: LifecycleErrorReason = frame.type === "session_close" ? "close_refused" : "terminal_uncertain";
 		Object.assign(entry, {
 			state: "terminal_uncertain",
 			updatedAt: deps.now(),
@@ -453,6 +481,10 @@ export async function handleLifecycleRequest(
 		});
 		await deps.store.write(doc);
 		await deps.audit({ ...baseAudit, event: "terminal_uncertain", reason });
-		return { status: "error", reason: "terminal_uncertain", message: `${frame.type} effect failed: ${String(err)}` };
+		return {
+			status: "error",
+			reason: "terminal_uncertain",
+			message: "lifecycle effect outcome unknown; manual check required",
+		};
 	}
 }

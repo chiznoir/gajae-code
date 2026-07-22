@@ -25,11 +25,13 @@ export const GJC_COORDINATOR_SESSION_ID_ENV = "GJC_COORDINATOR_SESSION_ID";
 export const GJC_COORDINATOR_SESSION_BRANCH_ENV = "GJC_COORDINATOR_SESSION_BRANCH";
 export const GJC_COORDINATOR_SESSION_LAUNCH_ID_ENV = "GJC_COORDINATOR_SESSION_LAUNCH_ID";
 export const GJC_COORDINATOR_SESSION_READINESS_FILE_ENV = "GJC_COORDINATOR_SESSION_READINESS_FILE";
+export const GJC_COORDINATOR_SESSION_ATTESTATION_DIGEST_ENV = "GJC_COORDINATOR_SESSION_ATTESTATION_DIGEST";
 
 export type RuntimeInputReadyMarker = Readonly<{
-	schema_version: 1;
+	schema_version: 2;
 	session_id: string;
 	launch_id: string;
+	attestation_sha256: string;
 	state: "ready_for_input";
 	event: "interactive_input_ready";
 	source: "gjc_interactive_runtime";
@@ -129,9 +131,11 @@ function isRuntimeInputReadyMarker(value: unknown): value is RuntimeInputReadyMa
 	if (!value || typeof value !== "object") return false;
 	const marker = value as Record<string, unknown>;
 	return (
-		marker.schema_version === 1 &&
+		marker.schema_version === 2 &&
 		typeof marker.session_id === "string" &&
 		typeof marker.launch_id === "string" &&
+		typeof marker.attestation_sha256 === "string" &&
+		/^[a-f0-9]{64}$/i.test(marker.attestation_sha256) &&
 		marker.state === "ready_for_input" &&
 		marker.event === "interactive_input_ready" &&
 		marker.source === "gjc_interactive_runtime" &&
@@ -171,20 +175,27 @@ export async function persistCoordinatorRuntimeInputReady(): Promise<RuntimeInpu
 	const launchId = process.env[GJC_COORDINATOR_SESSION_LAUNCH_ID_ENV]?.trim();
 	const readinessFile = process.env[GJC_COORDINATOR_SESSION_READINESS_FILE_ENV]?.trim();
 	if (!stateFile || !sessionId || !launchId || !readinessFile) return null;
+	const attestationDigest = process.env[GJC_COORDINATOR_SESSION_ATTESTATION_DIGEST_ENV]?.trim();
+	if (!attestationDigest || !/^[a-f0-9]{64}$/i.test(attestationDigest)) throw runtimeReadinessMarkerConflict();
 
-	const expected = { sessionId, launchId };
+	const expected = { sessionId, launchId, attestationDigest };
 	const existing = await readRuntimeInputReadyMarker(readinessFile);
 	if (existing) {
-		if (existing.session_id !== expected.sessionId || existing.launch_id !== expected.launchId) {
+		if (
+			existing.session_id !== expected.sessionId ||
+			existing.launch_id !== expected.launchId ||
+			existing.attestation_sha256 !== expected.attestationDigest
+		) {
 			throw runtimeReadinessMarkerConflict();
 		}
 		return existing;
 	}
 
 	const marker = immutableRuntimeInputReadyMarker({
-		schema_version: 1,
+		schema_version: 2,
 		session_id: expected.sessionId,
 		launch_id: expected.launchId,
+		attestation_sha256: expected.attestationDigest,
 		state: "ready_for_input",
 		event: "interactive_input_ready",
 		source: "gjc_interactive_runtime",
@@ -203,7 +214,13 @@ export async function persistCoordinatorRuntimeInputReady(): Promise<RuntimeInpu
 		} catch (error) {
 			if ((error as { code?: unknown }).code !== "EEXIST") throw runtimeReadinessMarkerConflict();
 			const raced = await readRuntimeInputReadyMarker(readinessFile);
-			if (raced && raced.session_id === expected.sessionId && raced.launch_id === expected.launchId) return raced;
+			if (
+				raced &&
+				raced.session_id === expected.sessionId &&
+				raced.launch_id === expected.launchId &&
+				raced.attestation_sha256 === expected.attestationDigest
+			)
+				return raced;
 			throw runtimeReadinessMarkerConflict();
 		}
 		return marker;

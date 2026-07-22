@@ -382,7 +382,7 @@ mod tests {
 	}
 
 	#[test]
-	fn session_create_existing_path_round_trips() {
+	fn session_create_projection_redacts_token_and_preserves_worktree() {
 		let msg = LifecycleClientMessage::SessionCreate(SessionCreate {
 			request_id:           "lc_01".into(),
 			lifecycle_request_id: "lc_01".into(),
@@ -390,9 +390,28 @@ mod tests {
 			update_id:            100,
 			chat_id:              "42".into(),
 			token:                "control-token".into(),
-			target:               SessionCreateTarget::ExistingPath { path: "/repo".into() },
+			target:               SessionCreateTarget::Worktree {
+				repo:   "/repo".into(),
+				branch: "feature/exact-target".into(),
+			},
 			startup_prompt_ref:   Some("prompt_lc_01".into()),
 		});
+
+		let mut projection = serde_json::to_value(&msg).expect("serialize");
+		let redacted_token = projection
+			.as_object_mut()
+			.expect("lifecycle frame is an object")
+			.remove("token");
+		assert_eq!(redacted_token, Some(serde_json::json!("control-token")));
+		assert!(projection.get("token").is_none());
+		assert_eq!(
+			projection["target"],
+			serde_json::json!({
+				"kind": "worktree",
+				"repo": "/repo",
+				"branch": "feature/exact-target",
+			})
+		);
 		assert_eq!(round_trip(&msg), msg);
 	}
 

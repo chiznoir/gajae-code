@@ -2,21 +2,128 @@
  * Root command for the coding agent CLI.
  */
 
+import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { THINKING_EFFORTS } from "@gajae-code/ai";
 import { APP_NAME, setProjectDir } from "@gajae-code/utils";
 import { Args, Command, Flags } from "@gajae-code/utils/cli";
 import { parseArgs } from "../cli/args";
+import generatedSourceClosureManifest from "../daemon/lifecycle-source-closure.generated.json";
+import { fingerprintWorktreeRuntime, resolveGjcRuntimeArgv } from "../daemon/runtime";
 import { launchDefaultTmuxIfNeeded } from "../gjc-runtime/launch-tmux";
 import { type PreparedLaunchWorktree, prepareLaunchWorktree } from "../gjc-runtime/launch-worktree";
 import {
+	digestLifecycleLaunchCommand,
+	LIFECYCLE_LAUNCH_ATTESTATION_ENV,
+	LIFECYCLE_LAUNCH_ATTESTATION_FILE_ENV,
+	LIFECYCLE_LAUNCH_ATTESTATION_SCHEMA_VERSION,
+	parseWorktreeLaunchBinding,
+	projectLifecycleSourceManifestIdentity,
+	writeLifecycleLaunchAttestationExclusive,
+} from "../gjc-runtime/lifecycle-launch-attestation";
+import {
+	GJC_COORDINATOR_SESSION_ATTESTATION_DIGEST_ENV,
 	GJC_COORDINATOR_SESSION_ID_ENV,
 	GJC_COORDINATOR_SESSION_STATE_FILE_ENV,
 	GJC_TMUX_OWNER_GENERATION_ENV,
 } from "../gjc-runtime/session-state-sidecar";
 import { runRootCommand } from "../main";
+
+function lifecycleGit(cwd: string, args: string[]): string {
+	const result = Bun.spawnSync(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe" });
+	if (result.exitCode !== 0) throw new Error("lifecycle_launch_git_identity_unavailable");
+	return result.stdout.toString().trim();
+}
+
+export interface AttestWorktreeLaunchOptions {
+	runtimeExecPath?: string;
+	commandArgs?: readonly string[];
+	coordinatorEnv?: NodeJS.ProcessEnv;
+}
+
+export async function attestWorktreeLaunch(
+	cwd: string,
+	env: NodeJS.ProcessEnv = process.env,
+	options: AttestWorktreeLaunchOptions = {},
+): Promise<void> {
+	const raw = env[LIFECYCLE_LAUNCH_ATTESTATION_ENV];
+	const file = env[LIFECYCLE_LAUNCH_ATTESTATION_FILE_ENV];
+	if (!raw && !file) return;
+	if (!raw || !file) throw new Error("lifecycle_launch_attestation_binding_missing");
+	const binding = parseWorktreeLaunchBinding(raw);
+	if (file !== binding.attestation_file) throw new Error("lifecycle_launch_attestation_binding_invalid");
+	const runtime = resolveGjcRuntimeArgv(options.runtimeExecPath);
+	const command = [runtime.execPath, ...runtime.argsPrefix, ...(options.commandArgs ?? process.argv.slice(2))];
+	const commandSha = digestLifecycleLaunchCommand(command);
+	const observed = await fingerprintWorktreeRuntime({ execPath: options.runtimeExecPath });
+	if (
+		observed.mode !== binding.expected_runtime_fingerprint.mode ||
+		observed.digest !== binding.expected_runtime_fingerprint.digest ||
+		runtime.execPath !== binding.expected_runtime_identity.executable ||
+		commandSha !== binding.command_sha256
+	)
+		throw new Error("lifecycle_launch_runtime_identity_mismatch");
+	const canonicalCwd = await fs.realpath(cwd);
+	const topLevel = await fs.realpath(lifecycleGit(canonicalCwd, ["rev-parse", "--show-toplevel"]));
+	const commonDir = await fs.realpath(
+		path.resolve(canonicalCwd, lifecycleGit(canonicalCwd, ["rev-parse", "--git-common-dir"])),
+	);
+	const branch = lifecycleGit(canonicalCwd, ["branch", "--show-current"]);
+	if (canonicalCwd !== topLevel || branch !== binding.requested_branch)
+		throw new Error("lifecycle_launch_worktree_identity_mismatch");
+	await writeLifecycleLaunchAttestationExclusive(file, {
+		schema_version: LIFECYCLE_LAUNCH_ATTESTATION_SCHEMA_VERSION,
+		launch_id: binding.launch_id,
+		nonce: binding.nonce,
+		request_id: binding.request_id,
+		session_id: binding.session_id,
+		generation: binding.generation,
+		run_id: binding.run_id,
+		incarnation: binding.incarnation,
+		child_token: binding.child_token,
+		command_sha256: binding.command_sha256,
+		expected_runtime_identity: binding.expected_runtime_identity,
+		observed_runtime_identity: { executable: runtime.execPath, argv_sha256: commandSha },
+		observed_runtime_fingerprint: observed,
+		canonical_cwd: canonicalCwd,
+		git: { top_level: topLevel, common_dir: commonDir, branch },
+		source_manifest: (() => {
+			const identity = projectLifecycleSourceManifestIdentity(generatedSourceClosureManifest);
+			if (!identity) throw new Error("lifecycle_launch_source_manifest_unavailable");
+			return identity;
+		})(),
+		created_at: new Date().toISOString(),
+	});
+	(options.coordinatorEnv ?? process.env)[GJC_COORDINATOR_SESSION_ATTESTATION_DIGEST_ENV] = crypto
+		.createHash("sha256")
+		.update(await fs.readFile(file))
+		.digest("hex");
+}
+
 import { prepareAcpTerminalAuthArgs } from "../modes/acp/terminal-auth";
+
+const PUBLIC_LAUNCH_FAILURE_CODES = new Set([
+	"branch_in_use",
+	"invalid_worktree_branch",
+	"launch_failed",
+	"lifecycle_launch_attestation_binding_invalid",
+	"lifecycle_launch_attestation_binding_missing",
+	"lifecycle_launch_git_identity_unavailable",
+	"lifecycle_launch_runtime_identity_mismatch",
+	"lifecycle_launch_source_manifest_unavailable",
+	"lifecycle_launch_worktree_identity_mismatch",
+	"worktree_add_failed",
+	"worktree_dirty",
+	"worktree_path_conflict",
+	"worktree_target_mismatch",
+]);
+
+function projectCoordinatorLaunchFailure(error: unknown): { code: string; message: string } {
+	const candidate = (error instanceof Error ? error.message : String(error)).split(":", 1)[0]?.trim() ?? "";
+	const code = PUBLIC_LAUNCH_FAILURE_CODES.has(candidate) ? candidate : "launch_failed";
+	return { code, message: `Launch failed (${code}).` };
+}
 
 export async function persistCoordinatorLaunchFailure(
 	error: unknown,
@@ -25,8 +132,7 @@ export async function persistCoordinatorLaunchFailure(
 ): Promise<void> {
 	const stateFile = env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]?.trim();
 	if (!stateFile) return;
-	const message = error instanceof Error ? error.message : String(error);
-	const code = message.split(":", 1)[0] || "launch_failed";
+	const { code, message } = projectCoordinatorLaunchFailure(error);
 	const now = new Date().toISOString();
 	const payload = {
 		schema_version: 1,
@@ -41,6 +147,7 @@ export async function persistCoordinatorLaunchFailure(
 		source: "agent_session_event",
 		event: "launch_error",
 		cwd,
+		workdir: cwd,
 		session_file: null,
 		final_response: {
 			text: message,
@@ -54,8 +161,12 @@ export async function persistCoordinatorLaunchFailure(
 			? { owner_generation: env[GJC_TMUX_OWNER_GENERATION_ENV] ?? null }
 			: {}),
 	};
-	await fs.mkdir(path.dirname(stateFile), { recursive: true });
-	await Bun.write(stateFile, `${JSON.stringify(payload, null, 2)}\n`);
+	try {
+		await fs.mkdir(path.dirname(stateFile), { recursive: true });
+		await Bun.write(stateFile, `${JSON.stringify(payload, null, 2)}\n`);
+	} catch {
+		// The launch exception is the primary failure; state persistence is best-effort.
+	}
 }
 
 export default class Index extends Command {
@@ -224,6 +335,12 @@ export default class Index extends Command {
 		if (launch.worktree.enabled) {
 			process.chdir(launch.cwd);
 			setProjectDir(launch.cwd);
+			try {
+				await attestWorktreeLaunch(launch.cwd);
+			} catch (error) {
+				await persistCoordinatorLaunchFailure(error, launch.cwd);
+				throw error;
+			}
 		}
 		const launchParsed = parseArgs(launch.args);
 		if (

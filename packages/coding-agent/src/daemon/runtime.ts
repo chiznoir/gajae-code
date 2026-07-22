@@ -1,51 +1,85 @@
-/**
- * Shared source-vs-compiled runtime detection for daemon spawning.
- *
- * Centralizes the logic previously embedded in `ensureTelegramDaemonRunning`
- * so session autostart, reload, and status reporting agree on how a daemon
- * process is launched and whether a reload can pick up amended source.
- */
+/** Shared source-vs-compiled runtime detection and worktree-only identity primitives. */
 
+import * as crypto from "node:crypto";
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { materializeLifecycleSourceClosureFromRuntime } from "../gjc-runtime/lifecycle-source-closure";
+import generatedSourceClosureManifest from "./lifecycle-source-closure.generated.json";
 
-export interface GjcRuntimeSpawnInfo {
+const COMPILED_RELOAD_WARNING =
+	"Compiled binary: reload respawns the same binary. Rebuild the binary first for amended source to take effect.";
+const MAX_COMPILED_EXECUTABLE_BYTES = 128 * 1024 * 1024;
+
+export interface GjcRuntimeArgv {
 	execPath: string;
 	mode: "source" | "compiled";
-	/** Prefix prepended before the gjc subcommand args; `[Bun.main]` in source mode, otherwise `[]`. */
+	/** Prefix prepended before the gjc subcommand args. */
 	argsPrefix: string[];
+}
+
+export interface GjcRuntimeSpawnInfo extends GjcRuntimeArgv {
 	/** True only when respawn loads edited TypeScript directly (source/dev mode). */
 	reloadPicksUpSourceEdits: boolean;
 	/** Set in compiled mode to explain that a rebuild is required before reload picks up source edits. */
 	warning?: string;
 }
 
-const COMPILED_RELOAD_WARNING =
-	"Compiled binary: reload respawns the same binary. Rebuild the binary first for amended source to take effect.";
+export interface WorktreeRuntimeFingerprint {
+	mode: "source" | "compiled";
+	digest: string;
+}
+
+export interface FingerprintWorktreeRuntimeOptions {
+	execPath?: string;
+	/** Tests may inject a fixture; source mode otherwise uses the generated manifest. */
+	sourceClosureManifest?: unknown;
+}
 
 /**
- * Resolve how to spawn a detached gjc subcommand for the current runtime.
- *
- * Source/dev mode (bun/node) prepends the entry script (`Bun.main`) so the
- * respawn loads edited source. A compiled single-file binary self-spawns its
- * own subcommand directly and cannot pick up workspace source edits.
+ * Resolve a daemon launch argv using lexical paths only. This deliberately does
+ * not stat, realpath, read, hash, or load closure metadata.
  */
-export function resolveGjcRuntimeSpawnInfo(execPath: string = process.execPath): GjcRuntimeSpawnInfo {
-	const base = path.basename(execPath).toLowerCase();
+export function resolveGjcRuntimeArgv(execPath: string = process.execPath): GjcRuntimeArgv {
+	const absoluteExecPath = path.resolve(execPath);
+	const base = path.basename(absoluteExecPath).toLowerCase();
 	const fromSource = base === "bun" || base === "node" || base.startsWith("bun") || base.startsWith("node");
-	const sourceEntry = fromSource ? path.resolve(import.meta.dir, "../../bin/gjc.js") : undefined;
 	if (fromSource) {
 		return {
-			execPath,
+			execPath: absoluteExecPath,
 			mode: "source",
-			argsPrefix: sourceEntry ? [sourceEntry] : [],
-			reloadPicksUpSourceEdits: true,
+			argsPrefix: [path.resolve(import.meta.dir, "../../bin/gjc.js")],
 		};
 	}
-	return {
-		execPath,
-		mode: "compiled",
-		argsPrefix: [],
-		reloadPicksUpSourceEdits: false,
-		warning: COMPILED_RELOAD_WARNING,
-	};
+	return { execPath: absoluteExecPath, mode: "compiled", argsPrefix: [] };
+}
+
+/** Compatibility shape retained for daemon status and existing spawn callers. */
+export function resolveGjcRuntimeSpawnInfo(execPath: string = process.execPath): GjcRuntimeSpawnInfo {
+	const argv = resolveGjcRuntimeArgv(execPath);
+	return argv.mode === "source"
+		? { ...argv, reloadPicksUpSourceEdits: true }
+		: { ...argv, reloadPicksUpSourceEdits: false, warning: COMPILED_RELOAD_WARNING };
+}
+
+/**
+ * Compute identity for the artifact that a worktree-create child will execute.
+ * Callers must not use this on ordinary path/dir or cold-resume flows.
+ */
+export async function fingerprintWorktreeRuntime(
+	options: FingerprintWorktreeRuntimeOptions = {},
+): Promise<WorktreeRuntimeFingerprint> {
+	const argv = resolveGjcRuntimeArgv(options.execPath);
+	if (argv.mode === "source") {
+		const closure = await materializeLifecycleSourceClosureFromRuntime(
+			options.sourceClosureManifest ?? generatedSourceClosureManifest,
+		);
+		return { mode: "source", digest: closure.digest };
+	}
+	const executable = await fs.realpath(argv.execPath);
+	const stat = await fs.stat(executable);
+	if (!stat.isFile() || stat.size < 0 || stat.size > MAX_COMPILED_EXECUTABLE_BYTES) {
+		throw new Error("Invalid compiled runtime executable");
+	}
+	const bytes = await fs.readFile(executable);
+	return { mode: "compiled", digest: crypto.createHash("sha256").update(bytes).digest("hex") };
 }
