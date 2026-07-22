@@ -22,6 +22,7 @@
 - Telegram ask notifications now preserve the authoritative recommended choice from native asks and workflow gates, marking that option as `(Recommended)` in the message body without changing button indices or submitted answers.
 - Telegram `/session_close` now fails closed when tmux disappearance cannot be confirmed, and publishes the managed owner verdict before locked terminal-state preservation so normal close finalization is not delayed behind that state path.
 - Managed publication now fails closed on malformed, committed, or mutation-unknown native outcomes: it never retries or cleans a destination, and preserves bounded atomic-unavailable/durability diagnostics through managed startup (#2804).
+- Telegram `/session_create worktree` now pins the active GJC runtime, enters the requested linked worktree, and keeps tmux project/branch metadata aligned without mutating the primary checkout.
 
 ## [0.11.6] - 2026-07-21
 ## [0.11.5] - 2026-07-20
