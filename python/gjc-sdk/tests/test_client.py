@@ -11,9 +11,65 @@ from typing import Any
 import pytest
 
 from gjc_sdk import SdkClient
-from gjc_sdk.frames import ActionNeeded, parse_frame
+from gjc_sdk.frames import ActionNeeded, ControlResponse, QueryResponse, parse_frame
 from gjc_sdk.discovery import Endpoint, EndpointSelectionError
 
+
+class FakeTransport:
+    def __init__(self, received: list[str]) -> None:
+        self.received = asyncio.Queue[str]()
+        for frame in received:
+            self.received.put_nowait(frame)
+        self.sent: list[dict[str, Any]] = []
+
+    async def send_text(self, text: str) -> None:
+        self.sent.append(json.loads(text))
+
+    async def receive_text(self) -> str:
+        return await self.received.get()
+
+    async def close(self) -> None:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_control_correlates_out_of_order_and_preserves_actions() -> None:
+    transport = FakeTransport(
+        [
+            '{"type":"action_needed","id":"a1","kind":"ask","sessionId":"s1"}',
+            '{"type":"control_response","id":"second","ok":false,"error":{"code":"conflict"}}',
+            '{"type":"control_response","id":"first","ok":true,"result":{"accepted":true}}',
+        ]
+    )
+    client = SdkClient(transport, "secret")
+
+    first = asyncio.create_task(client.control("first.operation", {}, id="first"))
+    await asyncio.sleep(0)
+    second = asyncio.create_task(client.control("second.operation", {}, id="second"))
+
+    assert await first == ControlResponse("first", True, {"accepted": True})
+    assert await second == ControlResponse("second", False, error={"code": "conflict"})
+    assert await client.recv() == ActionNeeded("a1", "ask", "s1")
+
+
+@pytest.mark.asyncio
+async def test_query_returns_paginated_response() -> None:
+    transport = FakeTransport(
+        [
+            '{"type":"query_response","id":"q1","ok":true,"page":{"items":[{"id":"one"}],"complete":false,"continuationCursor":"next","revision":"r1"}}'
+        ]
+    )
+    client = SdkClient(transport, "secret")
+
+    response = await client.query("todo.list", {}, cursor="previous", id="q1")
+
+    assert isinstance(response, QueryResponse)
+    assert response.page is not None
+    assert response.page.items == [{"id": "one"}]
+    assert response.page.continuation_cursor == "next"
+    assert transport.sent == [
+        {"type": "query_request", "id": "q1", "query": "todo.list", "input": {}, "cursor": "previous"}
+    ]
 
 @pytest.mark.parametrize(
     ("endpoint", "code"),
