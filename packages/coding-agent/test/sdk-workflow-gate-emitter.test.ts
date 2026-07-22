@@ -63,7 +63,7 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 				publishedEmitter = emitter;
 			});
 			const emitter: WorkflowGateEmitter = {
-				isUnattended: () => true,
+				supportsRemoteGateAnswers: () => true,
 				emitGate: input => {
 					received.push(input);
 					return Promise.resolve({ selected: ["JWT"], other: false });
@@ -120,7 +120,7 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 
 			const received: OpenGateInput[] = [];
 			const emitter: WorkflowGateEmitter = {
-				isUnattended: () => true,
+				supportsRemoteGateAnswers: () => true,
 				emitGate: input => {
 					received.push(input);
 					return Promise.resolve({ selected: ["JWT"], other: false });
