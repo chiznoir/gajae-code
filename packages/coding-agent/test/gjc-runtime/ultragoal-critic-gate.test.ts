@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { deflateSync } from "node:zlib";
+import { verifyUltragoalDurableCompletionState } from "@gajae-code/coding-agent/gjc-runtime/ultragoal-guard";
 import {
 	CRITIC_GATE_HARD_STOP_EVENT,
 	computeCriticVerdictPlanGeneration,
@@ -357,6 +358,41 @@ describe("ultragoal terminal critic gate", () => {
 		});
 		const accepted = await checkpoint(root, passingLiveQualityGate());
 		expect(accepted.status).toBe(0);
+	});
+
+	it("revalidates the terminal critic ceiling before honoring a durable final receipt", async () => {
+		const root = await tempDir();
+		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+		await writeStructuralArtifacts(root);
+		await createUltragoalPlan({ cwd: root, brief: "Ship the story" });
+		await startNextUltragoalGoal({ cwd: root });
+		expect((await checkpoint(root, passingLiveQualityGate())).status).toBe(0);
+		expect((await verifyUltragoalDurableCompletionState({ cwd: root, sessionId: TEST_SESSION_ID })).state).toBe(
+			"active_verified_complete",
+		);
+
+		for (let attempt = 1; attempt <= TERMINAL_CRITIC_CEILING; attempt++) {
+			await recordUltragoalCriticVerdict({
+				cwd: root,
+				terminus: "completion",
+				verdict: "REJECT",
+				evidence: `Post-receipt terminal critic review ${attempt} found a release blocker`,
+				blockers: [`Resolve post-receipt release blocker ${attempt}`],
+			});
+		}
+		const blockedLedger = await readUltragoalLedger(root);
+		expect(terminalCriticHardStopReached(blockedLedger)).toBe(true);
+		expect((await verifyUltragoalDurableCompletionState({ cwd: root, sessionId: TEST_SESSION_ID })).state).toBe(
+			"active_missing_final_receipt",
+		);
+
+		await recordUltragoalCriticGateOverride({
+			cwd: root,
+			evidence: "Leader reviewed the post-receipt findings and approved final aggregation.",
+		});
+		expect((await verifyUltragoalDurableCompletionState({ cwd: root, sessionId: TEST_SESSION_ID })).state).toBe(
+			"active_verified_complete",
+		);
 	});
 
 	it("stales a pause critic verdict after add_subgoal changes the required-goal set", async () => {

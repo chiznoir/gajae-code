@@ -65,6 +65,35 @@ describe("ultragoal critic pause ceiling", () => {
 		expect((await isUltragoalPauseBlocked(cwd)).blocked).toBe(false);
 	});
 
+	it("uses the latest pause verdict for the current classification", async () => {
+		const cwd = await createActiveRun();
+		const classification = await recordUltragoalBlockerClassification({
+			cwd,
+			classification: "human_blocked",
+			evidence: "User must approve the production release",
+		});
+		const recordPauseVerdict = async (verdict: "OKAY" | "ITERATE" | "REJECT") =>
+			recordUltragoalCriticVerdict({
+				cwd,
+				terminus: "pause",
+				verdict,
+				evidence: `Critic ${verdict.toLowerCase()} verdict for the human-only blocker`,
+				blockers: verdict === "OKAY" ? [] : ["Await a clean current pause verdict"],
+				classificationEventId: classification.eventId,
+			});
+
+		await recordPauseVerdict("OKAY");
+		expect((await isUltragoalPauseBlocked(cwd)).blocked).toBe(false);
+		await recordPauseVerdict("REJECT");
+		expect((await isUltragoalPauseBlocked(cwd)).blocked).toBe(true);
+		await recordPauseVerdict("OKAY");
+		expect((await isUltragoalPauseBlocked(cwd)).blocked).toBe(false);
+		await recordPauseVerdict("ITERATE");
+		expect((await isUltragoalPauseBlocked(cwd)).blocked).toBe(true);
+		await recordPauseVerdict("OKAY");
+		expect((await isUltragoalPauseBlocked(cwd)).blocked).toBe(false);
+	});
+
 	it("rejects a pause approval bound to an earlier classification and accepts the latest binding", async () => {
 		const cwd = await createActiveRun();
 		const earlier = await recordUltragoalBlockerClassification({
@@ -181,8 +210,17 @@ describe("ultragoal critic pause ceiling", () => {
 		expect((await isUltragoalPauseBlocked(cwd)).blocked).toBe(true);
 	});
 
-	it("records an override through the CLI and lets a valid human-blocked pause pass the ceiling", async () => {
+	it("rejects a preemptive override and lets a post-hard-stop override recover a valid human-blocked pause", async () => {
 		const cwd = await createActiveRun();
+		const preemptiveOverride = await runNativeUltragoalCommand(
+			["record-critic-gate-override", "--evidence", "Leader approval before any hard stop", "--json"],
+			cwd,
+		);
+		expect(preemptiveOverride.status).not.toBe(0);
+		expect(preemptiveOverride.stderr).toContain("requires a durably recorded terminal critic hard stop");
+		let ledger = await readUltragoalLedger(cwd);
+		expect(ledger.some(event => event.event === CRITIC_GATE_OVERRIDE_EVENT)).toBe(false);
+
 		const classification = await recordUltragoalBlockerClassification({
 			cwd,
 			classification: "human_blocked",
@@ -216,7 +254,7 @@ describe("ultragoal critic pause ceiling", () => {
 			event: CRITIC_GATE_OVERRIDE_EVENT,
 			event_id: expect.any(String),
 		});
-		const ledger = await readUltragoalLedger(cwd);
+		ledger = await readUltragoalLedger(cwd);
 		expect(terminalCriticGateOverridden(ledger)).toBe(true);
 		expect((await isUltragoalPauseBlocked(cwd)).blocked).toBe(false);
 	});

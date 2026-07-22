@@ -3732,7 +3732,21 @@ export async function recordUltragoalCriticGateOverride(input: {
 }): Promise<UltragoalLedgerEvent> {
 	const evidence = input.evidence.trim();
 	if (!evidence) throw new Error("record-critic-gate-override --evidence is required");
-	return appendLedger(input.cwd, { event: CRITIC_GATE_OVERRIDE_EVENT, evidence });
+	const resolvedSessionId = resolveGjcSessionForWrite(input.cwd, {
+		envSessionId: process.env.GJC_SESSION_ID,
+	}).gjcSessionId;
+	const paths = getUltragoalPaths(input.cwd, resolvedSessionId);
+	return withWorkflowStateLock(
+		paths.ledgerPath,
+		async () => {
+			const ledger = await readUltragoalLedger(input.cwd, resolvedSessionId);
+			if (!terminalCriticHardStopReached(ledger)) {
+				throw new Error("record-critic-gate-override requires a durably recorded terminal critic hard stop");
+			}
+			return appendLedger(input.cwd, { event: CRITIC_GATE_OVERRIDE_EVENT, evidence }, resolvedSessionId);
+		},
+		{ cwd: input.cwd },
+	);
 }
 
 type UltragoalReviewMode = "review-only" | "review-start";

@@ -304,6 +304,15 @@ export function validateCompletionReceipt(input: {
 		receiptKind: input.receiptKind,
 	});
 	if (baseDiagnostic) return baseDiagnostic;
+	if (input.receiptKind === "final-aggregate") {
+		if (terminalCriticCeilingReached(input.ledger) && !terminalCriticGateOverridden(input.ledger)) {
+			return {
+				state: "active_stale_receipt",
+				message: `Ultragoal ${input.goal.id} final aggregate receipt is stale because the terminal-critic ceiling is currently reached.`,
+				goalId: input.goal.id,
+			};
+		}
+	}
 	if (receipt.validationBatch?.role === "batch-close") {
 		for (const memberId of receipt.validationBatch.memberIds) {
 			const member = input.plan.goals.find(goal => goal.id === memberId);

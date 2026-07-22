@@ -98,7 +98,14 @@ export function findCleanPauseCriticVerdict(
 	const planGeneration = computeCriticVerdictPlanGeneration(plan);
 	for (let index = ledger.length - 1; index > classificationIndex; index--) {
 		const event = ledger[index];
-		if (isCleanPauseCriticVerdict(event, { planGeneration, classificationEventId })) return event;
+		if (
+			event.event !== CRITIC_VERDICT_EVENT ||
+			event.terminus !== "pause" ||
+			event.planGeneration !== planGeneration ||
+			event.classificationEventId !== classificationEventId
+		)
+			continue;
+		return isCleanPauseCriticVerdict(event, { planGeneration, classificationEventId }) ? event : null;
 	}
 	return null;
 }
@@ -124,7 +131,13 @@ export function terminalCriticHardStopReached(
 }
 
 export function terminalCriticGateOverridden(ledger: readonly UltragoalLedgerEvent[]): boolean {
-	return ledger.some(event => event.event === CRITIC_GATE_OVERRIDE_EVENT);
+	let overrideAfterLatestHardStop = false;
+	for (let index = ledger.length - 1; index >= 0; index--) {
+		const event = ledger[index];
+		if (event.event === CRITIC_GATE_OVERRIDE_EVENT) overrideAfterLatestHardStop = true;
+		if (event.event === CRITIC_GATE_HARD_STOP_EVENT) return overrideAfterLatestHardStop;
+	}
+	return false;
 }
 
 export function terminalCriticCeilingReached(
