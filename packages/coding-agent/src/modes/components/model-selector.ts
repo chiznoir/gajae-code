@@ -973,8 +973,8 @@ export class ModelSelectorComponent extends Container {
 		} else {
 			rows.push({ kind: "createUnavailable", label: "Select a model before creating a custom preset" });
 		}
-		rows.push({ kind: "browse" });
 		rows.push({ kind: "imageGeneration" });
+		rows.push({ kind: "browse" });
 		return rows;
 	}
 
