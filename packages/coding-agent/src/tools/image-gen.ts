@@ -30,8 +30,6 @@ import { isPrivateOrSpecialAddress, validatePublicHttpUrl } from "../web/insane/
 import { resolveReadPath } from "./path-utils";
 
 const DEFAULT_MODEL = "gemini-3-pro-image-preview";
-const DEFAULT_OPENROUTER_MODEL = "google/gemini-3-pro-image-preview";
-const DEFAULT_ANTIGRAVITY_MODEL = "gemini-3-pro-image";
 const IMAGE_TIMEOUT = 3 * 60 * 1000; // 3 minutes
 const MAX_IMAGE_SIZE = 35 * 1024 * 1024;
 const MAX_IMAGE_REDIRECTS = 5;
@@ -584,6 +582,49 @@ export function setPreferredImageProvider(provider: ImageProvider | "auto"): voi
 	preferredImageProvider = provider;
 }
 
+/** Provider → default image model mapping for auto-binding */
+export const IMAGE_PROVIDER_DEFAULTS: Record<string, string> = {
+	openai: "gpt-image-2",
+	"openai-codex": "gpt-image-2",
+	antigravity: "gemini-3-pro-image",
+	gemini: "gemini-3-pro-image-preview",
+	openrouter: "google/gemini-3-pro-image-preview",
+};
+
+/** Resolved image generation configuration from settings */
+export interface ImageProviderConfig {
+	provider: ImageProvider | "auto" | "custom";
+	model: string | null;
+	customUrl?: string;
+	customKey?: string;
+	customKeyEnv?: string;
+}
+
+/** Module-level configured image model state (set from settings at session init) */
+let configuredImageConfig: ImageProviderConfig | null = null;
+
+/** Set the configured image provider + model from settings */
+export function setConfiguredImageModel(config: ImageProviderConfig | null): void {
+	configuredImageConfig = config;
+	// Keep preferredImageProvider in sync for backward compat
+	if (config && config.provider !== "auto" && config.provider !== "custom") {
+		preferredImageProvider = config.provider;
+	} else if (!config || config.provider === "auto") {
+		preferredImageProvider = "auto";
+	}
+}
+
+/** Get the current configured image model (for UI display) */
+export function getConfiguredImageModel(): ImageProviderConfig | null {
+	return configuredImageConfig;
+}
+
+/** Resolve the effective image model for a configured provider */
+export function resolveImageModel(provider: string, modelOverride: string | null): string {
+	if (modelOverride) return modelOverride;
+	return IMAGE_PROVIDER_DEFAULTS[provider] ?? DEFAULT_MODEL;
+}
+
 interface ParsedAntigravityCredentials {
 	accessToken: string;
 	projectId?: string;
@@ -603,6 +644,22 @@ function parseAntigravityCredentials(raw: string): ParsedAntigravityCredentials 
 	}
 	const rawToken = raw.trim();
 	return rawToken.length > 0 ? { accessToken: rawToken } : null;
+}
+
+function createCustomImageModel(baseUrl: string, id: string): Model<"openai-responses"> {
+	return {
+		id,
+		name: id,
+		api: "openai-responses",
+		provider: "openai",
+		baseUrl: baseUrl.replace(/\/+$/, ""),
+		reasoning: false,
+		input: ["text"],
+		output: ["text", "image"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 128_000,
+		maxTokens: 16_384,
+	};
 }
 
 async function findAntigravityCredentials(
@@ -652,7 +709,44 @@ async function findImageApiKey(
 	activeModel?: Model,
 	sessionId?: string,
 ): Promise<ImageApiKey | null> {
-	// If a specific provider is preferred, try it first.
+	// Config-driven routing: if an explicit provider+model is configured, use it.
+	if (configuredImageConfig && configuredImageConfig.provider !== "auto") {
+		const config = configuredImageConfig;
+		if (config.provider === "custom") {
+			const baseUrl = config.customUrl?.trim();
+			const apiKey = config.customKey ?? (config.customKeyEnv ? Bun.env[config.customKeyEnv] : undefined);
+			if (baseUrl && apiKey) {
+				return {
+					provider: "openai",
+					apiKey,
+					model: createCustomImageModel(baseUrl, config.model ?? IMAGE_PROVIDER_DEFAULTS.openai),
+				};
+			}
+			return null;
+		}
+		// For configured providers, resolve credentials through the existing paths.
+		if (config.provider === "openai" || config.provider === "openai-codex") {
+			const openAI = await findOpenAIHostedImageCredentials(modelRegistry, activeModel, sessionId);
+			if (openAI) return openAI;
+			return null;
+		}
+		if (config.provider === "antigravity") {
+			if (!modelRegistry) return null;
+			return await findAntigravityCredentials(modelRegistry, sessionId);
+		}
+		if (config.provider === "gemini") {
+			const geminiKey = getEnvApiKey("google");
+			if (geminiKey) return { provider: "gemini", apiKey: geminiKey };
+			const googleKey = $env.GOOGLE_API_KEY;
+			return googleKey ? { provider: "gemini", apiKey: googleKey } : null;
+		}
+		if (config.provider === "openrouter") {
+			const openRouterKey = getEnvApiKey("openrouter");
+			return openRouterKey ? { provider: "openrouter", apiKey: openRouterKey } : null;
+		}
+	}
+
+	// If a specific provider is preferred (legacy path), try it first.
 	if (preferredImageProvider === "openai") {
 		const openAI = await findOpenAIHostedImageCredentials(modelRegistry, activeModel, sessionId);
 		if (openAI) return openAI;
@@ -1130,13 +1224,15 @@ export const imageGenTool: CustomTool<typeof imageGenSchema, ImageGenToolDetails
 
 			const provider = apiKey.provider;
 			const model =
-				provider === "openai" || provider === "openai-codex"
-					? (apiKey.model?.id ?? "gpt")
-					: provider === "antigravity"
-						? DEFAULT_ANTIGRAVITY_MODEL
-						: provider === "openrouter"
-							? DEFAULT_OPENROUTER_MODEL
-							: DEFAULT_MODEL;
+				configuredImageConfig && configuredImageConfig.provider !== "auto" && configuredImageConfig.model
+					? configuredImageConfig.model
+					: provider === "openai" || provider === "openai-codex"
+						? (apiKey.model?.id ?? resolveImageModel(provider, null))
+						: provider === "antigravity"
+							? resolveImageModel("antigravity", null)
+							: provider === "openrouter"
+								? resolveImageModel("openrouter", null)
+								: resolveImageModel("gemini", null);
 			const resolvedModel = provider === "openrouter" ? resolveOpenRouterModel(model) : model;
 			const cwd = ctx.sessionManager.getCwd();
 

@@ -150,6 +150,7 @@ import {
 	ReadTool,
 	ResolveTool,
 	SearchTool,
+	setConfiguredImageModel,
 	setPreferredImageProvider,
 	setPreferredSearchProvider,
 	setSearchFallbackProviders,
@@ -1159,14 +1160,26 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		applyConfiguredSearchTimeout(settings);
 
 		const imageProvider = settings.get("providers.image");
+		const imageModel = settings.get("providers.imageModel");
+		const imageCustomUrl = settings.get("providers.imageCustomUrl");
+		const imageCustomKey = settings.get("providers.imageCustomKey");
+		const imageCustomKeyEnv = settings.get("providers.imageCustomKeyEnv");
 		if (
 			imageProvider === "auto" ||
 			imageProvider === "openai" ||
 			imageProvider === "gemini" ||
 			imageProvider === "openrouter" ||
-			imageProvider === "antigravity"
+			imageProvider === "antigravity" ||
+			imageProvider === "custom"
 		) {
-			setPreferredImageProvider(imageProvider);
+			setPreferredImageProvider(imageProvider === "custom" ? "auto" : imageProvider);
+			setConfiguredImageModel({
+				provider: imageProvider,
+				model: imageModel ?? null,
+				customUrl: imageCustomUrl,
+				customKey: imageCustomKey,
+				customKeyEnv: imageCustomKeyEnv,
+			});
 		}
 
 		const sessionManager =
