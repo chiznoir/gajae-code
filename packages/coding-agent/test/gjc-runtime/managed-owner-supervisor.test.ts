@@ -22,6 +22,7 @@ const admissionModule = path.join(
 	"gjc-runtime",
 	"managed-owner-admission.ts",
 );
+const cliEntry = path.join(repoRoot, "packages", "coding-agent", "src", "cli.ts");
 
 async function runSupervisor(
 	stateDir: string,
@@ -101,6 +102,36 @@ describe("managed owner supervisor", () => {
 			expect(result.exitCode).toBe(23);
 			const root = lifecyclePaths(stateDir, "session-2681", "generation-2681").root;
 			expect((await fs.readdir(root)).some(file => file.startsWith("sigabrt-"))).toBe(false);
+		} finally {
+			await fs.rm(stateDir, { recursive: true, force: true });
+		}
+	});
+	it("routes the internal supervisor flag before root launch argument parsing", async () => {
+		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-owner-cli-"));
+		const marker = path.join(stateDir, "child-ran.txt");
+		try {
+			const child = Bun.spawn({
+				cmd: [process.execPath, cliEntry, "--internal-managed-owner-supervisor"],
+				cwd: repoRoot,
+				stdout: "pipe",
+				stderr: "pipe",
+				env: {
+					...process.env,
+					GJC_TMUX_OWNER_STATE_DIR: stateDir,
+					GJC_COORDINATOR_SESSION_ID: "session-cli",
+					GJC_TMUX_OWNER_GENERATION: "generation-cli",
+					GJC_MANAGED_OWNER_RUN_ID: "run-cli",
+					GJC_MANAGED_OWNER_INCARNATION: "incarnation-cli",
+					GJC_MANAGED_OWNER_COMMAND_JSON: JSON.stringify([
+						process.execPath,
+						"-e",
+						`await Bun.write(${JSON.stringify(marker)}, "ok");`,
+					]),
+				},
+			});
+			const [stderr, exitCode] = await Promise.all([new Response(child.stderr).text(), child.exited]);
+			expect(exitCode, stderr).toBe(0);
+			expect(await fs.readFile(marker, "utf8")).toBe("ok");
 		} finally {
 			await fs.rm(stateDir, { recursive: true, force: true });
 		}

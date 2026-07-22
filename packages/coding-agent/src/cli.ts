@@ -8,6 +8,7 @@ import "@gajae-code/utils/postmortem";
 import { Args, type CliConfig, Command, type CommandEntry, Flags, run } from "@gajae-code/utils/cli";
 import { APP_NAME, formatBunRuntimeError, MIN_BUN_VERSION, VERSION } from "@gajae-code/utils/dirs";
 import { runFixtureReport } from "./cli/fixture-report";
+import { isManagedOwnerSupervisorArgv, runManagedOwnerSupervisor } from "./gjc-runtime/managed-owner-supervisor";
 import { isTmuxOwnerIsolationCliArgv, runTmuxOwnerIsolationCliFromStdin } from "./gjc-runtime/tmux-owner-isolation-cli";
 import { smokeTestTabWorker } from "./tools/browser/tab-worker-smoke";
 
@@ -348,6 +349,10 @@ export async function runCli(argv: string[]): Promise<void> {
 	}
 	if (isTmuxOwnerIsolationCliArgv(argv)) {
 		await runTmuxOwnerIsolationCliFromStdin();
+		return;
+	}
+	if (isManagedOwnerSupervisorArgv(argv)) {
+		await runManagedOwnerSupervisor();
 		return;
 	}
 	if (isNotifyDaemonInternalFastPath(argv)) {
