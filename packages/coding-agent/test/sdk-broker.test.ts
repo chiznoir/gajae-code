@@ -34,6 +34,7 @@ import {
 	readSessionLifecycleLaunchRequest,
 	type SessionLifecycleLaunchRequest,
 } from "../src/sdk/broker/lifecycle";
+import { processIncarnation } from "../src/sdk/broker/process-incarnation";
 import { resolveSdkInternalSpawnCommand, resolveSdkInternalSpawnCommandForTest } from "../src/sdk/broker/runtime";
 import { prepareManagedSessionScopeForWrite, resolveManagedScope } from "../src/session/internal/managed-session-scope";
 import { SessionManager } from "../src/session/session-manager";
@@ -1676,6 +1677,77 @@ describe("SDK broker identity and discovery", () => {
 				error: { code: "flush_failed", message: "session flush failed" },
 			});
 		} finally {
+			server.stop(true);
+			await broker.stop();
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("refuses psmux close when the endpoint marker or PID drifts from its indexed authority", async () => {
+		const dir = await temp();
+		const stateRoot = path.join(dir, ".gjc", "state");
+		const sessionId = "psmux-close";
+		const marker = "m".repeat(43);
+		const endpointPath = path.join(stateRoot, "sdk", `${sessionId}.json`);
+		const broker = new Broker({ agentDir: dir });
+		let controlRequests = 0;
+		const kill = vi.spyOn(process, "kill");
+		const server = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch(request, httpServer) {
+				if (httpServer.upgrade(request)) return;
+				return new Response("WebSocket required", { status: 426 });
+			},
+			websocket: {
+				open(ws) {
+					ws.send(JSON.stringify({ type: "hello" }));
+				},
+				message(_ws, message) {
+					if ((JSON.parse(String(message)) as { type?: string }).type === "control_request") controlRequests++;
+				},
+			},
+		});
+		await broker.start();
+		try {
+			await fs.mkdir(path.dirname(endpointPath), { recursive: true });
+			await broker.index.append({
+				type: "host_registered",
+				sessionId,
+				locator: { repo: dir, stateRoot },
+				endpointGeneration: 1,
+				pid: process.pid,
+				pidIncarnation: processIncarnation(process.pid)!,
+				psmuxPrimaryMarker: marker,
+				endpointMtimeMs: 1,
+			});
+			for (const endpoint of [
+				{ session_id: sessionId, pid: process.pid, url: `ws://127.0.0.1:${server.port}`, token: "tok" },
+				{
+					session_id: sessionId,
+					pid: process.pid + 1,
+					psmux_primary_marker: marker,
+					url: `ws://127.0.0.1:${server.port}`,
+					token: "tok",
+				},
+				{
+					session_id: sessionId,
+					pid: process.pid,
+					psmux_primary_marker: "d".repeat(43),
+					url: `ws://127.0.0.1:${server.port}`,
+					token: "tok",
+				},
+			]) {
+				await fs.writeFile(endpointPath, JSON.stringify(endpoint));
+				const outcome = await broker.handleRequest("session.close", { sessionId }, `psmux-close-${endpoint.pid}`);
+				expect(outcome.ok).toBe(false);
+				if (outcome.ok) throw new Error("expected psmux close refusal");
+				expect(["endpoint_stale", "terminal_uncertain"]).toContain(outcome.error?.code);
+			}
+			expect(controlRequests).toBe(0);
+			expect(kill.mock.calls.every(call => call[1] === 0)).toBe(true);
+		} finally {
+			kill.mockRestore();
 			server.stop(true);
 			await broker.stop();
 			await fs.rm(dir, { recursive: true, force: true });

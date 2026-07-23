@@ -113,6 +113,7 @@ function stubDeps(): OrchestratorDeps {
 		pairedChatId: PAIRED,
 		auditRedactionKey: new Uint8Array(32).fill(7),
 		isPsmuxProvider: () => false,
+		isReviewedPsmuxProvider: () => false,
 		now: () => 1000,
 		store: { read: async () => ({ version: 1, entries: {} }), write: async () => {} },
 		audit: () => {},
@@ -1972,7 +1973,7 @@ describe("lifecycle control runtime", () => {
 					lifecycleRequestId: "psmux-create",
 					intendedSessionId: "psmux-create",
 				}),
-			).rejects.toThrow("gjc_lifecycle_psmux_unsupported");
+			).rejects.toThrow("gjc_lifecycle_psmux_attestation_refused");
 			let listSessionsCalled = false;
 			await expect(
 				daemonResumeSession(env, {
@@ -1985,7 +1986,7 @@ describe("lifecycle control runtime", () => {
 					sessionIdOrPrefix: "resume-123",
 					path: project,
 				}),
-			).rejects.toThrow("gjc_lifecycle_psmux_unsupported");
+			).rejects.toThrow("gjc_lifecycle_psmux_attestation_refused");
 			expect(listSessionsCalled).toBe(false);
 			await expect(
 				daemonResumeSession(env, {
@@ -1997,7 +1998,7 @@ describe("lifecycle control runtime", () => {
 				})({
 					sessionIdOrPrefix: "resume-123",
 				}),
-			).rejects.toThrow("gjc_lifecycle_psmux_unsupported");
+			).rejects.toThrow("gjc_lifecycle_psmux_attestation_refused");
 			expect(listSessionsCalled).toBe(false);
 			expect(fs.existsSync(plain)).toBe(false);
 			expect(fs.existsSync(path.join(project, ".gjc"))).toBe(false);

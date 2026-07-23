@@ -11,6 +11,71 @@ const event = (sessionId: string) => ({
 	endpointGeneration: 1,
 	pid: process.pid,
 });
+const psmuxMarker = "A".repeat(43);
+it("accepts a psmux marker only on host registration and leaves ordinary registrations unchanged", async () => {
+	const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-psmux-marker-"));
+	const index = await new SessionIndex(dir).open();
+	await index.append({ ...event("psmux"), psmuxPrimaryMarker: psmuxMarker });
+	await index.append(event("native"));
+	await expect(index.append({ ...event("bad"), psmuxPrimaryMarker: "A".repeat(42) })).rejects.toThrow(
+		"psmuxPrimaryMarker must be a 43-character base64url value on host_registered events",
+	);
+	await expect(
+		index.append({ ...event("heartbeat"), type: "host_heartbeat", psmuxPrimaryMarker: psmuxMarker }),
+	).rejects.toThrow("psmuxPrimaryMarker must be a 43-character base64url value on host_registered events");
+	expect(index.listSessions().sessions).toEqual(
+		expect.arrayContaining([
+			expect.objectContaining({ sessionId: "psmux", psmuxPrimaryMarker: psmuxMarker }),
+			expect.not.objectContaining({ sessionId: "native", psmuxPrimaryMarker: expect.anything() }),
+		]),
+	);
+});
+it("accepts pid incarnation only on host registration and preserves it through heartbeat projection", async () => {
+	const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-pid-incarnation-"));
+	const index = await new SessionIndex(dir).open();
+	const registration = { ...event("incarnation"), endpointMtimeMs: 10, lifecycleRequestId: "request" };
+	await index.append({ ...registration, pidIncarnation: "linux:1" });
+	await expect(index.append({ ...event("bad"), pidIncarnation: "invalid" })).rejects.toThrow(
+		"pidIncarnation must be a canonical process incarnation on host_registered events",
+	);
+	await expect(index.append({ ...registration, type: "host_heartbeat", pidIncarnation: "linux:2" })).rejects.toThrow(
+		"pidIncarnation must be a canonical process incarnation on host_registered events",
+	);
+	await index.append({ ...registration, type: "host_heartbeat" });
+	expect(index.listSessions().sessions.find(session => session.sessionId === "incarnation")).toMatchObject({
+		pidIncarnation: "linux:1",
+	});
+});
+it("preserves a psmux marker through heartbeat projection and snapshot compaction", async () => {
+	const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-psmux-compact-"));
+	const index = await new SessionIndex(dir).open();
+	const registration = { ...event("psmux"), endpointMtimeMs: 10, lifecycleRequestId: "request" };
+	await index.append({ ...registration, psmuxPrimaryMarker: psmuxMarker });
+	await index.append({ ...registration, type: "host_heartbeat" });
+	await index.append(event("anchor"));
+	await index.snapshot();
+	const replay = await new SessionIndex(dir).open();
+	expect(replay.listSessions().sessions.find(session => session.sessionId === "psmux")).toMatchObject({
+		psmuxPrimaryMarker: psmuxMarker,
+	});
+});
+it("does not let a stale same-name heartbeat inherit a successor marker or incarnation", async () => {
+	const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-psmux-stale-"));
+	const index = await new SessionIndex(dir).open();
+	const first = { ...event("same"), endpointMtimeMs: 10, lifecycleRequestId: "first" };
+	await index.append({ ...first, psmuxPrimaryMarker: psmuxMarker, pidIncarnation: "linux:1" });
+	const successor = { ...event("same"), endpointGeneration: 2, endpointMtimeMs: 20, lifecycleRequestId: "second" };
+	await index.append(successor);
+	await index.append({ ...first, type: "host_heartbeat" });
+	expect(index.listSessions().sessions.find(session => session.sessionId === "same")).not.toHaveProperty(
+		"psmuxPrimaryMarker",
+	);
+	expect(index.listSessions().sessions.find(session => session.sessionId === "same")).not.toHaveProperty(
+		"pidIncarnation",
+	);
+	expect(index.findHostRegistration("same", 1, process.pid, "first")).not.toHaveProperty("psmuxPrimaryMarker");
+	expect(index.findHostRegistration("same", 1, process.pid, "first")).not.toHaveProperty("pidIncarnation");
+});
 
 function deferred<T = void>() {
 	return Promise.withResolvers<T>();

@@ -37,6 +37,24 @@ export interface ProcessIncarnationOptions {
 	platform?: typeof process.platform;
 	runCommand?: ProcessIncarnationCommandRunner;
 }
+export type ProcessIncarnationObservation =
+	| "same_incarnation"
+	| "pid_absent"
+	| "pid_reused"
+	| "inaccessible"
+	| "unknown";
+
+const PROCESS_INCARNATION_OBSERVATIONS = new Set<ProcessIncarnationObservation>([
+	"same_incarnation",
+	"pid_absent",
+	"pid_reused",
+	"inaccessible",
+	"unknown",
+]);
+
+function isProcessIncarnationObservation(value: unknown): value is ProcessIncarnationObservation {
+	return typeof value === "string" && PROCESS_INCARNATION_OBSERVATIONS.has(value as ProcessIncarnationObservation);
+}
 
 function runProcessIncarnationCommand(command: string, args: readonly string[]): ProcessIncarnationCommandResult {
 	try {
@@ -102,6 +120,35 @@ export function isProcessIncarnation(value: unknown): value is string {
 		(/^(?:linux:\d+|darwin:[1-9]\d*:\d+)$/.test(value) ||
 			(value.startsWith("windows:") && isWindowsFiletimeTicks(value.slice("windows:".length))))
 	);
+}
+/**
+ * Compare a PID against an expected Windows process incarnation without
+ * acquiring control authority. The native boundary accepts and returns only
+ * strings, preserving FILETIME values above `Number.MAX_SAFE_INTEGER`.
+ */
+export function observeProcessIncarnation(
+	pid: number,
+	expectedIncarnation: string,
+	options: Pick<ProcessIncarnationOptions, "platform"> = {},
+): ProcessIncarnationObservation {
+	if (
+		!Number.isSafeInteger(pid) ||
+		pid <= 0 ||
+		!isProcessIncarnation(expectedIncarnation) ||
+		!expectedIncarnation.startsWith("windows:") ||
+		(options.platform ?? process.platform) !== "win32" ||
+		process.platform !== "win32"
+	)
+		return "unknown";
+	try {
+		const observer = Process as unknown as {
+			observeIncarnation?: (processId: number, expected: string) => unknown;
+		};
+		const observation = observer.observeIncarnation?.(pid, expectedIncarnation);
+		return isProcessIncarnationObservation(observation) ? observation : "unknown";
+	} catch {
+		return "unknown";
+	}
 }
 
 /** A PID is reusable; bind it to the strongest OS-provided process start incarnation available. */

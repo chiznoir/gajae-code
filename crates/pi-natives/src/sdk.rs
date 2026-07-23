@@ -232,10 +232,12 @@ impl NotificationServer {
 		token: String,
 		state_root: Option<String>,
 		resolver_available: Option<bool>,
+		psmux_primary_marker: Option<String>,
 	) -> Self {
 		let mut config = ServerConfig::new(session_id, token);
 		config.state_root = state_root.map(PathBuf::from);
 		config.resolver_available = resolver_available.unwrap_or(true);
+		config.psmux_primary_marker = psmux_primary_marker;
 		// TS always owns gate resolution, so the core forwards replies.
 		config.forward_replies = true;
 		Self {

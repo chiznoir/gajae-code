@@ -59,24 +59,27 @@ use crate::{
 #[derive(Debug)]
 pub struct ServerConfig {
 	/// The session this endpoint belongs to.
-	pub session_id:         String,
+	pub session_id:           String,
 	/// The per-session token clients must present (as `?token=` on connect).
-	pub token:              String,
+	pub token:                String,
 	/// Bind host. Defaults to loopback via [`ServerConfig::new`].
-	pub host:               IpAddr,
+	pub host:                 IpAddr,
 	/// Bind port. `0` selects an ephemeral port; the bound port is read back.
-	pub port:               u16,
+	pub port:                 u16,
 	/// Whether an SDK workflow-gate resolver is available for ask round-trips.
 	/// When `false`, asks are notify-only and replies are rejected.
-	pub resolver_available: bool,
+	pub resolver_available:   bool,
 	/// Optional GJC state root. When set, the server writes/removes the endpoint
 	/// discovery file at `<state_root>/sdk/<session_id>.json`.
-	pub state_root:         Option<PathBuf>,
+	pub state_root:           Option<PathBuf>,
 	/// When `true`, accepted client replies are forwarded to the host (via
 	/// [`ServerHandle::take_reply_receiver`]) instead of resolving internally,
 	/// so the host resolves the real gate then calls
 	/// [`ServerHandle::resolve_client`].
-	pub forward_replies:    bool,
+	pub forward_replies:      bool,
+	/// Optional psmux primary-session marker published with endpoint discovery.
+	/// It must be a 43-character base64url value.
+	pub psmux_primary_marker: Option<String>,
 }
 
 impl ServerConfig {
@@ -84,15 +87,22 @@ impl ServerConfig {
 	#[must_use]
 	pub fn new(session_id: impl Into<String>, token: impl Into<String>) -> Self {
 		Self {
-			session_id:         session_id.into(),
-			token:              token.into(),
-			host:               IpAddr::V4(Ipv4Addr::LOCALHOST),
-			port:               0,
-			resolver_available: true,
-			state_root:         None,
-			forward_replies:    false,
+			session_id:           session_id.into(),
+			token:                token.into(),
+			host:                 IpAddr::V4(Ipv4Addr::LOCALHOST),
+			port:                 0,
+			resolver_available:   true,
+			state_root:           None,
+			forward_replies:      false,
+			psmux_primary_marker: None,
 		}
 	}
+}
+fn is_psmux_primary_marker(marker: &str) -> bool {
+	marker.len() == 43
+		&& marker
+			.bytes()
+			.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
 }
 
 /// Bounded time a connection may defer controlled delivery while it advertises
@@ -1168,17 +1178,26 @@ impl Drop for ServerHandle {
 /// # Errors
 /// Returns the bind error if the loopback socket cannot be acquired.
 pub async fn start(config: ServerConfig) -> std::io::Result<ServerHandle> {
+	if let Some(marker) = config.psmux_primary_marker.as_deref() {
+		if !is_psmux_primary_marker(marker) {
+			return Err(std::io::Error::new(
+				std::io::ErrorKind::InvalidInput,
+				"psmux primary marker must be a 43-character base64url value",
+			));
+		}
+	}
 	let listener = TcpListener::bind(SocketAddr::new(config.host, config.port)).await?;
 	let addr = listener.local_addr()?;
 	let (tx, _rx) = broadcast::channel(256);
 
 	if let Some(state_root) = config.state_root.as_deref() {
-		let record = EndpointRecord::new(
+		let mut record = EndpointRecord::new(
 			config.session_id.as_str(),
 			&addr.ip().to_string(),
 			addr.port(),
 			config.token.as_str(),
 		);
+		record.psmux_primary_marker = config.psmux_primary_marker.clone();
 		crate::discovery::write_endpoint(state_root, &record)?;
 	}
 

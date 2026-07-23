@@ -40,6 +40,7 @@ function deps(overrides: Partial<OrchestratorDeps> = {}): {
 		pairedChatId: PAIRED,
 		auditRedactionKey: new Uint8Array(32).fill(7),
 		isPsmuxProvider: () => false,
+		isReviewedPsmuxProvider: () => false,
 		now: () => 1_000,
 		store,
 		audit: e => {

@@ -415,10 +415,9 @@ export class ExtensionUiController {
 			},
 
 			shutdown: () => {
-				// Defer the actual teardown to the main loop, which calls
-				// `checkShutdownRequested()` at idle boundaries so any queued
-				// steering / follow-up messages drain first (see issue #1020).
 				this.ctx.shutdownRequested = true;
+				if (!this.ctx.session.isStreaming && this.ctx.session.queuedMessageCount === 0)
+					queueMicrotask(() => void this.ctx.checkShutdownRequested?.());
 			},
 			getContextUsage: () => this.ctx.session.getContextUsage(),
 			compact: instructionsOrOptions => this.#compactSession(instructionsOrOptions),
@@ -717,10 +716,9 @@ export class ExtensionUiController {
 			},
 
 			shutdown: () => {
-				// Defer the actual teardown to the main loop, which calls
-				// `checkShutdownRequested()` at idle boundaries so any queued
-				// steering / follow-up messages drain first (see issue #1020).
 				this.ctx.shutdownRequested = true;
+				if (!this.ctx.session.isStreaming && this.ctx.session.queuedMessageCount === 0)
+					queueMicrotask(() => void this.ctx.checkShutdownRequested?.());
 			},
 			getContextUsage: () => this.ctx.session.getContextUsage(),
 			compact: instructionsOrOptions => this.#compactSession(instructionsOrOptions),

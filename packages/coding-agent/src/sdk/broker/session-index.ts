@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import path from "node:path";
 import { withFileLock } from "../../config/file-lock";
+import { isProcessIncarnation } from "./process-incarnation";
 import {
 	assertSupportedSnapshotVersion,
 	assertSupportedStateVersion,
@@ -29,6 +30,8 @@ export interface SessionIndexEvent {
 	endpointMtimeMs?: number;
 	lifecycleRequestId?: string;
 	terminalUncertain?: boolean;
+	psmuxPrimaryMarker?: string;
+	pidIncarnation?: string;
 	ts: number;
 	checksum: string;
 }
@@ -42,6 +45,8 @@ export interface IndexedSession {
 	indexSeq: number;
 	lifecycleRequestId?: string;
 	terminalUncertain?: boolean;
+	psmuxPrimaryMarker?: string;
+	pidIncarnation?: string;
 }
 export interface SessionList {
 	indexSeq: number;
@@ -76,6 +81,86 @@ const dirFor = (agentDir: string) => path.join(agentDir, "sdk", "sessions");
 const logFor = (agentDir: string) => path.join(dirFor(agentDir), "index.jsonl");
 const snapshotFor = (agentDir: string) => path.join(dirFor(agentDir), "index.snapshot.json");
 const ROTATE_BYTES = 4 * 1024 * 1024;
+const PSMUX_PRIMARY_MARKER = /^[A-Za-z0-9_-]{43}$/;
+function hasValidPsmuxPrimaryMarker(event: SessionIndexEvent): boolean {
+	return (
+		event.psmuxPrimaryMarker === undefined ||
+		(event.type === "host_registered" &&
+			typeof event.psmuxPrimaryMarker === "string" &&
+			PSMUX_PRIMARY_MARKER.test(event.psmuxPrimaryMarker))
+	);
+}
+function hasValidPidIncarnation(event: SessionIndexEvent): boolean {
+	return (
+		event.pidIncarnation === undefined ||
+		(event.type === "host_registered" && isProcessIncarnation(event.pidIncarnation))
+	);
+}
+function pidIncarnationForLiveEvent(events: SessionIndexEvent[], event: SessionIndexEvent): string | undefined {
+	const registration =
+		event.type === "host_registered"
+			? event
+			: event.type === "host_heartbeat"
+				? events.findLast(
+						candidate =>
+							candidate.indexSeq <= event.indexSeq &&
+							candidate.type === "host_registered" &&
+							candidate.sessionId === event.sessionId &&
+							candidate.endpointGeneration === event.endpointGeneration &&
+							candidate.endpointMtimeMs === event.endpointMtimeMs &&
+							candidate.pid === event.pid &&
+							candidate.lifecycleRequestId === event.lifecycleRequestId,
+					)
+				: undefined;
+	if (typeof registration?.pidIncarnation !== "string" || !isProcessIncarnation(registration.pidIncarnation))
+		return undefined;
+	const end = event.type === "host_heartbeat" ? event.indexSeq : Number.MAX_SAFE_INTEGER;
+	const fenced = events.some(
+		candidate =>
+			candidate.indexSeq > registration.indexSeq &&
+			candidate.indexSeq < end &&
+			candidate.sessionId === registration.sessionId &&
+			(candidate.type === "host_registered" ||
+				candidate.type === "host_unregistered" ||
+				candidate.type === "session_closed" ||
+				candidate.type === "lifecycle_terminal"),
+	);
+	return fenced ? undefined : registration.pidIncarnation;
+}
+function psmuxMarkerForLiveEvent(events: SessionIndexEvent[], event: SessionIndexEvent): string | undefined {
+	const registration =
+		event.type === "host_registered"
+			? event
+			: event.type === "host_heartbeat"
+				? events.findLast(
+						candidate =>
+							candidate.indexSeq <= event.indexSeq &&
+							candidate.type === "host_registered" &&
+							candidate.sessionId === event.sessionId &&
+							candidate.endpointGeneration === event.endpointGeneration &&
+							candidate.endpointMtimeMs === event.endpointMtimeMs &&
+							candidate.pid === event.pid &&
+							candidate.lifecycleRequestId === event.lifecycleRequestId,
+					)
+				: undefined;
+	if (
+		typeof registration?.psmuxPrimaryMarker !== "string" ||
+		!PSMUX_PRIMARY_MARKER.test(registration.psmuxPrimaryMarker)
+	)
+		return undefined;
+	const end = event.type === "host_heartbeat" ? event.indexSeq : Number.MAX_SAFE_INTEGER;
+	const fenced = events.some(
+		candidate =>
+			candidate.indexSeq > registration.indexSeq &&
+			candidate.indexSeq < end &&
+			candidate.sessionId === registration.sessionId &&
+			(candidate.type === "host_registered" ||
+				candidate.type === "host_unregistered" ||
+				candidate.type === "session_closed" ||
+				candidate.type === "lifecycle_terminal"),
+	);
+	return fenced ? undefined : registration.psmuxPrimaryMarker;
+}
 function isValidSnapshot(snapshot: unknown): snapshot is { indexSeq: number; events: SessionIndexEvent[] } {
 	if (!snapshot || typeof snapshot !== "object") return false;
 	const { indexSeq, events } = snapshot as { indexSeq?: unknown; events?: unknown };
@@ -520,6 +605,10 @@ export class SessionIndex {
 					throw new Error(
 						"Cannot append to corrupt session index log; run `gjc gc --repair-session-index` to quarantine evidence and retain the valid prefix",
 					);
+				if (!hasValidPsmuxPrimaryMarker(input as SessionIndexEvent))
+					throw new Error("psmuxPrimaryMarker must be a 43-character base64url value on host_registered events");
+				if (!hasValidPidIncarnation(input as SessionIndexEvent))
+					throw new Error("pidIncarnation must be a canonical process incarnation on host_registered events");
 				const unsigned: Omit<SessionIndexEvent, "checksum"> = {
 					...input,
 					version: SDK_STATE_VERSION,
@@ -593,23 +682,31 @@ export class SessionIndex {
 							locator: previous.locator,
 							endpointMtimeMs: previous.endpointMtimeMs,
 							lifecycleRequestId: previous.lifecycleRequestId,
+							pidIncarnation: pidIncarnationForLiveEvent(this.#events, event),
+							psmuxPrimaryMarker: psmuxMarkerForLiveEvent(this.#events, event),
 						}
 					: event,
 			);
 		}
 		const sessions = [...latest.values()]
 			.filter(event => !["host_unregistered", "session_closed"].includes(event.type))
-			.map(event => ({
-				sessionId: event.sessionId,
-				locator: event.locator,
-				endpointGeneration: event.endpointGeneration,
-				pid: event.pid,
-				endpointMtimeMs: event.endpointMtimeMs,
-				lifecycleRequestId: event.lifecycleRequestId,
-				terminalUncertain: event.type === "lifecycle_terminal" || event.terminalUncertain === true,
-				indexSeq: event.indexSeq,
-				live: alive(event.pid),
-			}));
+			.map(event => {
+				const psmuxPrimaryMarker = psmuxMarkerForLiveEvent(this.#events, event);
+				const pidIncarnation = pidIncarnationForLiveEvent(this.#events, event);
+				return {
+					sessionId: event.sessionId,
+					locator: event.locator,
+					endpointGeneration: event.endpointGeneration,
+					pid: event.pid,
+					endpointMtimeMs: event.endpointMtimeMs,
+					lifecycleRequestId: event.lifecycleRequestId,
+					...(pidIncarnation ? { pidIncarnation } : {}),
+					terminalUncertain: event.type === "lifecycle_terminal" || event.terminalUncertain === true,
+					indexSeq: event.indexSeq,
+					live: alive(event.pid),
+					...(psmuxPrimaryMarker ? { psmuxPrimaryMarker } : {}),
+				};
+			});
 		return { indexSeq: this.indexSeq, sessions, warnings: this.#warnings };
 	}
 
@@ -651,6 +748,8 @@ export class SessionIndex {
 				item.pid === pid &&
 				(lifecycleRequestId === undefined || item.lifecycleRequestId === lifecycleRequestId),
 		);
+		const psmuxPrimaryMarker = event ? psmuxMarkerForLiveEvent(this.#events, event) : undefined;
+		const pidIncarnation = event ? pidIncarnationForLiveEvent(this.#events, event) : undefined;
 		return event
 			? {
 					sessionId: event.sessionId,
@@ -659,6 +758,8 @@ export class SessionIndex {
 					pid: event.pid,
 					endpointMtimeMs: event.endpointMtimeMs,
 					lifecycleRequestId: event.lifecycleRequestId,
+					...(pidIncarnation ? { pidIncarnation } : {}),
+					...(psmuxPrimaryMarker ? { psmuxPrimaryMarker } : {}),
 					terminalUncertain: false,
 					indexSeq: event.indexSeq,
 					live: alive(event.pid),

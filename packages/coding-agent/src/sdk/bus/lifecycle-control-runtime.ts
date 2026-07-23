@@ -11,7 +11,7 @@ import * as fs from "node:fs";
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 import type { NotificationControlServer as NativeNotificationControlServer } from "@gajae-code/natives";
-import { logger } from "@gajae-code/utils";
+import { getAgentDir, logger } from "@gajae-code/utils";
 import { readLinuxProcStartTime } from "../../gjc-runtime/linux-proc";
 import {
 	MANAGED_OWNER_PREDECESSOR_GENERATION_ENV,
@@ -56,6 +56,9 @@ import {
 	type GjcTmuxSessionStatus,
 	listGjcTmuxSessions,
 } from "../../gjc-runtime/tmux-sessions";
+import { ensureBroker } from "../broker/ensure";
+import { observeProcessIncarnation } from "../broker/process-incarnation";
+import { readSdkBrokerDiscovery, SdkClient } from "../client";
 import type {
 	LifecycleErrorReason,
 	ResumeCandidate,
@@ -75,7 +78,159 @@ import {
 	type OrchestratorDeps,
 	type ResumeEffectResult,
 } from "./lifecycle-orchestrator";
+import {
+	createPsmuxLifecycleMarker,
+	isReviewedPsmuxLifecycleExecutable,
+	PSMUX_LIFECYCLE_MARKER_ENV,
+	psmuxExactSessionTarget,
+	psmuxLifecycleArgv,
+	psmuxLifecycleSessionName,
+	readPsmuxMarkerLine,
+	resolvePsmuxLifecycleExecutable,
+} from "./psmux-lifecycle";
 import { listRecentSessions } from "./recent-activity";
+
+function admitPsmuxLifecycle(command: string): string {
+	const executable = resolvePsmuxLifecycleExecutable(command);
+	if (!isReviewedPsmuxLifecycleExecutable(executable)) throw new Error("gjc_lifecycle_psmux_attestation_refused");
+	return executable;
+}
+
+function psmuxInventory(executable: string, env: NodeJS.ProcessEnv): Set<string> {
+	const result = Bun.spawnSync(psmuxLifecycleArgv(executable, ["list-sessions", "-F", "#{session_name}"]), {
+		env,
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	if (result.exitCode !== 0) throw new Error("gjc_lifecycle_psmux_inventory_indeterminate");
+	return new Set(result.stdout.toString().split(/\r?\n/).filter(Boolean));
+}
+
+async function isPsmuxRegistrationReady(
+	agentDir: string,
+	sessionId: string,
+	marker: string,
+	pid: number,
+): Promise<boolean> {
+	try {
+		await ensureBroker({ agentDir });
+		const discovery = await readSdkBrokerDiscovery(agentDir);
+		if (!discovery) return false;
+		const client = await SdkClient.connect(discovery.url, discovery.token);
+		try {
+			const response = (await client.global("session.list", {})) as {
+				result?: {
+					sessions?: Array<{
+						sessionId?: unknown;
+						pid?: unknown;
+						pidIncarnation?: unknown;
+						psmuxPrimaryMarker?: unknown;
+					}>;
+				};
+			};
+			return (
+				response.result?.sessions?.some(
+					session =>
+						session.sessionId === sessionId &&
+						session.pid === pid &&
+						typeof session.pidIncarnation === "string" &&
+						observeProcessIncarnation(pid, session.pidIncarnation) === "same_incarnation" &&
+						session.psmuxPrimaryMarker === marker,
+				) === true
+			);
+		} finally {
+			await client.close();
+		}
+	} catch {
+		return false;
+	}
+}
+
+function psmuxChildCommand(args: string[]): string {
+	return ["gjc", ...args]
+		.map(value => (/^[A-Za-z0-9_./:=+-]+$/.test(value) ? value : `"${value.replaceAll('"', '\\"')}"`))
+		.join(" ");
+}
+
+async function spawnPsmuxLifecycle(input: {
+	command: string;
+	env: NodeJS.ProcessEnv;
+	name: string;
+	cwd: string;
+	sessionId: string;
+	lifecycleRequestId: string;
+	agentDir: string;
+	args: string[];
+}): Promise<{ endpointUrl: string }> {
+	const executable = admitPsmuxLifecycle(input.command);
+	const before = psmuxInventory(executable, input.env);
+	if (before.has(input.name)) throw new Error("gjc_lifecycle_psmux_name_occupied");
+	const marker = createPsmuxLifecycleMarker();
+	const spawned = Bun.spawnSync(
+		psmuxLifecycleArgv(executable, [
+			"new-session",
+			"-d",
+			"-e",
+			`${PSMUX_LIFECYCLE_MARKER_ENV}=${marker}`,
+			"-e",
+			`GJC_SESSION_ID=${input.sessionId}`,
+			"-e",
+			`GJC_LIFECYCLE_REQUEST_ID=${input.lifecycleRequestId}`,
+			"-e",
+			"GJC_NOTIFICATIONS=1",
+			"-e",
+			"GJC_TMUX_LAUNCHED=1",
+			...(input.env.PATH ? ["-e", `PATH=${input.env.PATH}`] : []),
+			"-s",
+			input.name,
+			psmuxChildCommand(input.args),
+		]),
+		{
+			cwd: input.cwd,
+			env: {
+				...input.env,
+				GJC_SESSION_ID: input.sessionId,
+				GJC_LIFECYCLE_REQUEST_ID: input.lifecycleRequestId,
+				[PSMUX_LIFECYCLE_MARKER_ENV]: marker,
+			},
+			stdout: "pipe",
+			stderr: "pipe",
+		},
+	);
+	if (spawned.exitCode !== 0) throw new Error("gjc_lifecycle_psmux_spawn_uncertain");
+	const after = psmuxInventory(executable, input.env);
+	if (!after.has(input.name)) throw new Error("gjc_lifecycle_psmux_spawn_uncertain");
+
+	const target = psmuxExactSessionTarget(input.name);
+	const endpointPath = path.join(input.cwd, ".gjc", "state", "sdk", `${input.sessionId}.json`);
+	const deadlineAt = Date.now() + 30_000;
+	while (Date.now() < deadlineAt) {
+		try {
+			const endpoint = JSON.parse(fs.readFileSync(endpointPath, "utf8")) as {
+				sessionId?: unknown;
+				pid?: unknown;
+				url?: unknown;
+				psmuxPrimaryMarker?: unknown;
+			};
+			const markerResult = Bun.spawnSync(
+				psmuxLifecycleArgv(executable, ["show-environment", "-t", target, PSMUX_LIFECYCLE_MARKER_ENV]),
+				{ env: input.env, stdout: "pipe", stderr: "pipe" },
+			);
+			if (
+				markerResult.exitCode === 0 &&
+				endpoint.sessionId === input.sessionId &&
+				endpoint.psmuxPrimaryMarker === marker &&
+				readPsmuxMarkerLine(markerResult.stdout.toString()) === marker &&
+				typeof endpoint.pid === "number" &&
+				typeof endpoint.url === "string" &&
+				(await isPsmuxRegistrationReady(input.agentDir, input.sessionId, marker, endpoint.pid))
+			)
+				return { endpointUrl: endpoint.url };
+		} catch {}
+		await Bun.sleep(25);
+	}
+	throw new Error("gjc_lifecycle_psmux_readiness_timeout");
+}
 
 type NativeControlServerConstructor = new (
 	token: string,
@@ -487,8 +642,10 @@ async function preflightLifecycleTmuxOwner(input: {
 	if (server.state === "absent") {
 		try {
 			if (
-				classifyCgroup({ platform: process.platform, cgroupText: await probe.readCallerCgroup() })
-					.classification === "unverifiable"
+				classifyCgroup({
+					platform: process.platform,
+					cgroupText: await probe.readCallerCgroup(),
+				}).classification === "unverifiable"
 			)
 				throw new Error("gjc_lifecycle_owner_server_unverifiable");
 		} catch (error) {
@@ -600,9 +757,15 @@ async function executeLifecycleTmuxOwnerPlan(input: {
 			plan.execution.mode === "scoped" ? scopedReceipt?.native_session_id : nativeTmuxSessionIdFromSpawn(rawStdout),
 		attemptSession: plan.execution.attempt_session,
 		...(scopedReceipt
-			? { serverPid: scopedReceipt.server_pid, serverStartTime: scopedReceipt.server_start_time }
+			? {
+					serverPid: scopedReceipt.server_pid,
+					serverStartTime: scopedReceipt.server_start_time,
+				}
 			: preSpawnProof
-				? { serverPid: preSpawnProof.pid, serverStartTime: preSpawnProof.startTime }
+				? {
+						serverPid: preSpawnProof.pid,
+						serverStartTime: preSpawnProof.startTime,
+					}
 				: {}),
 	};
 	input.onAttemptCreated?.(attempt);
@@ -860,18 +1023,45 @@ async function completeLifecycleSpawnTransaction(input: {
 /** Real daemon-safe tmux launcher: canonical owner-isolation plan + GJC tags. */
 export function daemonSpawnCreate(
 	env: NodeJS.ProcessEnv = process.env,
-	opts: { ownerIsolationProbe?: OwnerIsolationProbe } = {},
+	opts: { ownerIsolationProbe?: OwnerIsolationProbe; agentDir?: string } = {},
 ) {
 	return async (
 		frame: SessionCreateFrame,
-		ids: { lifecycleRequestId: string; intendedSessionId: string; startupPromptRef?: string },
+		ids: {
+			lifecycleRequestId: string;
+			intendedSessionId: string;
+			startupPromptRef?: string;
+		},
 	): Promise<CreateEffectResult> => {
 		const tmuxBinary = resolveGjcTmuxBinary({ env });
-		if (tmuxBinary.isPsmux) throw new Error("gjc_lifecycle_psmux_unsupported");
 		const tmux = tmuxBinary.command;
-		const name = tmuxSessionNameFor(ids.intendedSessionId);
+		const name = tmuxBinary.isPsmux
+			? psmuxLifecycleSessionName(ids.intendedSessionId)
+			: tmuxSessionNameFor(ids.intendedSessionId);
 		const { cwd, args } = buildCreateArgv(frame, ids);
 		const sessionStateFile = lifecycleRuntimeStateFile(cwd, ids.intendedSessionId, name);
+		if (tmuxBinary.isPsmux) {
+			const executable = admitPsmuxLifecycle(tmux);
+			psmuxInventory(executable, env);
+			if (frame.target.kind === "plain_dir") fs.mkdirSync(cwd, { recursive: true });
+			const readiness = await spawnPsmuxLifecycle({
+				command: tmux,
+				env,
+				name,
+				cwd,
+				sessionId: ids.intendedSessionId,
+				lifecycleRequestId: ids.lifecycleRequestId,
+				agentDir: opts.agentDir ?? getAgentDir(),
+				args,
+			});
+			return {
+				sessionId: ids.intendedSessionId,
+				tmuxSession: name,
+				sessionStateFile,
+				endpointUrl: readiness.endpointUrl,
+				topicThreadId: "",
+			};
+		}
 		const stateDir = path.dirname(sessionStateFile);
 		const previousBaseline = await captureOwnerGenerationBaseline(stateDir, ids.intendedSessionId);
 		const predecessor = resolveManagedOwnerPredecessorSync(stateDir, ids.intendedSessionId, previousBaseline);
@@ -955,7 +1145,11 @@ async function applyRequiredLifecycleTmuxMetadata(
 		ownerGeneration: string;
 		ownerServerKey: string;
 	},
-	attempt: { nativeSessionId: string; attemptSession: string; serverPid: number },
+	attempt: {
+		nativeSessionId: string;
+		attemptSession: string;
+		serverPid: number;
+	},
 ): Promise<void> {
 	if (
 		!metadata.sessionId.trim() ||
@@ -1003,7 +1197,32 @@ export function daemonCloseSession(
 	return async (target: { sessionId: string; tmuxSession?: string; sessionStateFile?: string }) => {
 		const name = target.tmuxSession ?? tmuxSessionNameFor(target.sessionId);
 		await (deps.forceClose ?? forceCloseGjcTmuxSession)(name, env, target.sessionId, target.sessionStateFile);
-		return { processGone: (deps.findSession ?? findGjcTmuxSessionByName)(name, env) === undefined };
+		return {
+			processGone: (deps.findSession ?? findGjcTmuxSessionByName)(name, env) === undefined,
+		};
+	};
+}
+
+function daemonClosePsmuxSession(agentDir: string) {
+	return async (target: { sessionId: string }, lifecycleRequestId: string): Promise<{ processGone: boolean }> => {
+		await ensureBroker({ agentDir });
+		const discovery = await readSdkBrokerDiscovery(agentDir);
+		if (!discovery) throw new Error("gjc_lifecycle_broker_unavailable");
+		const client = await SdkClient.connect(discovery.url, discovery.token);
+		try {
+			const response = (await client.global(
+				"session.close",
+				{ sessionId: target.sessionId },
+				{ idempotencyKey: `telegram:${lifecycleRequestId}` },
+			)) as { ok?: unknown; error?: { code?: unknown } };
+			if (response.ok !== true)
+				throw new Error(
+					typeof response.error?.code === "string" ? response.error.code : "gjc_lifecycle_psmux_close_refused",
+				);
+			return { processGone: true };
+		} finally {
+			await client.close();
+		}
 	};
 }
 
@@ -1025,13 +1244,18 @@ export function daemonResumeSession(
 		path?: string;
 	}): Promise<ResumeEffectResult | { ambiguous: ResumeCandidate[] } | { notFound: true }> => {
 		const tmuxBinary = resolveGjcTmuxBinary({ env });
-		if (tmuxBinary.isPsmux) throw new Error("gjc_lifecycle_psmux_unsupported");
-		const live = (opts.listSessions?.(env) ?? listGjcTmuxSessions(env)).filter(
-			s => s.sessionId === target.sessionIdOrPrefix || s.sessionId?.startsWith(target.sessionIdOrPrefix),
-		);
+		if (tmuxBinary.isPsmux) admitPsmuxLifecycle(tmuxBinary.command);
+		const live = tmuxBinary.isPsmux
+			? []
+			: (opts.listSessions?.(env) ?? listGjcTmuxSessions(env)).filter(
+					s => s.sessionId === target.sessionIdOrPrefix || s.sessionId?.startsWith(target.sessionIdOrPrefix),
+				);
 		if (live.length > 1) {
 			return {
-				ambiguous: live.map(s => ({ sessionId: s.sessionId ?? s.name, path: s.project })),
+				ambiguous: live.map(s => ({
+					sessionId: s.sessionId ?? s.name,
+					path: s.project,
+				})),
 			};
 		}
 		if (live.length === 1) {
@@ -1055,6 +1279,11 @@ export function daemonResumeSession(
 		// blindly spawning `gjc --resume <prefix>` against a non-authoritative id.
 		let resumeId = target.sessionIdOrPrefix;
 		let resumeCwd = target.path;
+		const exactPsmuxLive =
+			tmuxBinary.isPsmux &&
+			psmuxInventory(admitPsmuxLifecycle(tmuxBinary.command), env).has(
+				psmuxLifecycleSessionName(target.sessionIdOrPrefix),
+			);
 		if (!target.path && !opts.agentDir && !opts.sessionsRoot) return { notFound: true };
 		const recent = await listRecentSessions({
 			cwd: target.path ?? opts.agentDir ?? opts.sessionsRoot ?? "",
@@ -1070,17 +1299,86 @@ export function daemonResumeSession(
 		);
 		const exact = prefixed.filter(s => s.sessionId === target.sessionIdOrPrefix);
 		const resolved = exact.length > 0 ? exact : prefixed;
-		if (resolved.length === 0) return { notFound: true };
+		if (resolved.length === 0 && !exactPsmuxLive) return { notFound: true };
 		if (resolved.length > 1) {
-			return { ambiguous: resolved.map(s => ({ sessionId: s.sessionId, path: s.path })) };
+			return {
+				ambiguous: resolved.map(s => ({
+					sessionId: s.sessionId,
+					path: s.path,
+				})),
+			};
 		}
-		const selected = resolved[0]!;
-		resumeId = selected.sessionId;
-		resumeCwd = selected.path;
+		const selected = resolved[0];
+		if (selected) {
+			resumeId = selected.sessionId;
+			resumeCwd = selected.path;
+		}
 		const resolvedResumeCwd = resumeCwd ? path.resolve(resumeCwd) : undefined;
 		const resumeCwdStat = resolvedResumeCwd ? fs.statSync(resolvedResumeCwd, { throwIfNoEntry: false }) : undefined;
 		if (typeof resolvedResumeCwd !== "string" || !resumeCwdStat?.isDirectory()) {
 			throw new Error(`gjc_lifecycle_resume_cwd_unavailable: ${resolvedResumeCwd ?? "(missing)"}`);
+		}
+		if (tmuxBinary.isPsmux) {
+			const name = psmuxLifecycleSessionName(resumeId);
+			const sessionStateFile = lifecycleRuntimeStateFile(resolvedResumeCwd, resumeId, name);
+			const executable = admitPsmuxLifecycle(tmuxBinary.command);
+			if (psmuxInventory(executable, env).has(name)) {
+				const targetName = psmuxExactSessionTarget(name);
+				const endpointPath = path.join(resolvedResumeCwd, ".gjc", "state", "sdk", `${resumeId}.json`);
+				try {
+					const endpoint = JSON.parse(fs.readFileSync(endpointPath, "utf8")) as {
+						sessionId?: unknown;
+						pid?: unknown;
+						url?: unknown;
+						psmuxPrimaryMarker?: unknown;
+					};
+					const markerResult = Bun.spawnSync(
+						psmuxLifecycleArgv(executable, ["show-environment", "-t", targetName, PSMUX_LIFECYCLE_MARKER_ENV]),
+						{ env, stdout: "pipe", stderr: "pipe" },
+					);
+					if (
+						markerResult.exitCode === 0 &&
+						endpoint.sessionId === resumeId &&
+						typeof endpoint.psmuxPrimaryMarker === "string" &&
+						endpoint.psmuxPrimaryMarker === readPsmuxMarkerLine(markerResult.stdout.toString()) &&
+						typeof endpoint.pid === "number" &&
+						typeof endpoint.url === "string" &&
+						(await isPsmuxRegistrationReady(
+							opts.agentDir ?? getAgentDir(),
+							resumeId,
+							endpoint.psmuxPrimaryMarker,
+							endpoint.pid,
+						))
+					)
+						return {
+							sessionId: resumeId,
+							tmuxSession: name,
+							sessionStateFile,
+							endpointUrl: endpoint.url,
+							topicThreadId: "",
+							mode: "reattached",
+						};
+				} catch {}
+				throw new Error("gjc_lifecycle_psmux_live_identity_indeterminate");
+			}
+			const readiness = await spawnPsmuxLifecycle({
+				command: tmuxBinary.command,
+				env,
+				name,
+				cwd: resolvedResumeCwd,
+				sessionId: resumeId,
+				lifecycleRequestId: `resume-${resumeId}`,
+				agentDir: opts.agentDir ?? getAgentDir(),
+				args: ["--resume", resumeId],
+			});
+			return {
+				sessionId: resumeId,
+				tmuxSession: name,
+				sessionStateFile,
+				endpointUrl: readiness.endpointUrl,
+				topicThreadId: "",
+				mode: "cold_restarted",
+			};
 		}
 		const tmux = tmuxBinary.command;
 		const name = tmuxSessionNameFor(resumeId);
@@ -1393,13 +1691,21 @@ export function buildOrchestratorDeps(input: {
 		store: fileLedgerStore(path.join(input.agentNotificationsDir, "telegram-lifecycle-idempotency.json")),
 		audit: fileAudit(path.join(input.agentNotificationsDir, "telegram-lifecycle-audit.jsonl")),
 		isPsmuxProvider: () => resolveGjcTmuxBinary({ env }).isPsmux,
+		isReviewedPsmuxProvider: () => {
+			const provider = resolveGjcTmuxBinary({ env });
+			return !provider.isPsmux || isReviewedPsmuxLifecycleExecutable(provider.command);
+		},
 		allowCreate: createRateLimiter(3, 10 * 60 * 1000),
 		writeStartupPrompt: async (_requestId, prompt, _persistRef) => {
 			if (prompt === undefined) return undefined;
 			throw new Error("startup_prompt_capability_transport_unavailable");
 		},
-		spawnCreate: daemonSpawnCreate(env),
-		closeSession: daemonCloseSession(env),
+		spawnCreate: daemonSpawnCreate(env, {
+			agentDir: input.agentDir ?? path.dirname(input.agentNotificationsDir),
+		}),
+		closeSession: resolveGjcTmuxBinary({ env }).isPsmux
+			? daemonClosePsmuxSession(input.agentDir ?? path.dirname(input.agentNotificationsDir))
+			: daemonCloseSession(env),
 		resumeSession: daemonResumeSession(env, {
 			agentDir: input.agentDir ?? path.dirname(input.agentNotificationsDir),
 		}),

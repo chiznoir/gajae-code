@@ -129,7 +129,7 @@ export declare class NotificationServer {
    * `state_root` (when given) is where the endpoint discovery file is written
    * (e.g. `<repo>/.gjc/state`). `resolver_available` defaults to `true`.
    */
-  constructor(sessionId: string, token: string, stateRoot?: string | undefined | null, resolverAvailable?: boolean | undefined | null)
+  constructor(sessionId: string, token: string, stateRoot?: string | undefined | null, resolverAvailable?: boolean | undefined | null, psmuxPrimaryMarker?: string | undefined | null)
   /** Register the reply callback. Must be called before [`Self::start`]. */
   onReply(callback: (err: null | Error, reply: ReplyEvent) => void): void
   /**
@@ -302,6 +302,12 @@ export declare class NotificationServer {
 export declare class Process {
   /** Open a stable process reference from a PID. */
   static fromPid(pid: number): Process | null
+  /**
+   * Compare a PID with an expected incarnation without creating a process
+   * control handle. This observer is supported on Windows; other platforms
+   * return `"unknown"`.
+   */
+  static observeIncarnation(pid: number, expectedIncarnation: string): ProcessIncarnationObservation
   /** Open stable process references whose executable path matches exactly. */
   static fromPath(path: string): Array<Process>
   /** Operating-system process identifier for this process reference. */
@@ -1896,6 +1902,15 @@ export declare function parseKittySequence(data: string): ParsedKittyResult | nu
 export interface PresentationLease {
   actionId: string
   registrationEpoch: number
+}
+
+/** Read-only comparison of a PID with a recorded process incarnation. */
+export declare enum ProcessIncarnationObservation {
+  SameIncarnation = 'same_incarnation',
+  PidAbsent = 'pid_absent',
+  PidReused = 'pid_reused',
+  Inaccessible = 'inaccessible',
+  Unknown = 'unknown'
 }
 
 /** Current state of a process reference. */

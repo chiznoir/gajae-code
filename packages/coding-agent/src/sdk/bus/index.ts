@@ -54,6 +54,7 @@ import type {
 } from "../../tools";
 import { registerAskAnswerSource, registerWorkflowGateEmitterListener } from "../../tools/ask-answer-registry";
 import { ensureBroker } from "../broker/ensure";
+import { processIncarnation } from "../broker/process-incarnation";
 import { SessionIndex } from "../broker/session-index";
 import { SessionSdkHost, shouldHostSdk } from "../host";
 import { type ControlSurface, dispatchControl } from "../host/control";
@@ -1649,6 +1650,15 @@ function sessionIdFromFile(file: string | undefined): string | undefined {
 function safeLifecycleRequestId(value: string | undefined): string | undefined {
 	return value && /^[A-Za-z0-9._-]{1,128}$/.test(value) ? value : undefined;
 }
+function psmuxPrimaryMarkerFromEndpointRecord(source: string): string | undefined {
+	try {
+		const record = JSON.parse(source) as { psmuxPrimaryMarker?: unknown };
+		const marker = record.psmuxPrimaryMarker;
+		return typeof marker === "string" && /^[A-Za-z0-9_-]{43}$/.test(marker) ? marker : undefined;
+	} catch {
+		return undefined;
+	}
+}
 
 function validateProviderDefinitions(capability: string, definitions: unknown): void {
 	if (capability !== "host_tools" && capability !== "host_uri") return;
@@ -3086,7 +3096,7 @@ export function createNotificationsExtension(
 				nativeVersion: nativeBuildInfo().version,
 				notificationServer: NotificationServer.prototype,
 			});
-			server = new NotificationServer(id, token, stateRoot, true);
+			server = new NotificationServer(id, token, stateRoot, true, process.env.GJC_PSMUX_LIFECYCLE_PRIMARY_MARKER);
 		} catch (error) {
 			if (lifecycleRequired) return failLifecycleStartup("failed", error);
 			throw error;
@@ -4101,7 +4111,10 @@ export function createNotificationsExtension(
 					const index = await new SessionIndex(agentDir).open();
 					throwIfLifecycleStopped();
 					const locator = { repo: path.resolve(ctx.cwd), stateRoot };
-					const endpointMtimeMs = fs.statSync(path.join(stateRoot, "sdk", `${id}.json`)).mtimeMs;
+					const endpointPath = path.join(stateRoot, "sdk", `${id}.json`);
+					const endpointMtimeMs = fs.statSync(endpointPath).mtimeMs;
+					const psmuxPrimaryMarker = psmuxPrimaryMarkerFromEndpointRecord(fs.readFileSync(endpointPath, "utf8"));
+					const pidIncarnation = processIncarnation(process.pid);
 					await host.registerWithBroker({
 						// The endpoint is written before registration. Its exact mtime
 						// binds this index generation to that discovery record.
@@ -4113,6 +4126,8 @@ export function createNotificationsExtension(
 								pid: process.pid,
 								endpointMtimeMs,
 								...(lifecycleRequestId ? { lifecycleRequestId } : {}),
+								...(pidIncarnation ? { pidIncarnation } : {}),
+								...(psmuxPrimaryMarker ? { psmuxPrimaryMarker } : {}),
 							});
 						},
 						unregister: async input => {

@@ -12,7 +12,10 @@ use napi::{
 	bindgen_prelude::{PromiseRaw, Unknown},
 };
 use napi_derive::napi;
-use pi_shell::process::{self as core_process, ProcessStatus as CoreProcessStatus};
+use pi_shell::process::{
+	self as core_process, ProcessIncarnationObservation as CoreProcessIncarnationObservation,
+	ProcessStatus as CoreProcessStatus,
+};
 pub use pi_shell::process::{KILL_SIGNAL, TERM_SIGNAL, TerminationTargets, kill_process_group};
 
 use crate::task;
@@ -62,6 +65,33 @@ impl From<CoreProcessStatus> for ProcessStatus {
 		}
 	}
 }
+/// Read-only comparison of a PID with a recorded process incarnation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[napi(string_enum)]
+pub enum ProcessIncarnationObservation {
+	#[napi(value = "same_incarnation")]
+	SameIncarnation,
+	#[napi(value = "pid_absent")]
+	PidAbsent,
+	#[napi(value = "pid_reused")]
+	PidReused,
+	#[napi(value = "inaccessible")]
+	Inaccessible,
+	#[napi(value = "unknown")]
+	Unknown,
+}
+
+impl From<CoreProcessIncarnationObservation> for ProcessIncarnationObservation {
+	fn from(value: CoreProcessIncarnationObservation) -> Self {
+		match value {
+			CoreProcessIncarnationObservation::SameIncarnation => Self::SameIncarnation,
+			CoreProcessIncarnationObservation::PidAbsent => Self::PidAbsent,
+			CoreProcessIncarnationObservation::PidReused => Self::PidReused,
+			CoreProcessIncarnationObservation::Inaccessible => Self::Inaccessible,
+			CoreProcessIncarnationObservation::Unknown => Self::Unknown,
+		}
+	}
+}
 
 /// Stable process reference.
 #[napi]
@@ -77,6 +107,17 @@ impl Process {
 	#[napi]
 	pub fn from_pid(pid: i32) -> Option<Process> {
 		core_process::Process::from_pid(pid).map(Self::from_inner)
+	}
+
+	/// Compare a PID with an expected incarnation without creating a process
+	/// control handle. This observer is supported on Windows; other platforms
+	/// return `"unknown"`.
+	#[napi]
+	pub fn observe_incarnation(
+		pid: i32,
+		expected_incarnation: String,
+	) -> ProcessIncarnationObservation {
+		core_process::observe_process_incarnation(pid, &expected_incarnation).into()
 	}
 
 	/// Open stable process references whose executable path matches exactly.

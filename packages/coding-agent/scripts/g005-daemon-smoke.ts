@@ -63,6 +63,7 @@ const deps: OrchestratorDeps = {
 	pairedChatId: "42",
 	auditRedactionKey: new Uint8Array(32).fill(5),
 	isPsmuxProvider: () => false,
+	isReviewedPsmuxProvider: () => false,
 	now: () => Date.now(),
 	store,
 	audit: e => {

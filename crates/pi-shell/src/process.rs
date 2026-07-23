@@ -14,6 +14,20 @@ pub enum ProcessStatus {
 	/// The referenced process has exited or is no longer observable.
 	Exited,
 }
+/// Read-only result of comparing a PID against a recorded process incarnation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProcessIncarnationObservation {
+	/// The PID currently identifies the recorded process incarnation.
+	SameIncarnation,
+	/// A complete process snapshot proved the PID is absent.
+	PidAbsent,
+	/// The PID exists but identifies a different process incarnation.
+	PidReused,
+	/// The PID exists, but opening its query handle was denied.
+	Inaccessible,
+	/// The operating system could not establish a conclusive result.
+	Unknown,
+}
 
 #[cfg(target_os = "linux")]
 mod platform {
@@ -712,7 +726,7 @@ mod platform {
 
 	use smallvec::SmallVec;
 
-	use super::ProcessStatus;
+	use super::{ProcessIncarnationObservation, ProcessStatus};
 
 	#[repr(C)]
 	#[allow(non_snake_case, reason = "Windows PROCESSENTRY32W field names must match Win32 ABI")]
@@ -782,6 +796,7 @@ mod platform {
 	const PROCESS_BASIC_INFORMATION_CLASS: u32 = 0;
 	const STATUS_SUCCESS: NtStatus = 0;
 	const TH32CS_SNAPPROCESS: u32 = 0x00000002;
+	const ERROR_NO_MORE_FILES: u32 = 18;
 	const PROCESS_TERMINATE: u32 = 0x0001;
 	const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
 	const SYNCHRONIZE: u32 = 0x00100000;
@@ -811,6 +826,7 @@ mod platform {
 			lpKernelTime: *mut Filetime,
 			lpUserTime: *mut Filetime,
 		) -> i32;
+		fn GetLastError() -> u32;
 		fn ReadProcessMemory(
 			hProcess: Handle,
 			lpBaseAddress: *const c_void,
@@ -1167,6 +1183,75 @@ mod platform {
 		let _ = unsafe { LocalFree(argv.cast::<c_void>()) };
 		args
 	}
+	/// Compare a PID with an expected canonical Windows creation-time
+	/// incarnation.
+	///
+	/// This is intentionally read-only: Toolhelp establishes whether the PID is
+	/// present, and a query-only handle supplies the creation timestamp.
+	pub fn observe_incarnation(pid: i32, expected: &str) -> ProcessIncarnationObservation {
+		let Some(value) = expected.strip_prefix("windows:") else {
+			return ProcessIncarnationObservation::Unknown;
+		};
+		if value.is_empty()
+			|| (value.len() > 1 && value.starts_with('0'))
+			|| !value.bytes().all(|byte| byte.is_ascii_digit())
+		{
+			return ProcessIncarnationObservation::Unknown;
+		}
+		let Some(expected) = value.parse::<u64>().ok() else {
+			return ProcessIncarnationObservation::Unknown;
+		};
+		let Ok(pid) = u32::try_from(pid) else {
+			return ProcessIncarnationObservation::Unknown;
+		};
+		if pid == 0 {
+			return ProcessIncarnationObservation::Unknown;
+		}
+
+		let present = match snapshot_contains_pid(pid) {
+			Ok(present) => present,
+			Err(()) => return ProcessIncarnationObservation::Unknown,
+		};
+		if !present {
+			return ProcessIncarnationObservation::PidAbsent;
+		}
+
+		let Some(handle) = open_process(pid, PROCESS_QUERY_LIMITED_INFORMATION) else {
+			// A failed open may race process exit or PID reuse. Re-enumerate completely
+			// before assigning a non-success result.
+			return match snapshot_contains_pid(pid) {
+				Ok(false) => ProcessIncarnationObservation::PidAbsent,
+				Ok(true) => ProcessIncarnationObservation::Inaccessible,
+				Err(()) => ProcessIncarnationObservation::Unknown,
+			};
+		};
+		creation_time_observation(process_creation_time(handle.as_raw()), expected)
+	}
+
+	fn creation_time_observation(
+		creation_time: Option<u64>,
+		expected: u64,
+	) -> ProcessIncarnationObservation {
+		match creation_time {
+			Some(creation_time) if creation_time == expected => {
+				ProcessIncarnationObservation::SameIncarnation
+			},
+			Some(_) => ProcessIncarnationObservation::PidReused,
+			// The process was observed and opened, but this post-open query did not
+			// establish identity. Do not turn an inconclusive query into access authority.
+			None => ProcessIncarnationObservation::Unknown,
+		}
+	}
+
+	#[cfg(test)]
+	mod tests {
+		use super::*;
+
+		#[test]
+		fn creation_time_query_failure_is_unknown() {
+			assert_eq!(creation_time_observation(None, 42), ProcessIncarnationObservation::Unknown);
+		}
+	}
 
 	fn open_process(pid: u32, access: u32) -> Option<Arc<OwnedHandle>> {
 		// SAFETY: `OpenProcess` takes the PID and access mask by value and does not
@@ -1197,6 +1282,38 @@ mod platform {
 			pcPriClassBase:      0,
 			dwFlags:             0,
 			szExeFile:           [0; 260],
+		}
+	}
+	/// Return whether `pid` occurs in a complete Toolhelp process enumeration.
+	///
+	/// Absence is conclusive only after `Process32NextW` terminates with
+	/// `ERROR_NO_MORE_FILES`; every other snapshot or enumeration failure is
+	/// deliberately surfaced to callers as uncertainty.
+	fn snapshot_contains_pid(pid: u32) -> Result<bool, ()> {
+		let snapshot = create_process_snapshot().ok_or(())?;
+		let mut entry = process_entry();
+		// SAFETY: `snapshot` is a valid Toolhelp snapshot handle and `entry` has the
+		// exact ABI size required by `Process32FirstW`.
+		if unsafe { Process32FirstW(snapshot.as_raw(), &raw mut entry) } == 0 {
+			return if unsafe { GetLastError() } == ERROR_NO_MORE_FILES {
+				Ok(false)
+			} else {
+				Err(())
+			};
+		}
+
+		let mut present = entry.th32ProcessID == pid;
+		loop {
+			// SAFETY: `snapshot` remains valid and `entry` remains writable with its
+			// `dwSize` initialized to the ABI-required value.
+			if unsafe { Process32NextW(snapshot.as_raw(), &raw mut entry) } == 0 {
+				return if unsafe { GetLastError() } == ERROR_NO_MORE_FILES {
+					Ok(present)
+				} else {
+					Err(())
+				};
+			}
+			present |= entry.th32ProcessID == pid;
 		}
 	}
 
@@ -1288,6 +1405,19 @@ mod platform {
 	}
 }
 
+/// Compare a PID to its recorded incarnation without acquiring process-control
+/// authority. Unsupported platforms report `Unknown`.
+pub fn observe_process_incarnation(pid: i32, expected: &str) -> ProcessIncarnationObservation {
+	#[cfg(target_os = "windows")]
+	{
+		platform::observe_incarnation(pid, expected)
+	}
+	#[cfg(not(target_os = "windows"))]
+	{
+		let _ = (pid, expected);
+		ProcessIncarnationObservation::Unknown
+	}
+}
 /// Stable process reference.
 #[derive(Clone)]
 pub struct Process {

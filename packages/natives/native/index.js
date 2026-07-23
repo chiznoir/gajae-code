@@ -142,6 +142,13 @@ export const MacOSAppearance = {
 	Dark: "dark",
 	Light: "light",
 };
+export const ProcessIncarnationObservation = {
+	SameIncarnation: "same_incarnation",
+	PidAbsent: "pid_absent",
+	PidReused: "pid_reused",
+	Inaccessible: "inaccessible",
+	Unknown: "unknown",
+};
 export const ProcessStatus = {
 	Running: "running",
 	Exited: "exited",

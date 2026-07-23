@@ -61,6 +61,10 @@ pub struct EndpointRecord {
 	/// session was spawned by the control ingress.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub intended_session_id:  Option<String>,
+	/// Optional psmux primary-session marker. This is public routing metadata,
+	/// not an endpoint credential.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub psmux_primary_marker: Option<String>,
 }
 
 impl EndpointRecord {
@@ -89,6 +93,7 @@ impl EndpointRecord {
 			lifecycle_request_id: None,
 			startup_prompt_ref: None,
 			intended_session_id: None,
+			psmux_primary_marker: None,
 		}
 	}
 

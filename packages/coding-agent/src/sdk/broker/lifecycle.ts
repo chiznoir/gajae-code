@@ -13,6 +13,7 @@ import {
 	type GjcLaunchWorktreePlan,
 	planLaunchWorktree,
 } from "../../gjc-runtime/launch-worktree";
+import { resolveGjcTmuxBinary } from "../../gjc-runtime/tmux-common";
 import { validateManagedArtifactTree } from "../../session/internal/managed-session-storage";
 import {
 	FileSessionStorage,
@@ -22,6 +23,14 @@ import {
 	type VerifiedSessionDeleteResult,
 	type VerifiedSessionDeleteTarget,
 } from "../../session/session-storage";
+import {
+	isReviewedPsmuxLifecycleExecutable,
+	PSMUX_LIFECYCLE_MARKER_ENV,
+	psmuxExactSessionTarget,
+	psmuxLifecycleArgv,
+	psmuxLifecycleSessionName,
+	readPsmuxMarkerLine,
+} from "../bus/psmux-lifecycle";
 import { SdkClient, SdkClientError } from "../client/client";
 import {
 	type LogicalSessionCandidate,
@@ -40,6 +49,7 @@ import type {
 	LifecycleWorktreeIntent,
 } from "./lifecycle-ledger";
 import {
+	observeProcessIncarnation,
 	type ProcessIncarnationCommandRunner,
 	type ProcessIncarnationOptions,
 	parseDarwinProcessIncarnation,
@@ -2487,6 +2497,7 @@ type CloseRecord = {
 	locator: { repo: string; stateRoot: string };
 	endpointGeneration: number;
 	pid: number;
+	pidIncarnation?: string;
 	endpointMtimeMs?: number;
 	lifecycleRequestId?: string;
 };
@@ -2589,6 +2600,73 @@ function closeEndpoint(endpoint: unknown): { url: string; token: string } | unde
 	return typeof value.url === "string" && typeof value.token === "string"
 		? { url: value.url, token: value.token }
 		: undefined;
+}
+async function closeVerifiedPsmux(
+	broker: Broker,
+	id: string,
+	record: CloseRecord & { psmuxPrimaryMarker?: string },
+	endpoint: { url: string; token: string },
+): Promise<BrokerResponse> {
+	const marker = record.psmuxPrimaryMarker;
+	const incarnation = record.pidIncarnation;
+	const endpointPath = path.join(record.locator.stateRoot, "sdk", `${id}.json`);
+	let executable: string;
+	try {
+		const source = JSON.parse(fsSync.readFileSync(endpointPath, "utf8")) as Record<string, unknown>;
+		if (
+			typeof marker !== "string" ||
+			!/^[A-Za-z0-9_-]{43}$/.test(marker) ||
+			typeof incarnation !== "string" ||
+			source.sessionId !== id ||
+			source.psmuxPrimaryMarker !== marker ||
+			source.pid !== record.pid
+		)
+			return fail("terminal_uncertain", "psmux close authority could not be verified.");
+		const provider = resolveGjcTmuxBinary({ env: process.env });
+		if (!provider.isPsmux || !isReviewedPsmuxLifecycleExecutable(provider.command))
+			return fail("terminal_uncertain", "psmux executable attestation was refused.");
+		executable = provider.command;
+	} catch {
+		return fail("terminal_uncertain", "psmux close authority could not be verified.");
+	}
+	const target = psmuxExactSessionTarget(psmuxLifecycleSessionName(id));
+	const run = (args: string[]): string | undefined => {
+		try {
+			const result = Bun.spawnSync(psmuxLifecycleArgv(executable, args), {
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			return result.exitCode === 0 ? result.stdout.toString() : undefined;
+		} catch {
+			return undefined;
+		}
+	};
+	const liveMarker = readPsmuxMarkerLine(run(["show-environment", "-t", target, PSMUX_LIFECYCLE_MARKER_ENV]) ?? "");
+	if (liveMarker !== marker || observeProcessIncarnation(record.pid, incarnation) !== "same_incarnation")
+		return fail("terminal_uncertain", "psmux close identity drifted before dispatch.");
+	const deadlineAt = lifecycleTiming(broker).now() + CLOSE_TIMEOUT_MS;
+	let client: SdkClient | undefined;
+	try {
+		client = await SdkClient.connect(endpoint.url, endpoint.token, {
+			timeoutMs: CLOSE_TIMEOUT_MS,
+			reconnectAttempts: 0,
+		});
+		const stale = await revalidateCloseGeneration(broker, id, record, undefined);
+		if (stale) return stale;
+		if (((await client.control("session.close")) as { ok?: unknown }).ok !== true)
+			return fail("close_refused", "Session endpoint rejected session.close.");
+	} catch {
+		return fail("terminal_uncertain", "psmux close dispatch could not be verified.");
+	} finally {
+		await client?.close();
+	}
+	const timing = lifecycleTiming(broker);
+	while (timing.now() < deadlineAt) {
+		if (observeProcessIncarnation(record.pid, incarnation) === "pid_absent")
+			return { ok: true, result: { sessionId: id } };
+		await timing.sleep(Math.min(POLL_MS, Math.max(1, deadlineAt - timing.now())));
+	}
+	return fail("terminal_uncertain", "psmux session.close did not prove process absence before the deadline.");
 }
 
 /** Executes broker-owned global lifecycle effects. */
@@ -2874,6 +2952,12 @@ async function executeLifecycleResponse(
 			sessionId: id,
 			endpointGeneration: record.endpointGeneration,
 		});
+		if (record.psmuxPrimaryMarker) {
+			if (!endpointResult.ok) return endpointResult;
+			const endpoint = closeEndpoint(endpointResult.result);
+			if (!endpoint) return fail("terminal_uncertain", "psmux endpoint authority is malformed.");
+			return closeVerifiedPsmux(broker, id, record, endpoint);
+		}
 		if (!endpointResult.ok && endpointResult.error.code === "endpoint_stale" && !requestedAuthority.authority) {
 			await broker.index.refresh();
 			const refreshed = broker.index.listSessions().sessions.find(session => session.sessionId === id);

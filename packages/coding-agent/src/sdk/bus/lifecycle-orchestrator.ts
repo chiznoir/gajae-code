@@ -99,6 +99,8 @@ export interface OrchestratorDeps {
 	audit: (event: AuditEvent) => Promise<void> | void;
 	/** Resolves the returned tmux provider once per request for psmux preflight. */
 	isPsmuxProvider: () => boolean;
+	/** Exact reviewed executable check; called only after paired-chat and frame validation. */
+	isReviewedPsmuxProvider: () => boolean;
 	/** Per-chat create rate limiter: returns true when allowed. */
 	allowCreate: (chatId: string, nowMs: number) => boolean;
 	/** Persist the once-consumed 0600 startup-prompt file after durably recording its ref. */
@@ -112,11 +114,14 @@ export interface OrchestratorDeps {
 		frame: SessionCreateFrame,
 		ids: { lifecycleRequestId: string; intendedSessionId: string; startupPromptRef?: string },
 	) => Promise<CreateEffectResult>;
-	closeSession: (target: {
-		sessionId: string;
-		tmuxSession?: string;
-		sessionStateFile?: string;
-	}) => Promise<{ processGone: boolean }>;
+	closeSession: (
+		target: {
+			sessionId: string;
+			tmuxSession?: string;
+			sessionStateFile?: string;
+		},
+		lifecycleRequestId: string,
+	) => Promise<{ processGone: boolean }>;
 	resumeSession: (target: {
 		sessionIdOrPrefix: string;
 		path?: string;
@@ -297,14 +302,9 @@ export async function handleLifecycleRequest(
 			message: "startup prompt capability transport is unavailable; retry without a startup prompt",
 		};
 	}
-	if (deps.isPsmuxProvider()) {
+	if (deps.isPsmuxProvider() && !deps.isReviewedPsmuxProvider()) {
 		await deps.audit({ ...baseAudit, event: "rejected", reason: "unsupported_platform" });
-		return {
-			status: "error",
-			reason: "unsupported_platform",
-			message:
-				"Remote session lifecycle is unavailable on this psmux host because GJC cannot prove immutable session identity. No lifecycle action was performed. Use a local GJC terminal with a supported tmux provider.",
-		};
+		return { status: "error", reason: "unsupported_platform", message: "psmux lifecycle profile is not approved" };
 	}
 
 	// 4. Durable idempotency.
@@ -408,7 +408,7 @@ export async function handleLifecycleRequest(
 		}
 
 		if (frame.type === "session_close") {
-			const closed = await deps.closeSession(frame.target);
+			const closed = await deps.closeSession(frame.target, frame.requestId);
 			if (!closed.processGone) {
 				Object.assign(entry, {
 					state: "terminal_uncertain",

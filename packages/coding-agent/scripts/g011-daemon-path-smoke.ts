@@ -32,6 +32,7 @@ function deps(): OrchestratorDeps {
 		pairedChatId: "42",
 		auditRedactionKey: new Uint8Array(32).fill(11),
 		isPsmuxProvider: () => false,
+		isReviewedPsmuxProvider: () => false,
 		now: () => Date.now(),
 		store: fileLedgerStore(path.join(tmp, "idempotency.json")),
 		audit: fileAudit(path.join(tmp, "audit.jsonl")),
