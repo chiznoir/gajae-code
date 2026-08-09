@@ -303,12 +303,19 @@ export function parseTopicRegistryState(value: unknown): TopicRegistryState | un
 			value => value !== undefined,
 		).length;
 		if (leaseFieldCount !== 0 && leaseFieldCount !== 3) malformed();
-		if (
-			raw.authorityState === "disconnect_grace"
-				? raw.disconnectGraceExpiresAt === undefined || raw.orphanedAt === undefined
-				: raw.disconnectGraceExpiresAt !== undefined
-		)
-			malformed();
+		if (raw.authorityState === "disconnect_grace") {
+			if (raw.disconnectGraceExpiresAt === undefined || raw.orphanedAt === undefined) malformed();
+		} else if (raw.disconnectGraceExpiresAt !== undefined) {
+			if (
+				raw.authorityState !== "archive_pending" &&
+				raw.authorityState !== "archive_exhausted" &&
+				raw.authorityState !== "inactive"
+			)
+				malformed();
+			// Older archive transitions retained the expired disconnect-grace marker,
+			// making the entire shared registry unreadable on the next daemon start.
+			delete raw.disconnectGraceExpiresAt;
+		}
 		const hasBinding = hasAnyBinding(raw);
 		const hasArchiveOnlyChatIdentity =
 			(raw.authorityState === "archive_pending" ||
@@ -1201,12 +1208,14 @@ export class TopicRegistry {
 				...snapshot.record,
 				authorityEpoch: deleteEpoch,
 				authorityState: "archive_pending",
+				disconnectGraceExpiresAt: undefined,
 			});
 		} else if (record.topicId !== snapshot.topicId) {
 			return false;
 		} else {
 			record.authorityEpoch = deleteEpoch;
 			record.authorityState = "archive_pending";
+			delete record.disconnectGraceExpiresAt;
 			if (this.byTopic.get(record.topicId) === snapshot.sessionId) this.byTopic.delete(record.topicId);
 		}
 		this.epochs.set(snapshot.sessionId, deleteEpoch);
@@ -1239,6 +1248,7 @@ export class TopicRegistry {
 		if (!record) return undefined;
 		record.authorityEpoch = epoch;
 		record.authorityState = "archive_pending";
+		delete record.disconnectGraceExpiresAt;
 		if (hostId) record.archiveHostId = hostId;
 		record.archiveLeaseEpoch = epoch;
 		if (this.byTopic.get(record.topicId) === sessionId) this.byTopic.delete(record.topicId);
@@ -1383,6 +1393,7 @@ export class TopicRegistry {
 					record.authorityEpoch = epoch;
 					record.archiveLeaseEpoch = epoch;
 					record.authorityState = "archive_pending";
+					delete record.disconnectGraceExpiresAt;
 				}
 			}
 			return (record.authorityState === "archive_pending" || record.authorityState === "archive_exhausted") &&
